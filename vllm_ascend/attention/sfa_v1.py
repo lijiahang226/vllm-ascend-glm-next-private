@@ -241,6 +241,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         self.reorder_batch_threshold = self.decode_threshold
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+        self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
 
     def _prepare_parallel_metadata(
         self,
@@ -347,7 +348,24 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         else:
             seq_lens_cpu = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
 
-        cos, sin = get_cos_and_sin_mla(input_positions, use_cache=(draft_index is None))
+        if self.rope_dim > 0:
+            cos, sin = get_cos_and_sin_mla(
+                input_positions,
+                use_cache=(draft_index is None),
+            )
+        else:
+            # NoPE models do not instantiate a rotary module, hence there is
+            # no global cos/sin cache to index. Keep metadata shapes valid for
+            # the shared SFA path; the Indexer KPool MLA implementation skips every RoPE op.
+            cos = torch.empty(
+                input_positions.shape[0],
+                1,
+                1,
+                0,
+                dtype=self.model_config.dtype,
+                device=input_positions.device,
+            )
+            sin = torch.empty_like(cos)
 
         cos, sin, slot_mapping, parallel_metadata = self._prepare_parallel_metadata(
             common_attn_metadata,

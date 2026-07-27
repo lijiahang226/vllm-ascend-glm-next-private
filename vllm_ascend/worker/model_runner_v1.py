@@ -81,6 +81,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
+    MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -219,6 +220,7 @@ else:
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 
 from vllm_ascend.core.kv_cache_interface import (
+    AscendIndexerKPoolStateSpec,
     AscendMLAAttentionSpec,
     AscendSFAIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
@@ -232,6 +234,13 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+
+
+def _is_glm5_indexer_kpool_cache_spec(spec: KVCacheSpec) -> bool:
+    return (
+        isinstance(spec, MLAAttentionSpec)
+        and spec.model_version == "glm5_next"
+    ) or isinstance(spec, AscendIndexerKPoolStateSpec)
 
 
 @dataclass
@@ -3911,6 +3920,39 @@ class NPUModelRunner(GPUModelRunner):
         # prefill disaggregation need the addr of cache tensor be aligned with 2M
         alignment = 2 * 1024 * 1024
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        is_glm5_cache_plan = any(
+            _is_glm5_indexer_kpool_cache_spec(spec)
+            for spec in layer_kv_cache_spec.values()
+        )
+        if is_glm5_cache_plan:
+            self.hybrid_with_attn_and_mamba = False
+            # GLM-5 的 allocator 已经为主 MLA、压缩 Indexer K、compressor
+            # state 和 KDA 分别规划好 KVCacheTensor。这里不能再根据层名把
+            # cache 拆成 K/V；直接按规划结果一一分配并绑定即可。
+            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                tensor = self._allocate_int8_cache_tensor(
+                    kv_cache_tensor.size,
+                    alignment,
+                )
+                for layer_name in kv_cache_tensor.shared_by:
+                    if layer_name not in self.runner_only_attn_layers:
+                        kv_cache_raw_tensors[layer_name] = tensor
+
+            expected_layers = {
+                layer_name
+                for group in kv_cache_config.kv_cache_groups
+                for layer_name in group.layer_names
+                if layer_name not in self.runner_only_attn_layers
+            }
+            allocated_layers = set(kv_cache_raw_tensors)
+            if expected_layers != allocated_layers:
+                raise AssertionError(
+                    "GLM-5 KV cache tensors are not correctly initialized: "
+                    f"missing={sorted(expected_layers - allocated_layers)}, "
+                    f"unexpected={sorted(allocated_layers - expected_layers)}."
+                )
+            return kv_cache_raw_tensors
+
         # If some tensors are shared by linear layers and attention layers,
         # the same tensor format must be maintained even if some layers
         # have only linear or attention layers, for example, the mtp layer.
@@ -3968,7 +4010,27 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         for layer_name_inner in kv_cache_tensor.shared_by:
                             kv_cache_raw_tensors[layer_name_inner] = tensor
-
+                elif _is_glm5_indexer_kpool_cache_spec(layer_kv_cache_spec[layer_name]):
+                    # GLM-5 Indexer KPool MLA plans one raw tensor per cache spec. The
+                    # combined MLA cache stays packed as [KV, RoPE]; the
+                    # attention implementation creates non-contiguous views.
+                    if self.vllm_config.kv_transfer_config is None:
+                        tensor = torch.zeros(
+                            kv_cache_tensor.size,
+                            dtype=torch.int8,
+                            device=self.device,
+                        )
+                    else:
+                        tensor = torch.zeros(
+                            kv_cache_tensor.size + alignment,
+                            dtype=torch.int8,
+                            device=self.device,
+                        )
+                        tensor = self._align_memory(tensor, alignment)[
+                            : kv_cache_tensor.size
+                        ]
+                    for layer_name_inner in kv_cache_tensor.shared_by:
+                        kv_cache_raw_tensors[layer_name_inner] = tensor
                 elif "attn" in layer_name and self.use_compress and layer_name not in kv_cache_raw_tensors:
                     if self.vllm_config.kv_transfer_config is None:
                         tensor = torch.zeros(kv_cache_tensor.size,
@@ -4094,7 +4156,12 @@ class NPUModelRunner(GPUModelRunner):
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 layer_names.add(layer_name)
-        assert layer_names == set(kv_cache_raw_tensors.keys()), "Some layers are not correctly initialized"
+        allocated_layer_names = set(kv_cache_raw_tensors)
+        assert layer_names == allocated_layer_names, (
+            "Some layers are not correctly initialized: "
+            f"missing={sorted(layer_names - allocated_layer_names)}, "
+            f"unexpected={sorted(allocated_layer_names - layer_names)}."
+        )
 
         return kv_cache_raw_tensors
 
@@ -4130,7 +4197,6 @@ class NPUModelRunner(GPUModelRunner):
             storage_offset_bytes += stride[0] * dtype_size
         return reshaped_kv_tensors
 
-
     def _reshape_kv_cache_tensors(
         self,
         kv_cache_config: KVCacheConfig,
@@ -4157,6 +4223,63 @@ class NPUModelRunner(GPUModelRunner):
                     continue
 
                 current_kv_cache_spec = layer_kv_cache_spec[layer_name]
+
+                if _is_glm5_indexer_kpool_cache_spec(current_kv_cache_spec):
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    assert isinstance(raw_tensor, torch.Tensor)
+                    assert (
+                        raw_tensor.numel()
+                        % current_kv_cache_spec.page_size_bytes
+                        == 0
+                    )
+                    num_blocks = (
+                        raw_tensor.numel()
+                        // current_kv_cache_spec.page_size_bytes
+                    )
+                    assert num_blocks >= kv_cache_config.num_blocks
+                    is_quantized_indexer_cache = (
+                        isinstance(current_kv_cache_spec, MLAAttentionSpec)
+                        and current_kv_cache_spec.compress_ratio > 1
+                        and current_kv_cache_spec.dtype == torch.uint8
+                    )
+                    if is_quantized_indexer_cache:
+                        indexer_head_size = (
+                            current_kv_cache_spec.head_size
+                            - get_dtype_size(torch.float16)
+                        )
+                        cache_shape = attn_backend.get_kv_cache_shape(
+                            num_blocks,
+                            current_kv_cache_spec.storage_block_size,
+                            current_kv_cache_spec.num_kv_heads,
+                            indexer_head_size,
+                        )
+                        scale_shape = attn_backend.get_kv_cache_shape(
+                            num_blocks,
+                            current_kv_cache_spec.storage_block_size,
+                            current_kv_cache_spec.num_kv_heads,
+                            1,
+                        )
+                        kv_caches[layer_name] = self._adjust_kv_layout(
+                            raw_tensor,
+                            [cache_shape, scale_shape],
+                            [
+                                torch.int8,
+                                torch.float16,
+                            ],
+                            current_kv_cache_spec.page_size_bytes,
+                            overlap_full_kv_cache=False,
+                        )
+                    else:
+                        cache_shape = attn_backend.get_kv_cache_shape(
+                            num_blocks,
+                            current_kv_cache_spec.storage_block_size,
+                            current_kv_cache_spec.num_kv_heads,
+                            current_kv_cache_spec.head_size,
+                        )
+                        kv_caches[layer_name] = raw_tensor.view(
+                            current_kv_cache_spec.dtype
+                        ).view(cache_shape)
+                    continue
 
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
                 # encounter OOM issue
@@ -4774,7 +4897,15 @@ class NPUModelRunner(GPUModelRunner):
                     cache_sparse_li_c8=cache_sparse_li_c8,
                     sfa_dcp_replicated_indexer_size=self.sfa_dcp_replicated_indexer_size,
                 )
-
+            elif hasattr(attn_module, "cache_role"):
+                spec = attn_module.get_kv_cache_spec(self.vllm_config)
+                if not _is_glm5_indexer_kpool_cache_spec(spec):
+                    raise TypeError(
+                        "A cache-role attention layer must return "
+                        "a GLM-5 MLAAttentionSpec or compressor-state spec."
+                    )
+                kv_cache_spec[layer_name] = spec
+                attn_layer_names.add(layer_name)
             elif isinstance(attn_module, MambaBase):
                 mamba_layers[layer_name] = attn_module
 
@@ -4810,7 +4941,11 @@ class NPUModelRunner(GPUModelRunner):
                     mamba_page_size_padded = spec.page_size_bytes
             # align attn_page_size to mamba_page_size_padded
             for layer_name in attn_layer_names:
-                if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]
+                if (
+                    not _is_glm5_indexer_kpool_cache_spec(kv_cache_spec[layer_name])
+                    and kv_cache_spec[layer_name].page_size_bytes
+                    < mamba_page_size_padded
+                ):
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
 
         if self.sparse_kv_offload_enabled:

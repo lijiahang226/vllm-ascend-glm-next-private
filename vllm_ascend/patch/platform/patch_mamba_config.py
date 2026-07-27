@@ -27,6 +27,21 @@ def _using_kv_store(vllm_config) -> bool:
     return False
 
 
+def _get_mamba_target_page_size(
+    *,
+    is_glm5_next: bool,
+    attn_page_size: int,
+    mamba_raw_size: int,
+    conv_block_page_size: int,
+) -> int:
+    if is_glm5_next:
+        # GLM5-Next 的 Mamba/KDA cache 与各个 Indexer/MLA cache 分组后独立
+        # 分配，不要求物理 page 字节数相同。但 MambaSpec 的一个 page 必须
+        # 能容纳完整的 SSM + conv state，不能只按最大的 SSM state 计算。
+        return max(attn_page_size, mamba_raw_size)
+    return attn_page_size + conv_block_page_size
+
+
 @classmethod
 def verify_and_update_config(cls, vllm_config) -> None:
     """
@@ -92,9 +107,16 @@ def verify_and_update_config(cls, vllm_config) -> None:
         attn_token_page_size = 2 * attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
 
     attn_block_size = kernel_block_size * cdiv(ssm_block_page_size, kernel_block_size * attn_single_token_k_page_size)
-    assert attn_single_token_k_page_size * attn_block_size == ssm_block_page_size, (
-        "Cannot align ssm_page_size and attn_page_size."
-    )
+    if attn_single_token_k_page_size * attn_block_size != ssm_block_page_size:
+        if model_config.hf_config.model_type == "glm5_next":
+            if ssm_block_page_size % attn_single_token_k_page_size == 0:
+                attn_block_size = ssm_block_page_size // attn_single_token_k_page_size
+            else:
+                attn_block_size = cache_config.block_size or 128
+        else:
+            raise AssertionError(
+                "Cannot align ssm_page_size and attn_page_size."
+            )
 
     # override attention block size if either (a) the
     # user has not set it or (b) the user has set it
@@ -109,19 +131,38 @@ def verify_and_update_config(cls, vllm_config) -> None:
     # compute new attention page size
     attn_page_size = cache_config.block_size * attn_token_page_size
 
-    # pad mamba page size for conv_blocks
+    # GLM5-Next separately allocates Mamba/KDA and Indexer/MLA cache groups,
+    # so their physical page sizes need not be identical. The KDA page must
+    # still hold both SSM and conv states. Other hybrid models retain the
+    # established extra conv padding behavior.
+    mamba_raw_size = sum(mamba_sizes)
+    is_glm5_next = model_config.hf_config.model_type == "glm5_next"
+    target_page_size = _get_mamba_target_page_size(
+        is_glm5_next=is_glm5_next,
+        attn_page_size=attn_page_size,
+        mamba_raw_size=mamba_raw_size,
+        conv_block_page_size=conv_block_page_size,
+    )
+
+    if target_page_size < mamba_raw_size:
+        raise ValueError(
+            "The padded hybrid cache page is smaller than the Mamba/KDA "
+            f"state: target={target_page_size}, required={mamba_raw_size}."
+        )
+
     if (
         cache_config.mamba_page_size_padded is None
-        or cache_config.mamba_page_size_padded != attn_page_size + conv_block_page_size
+        or cache_config.mamba_page_size_padded != target_page_size
     ):
-        cache_config.mamba_page_size_padded = attn_page_size + conv_block_page_size
-        mamba_padding_pct = 100 * conv_block_page_size / cache_config.mamba_page_size_padded
-        logger.info(
-            "Padding mamba page size by %.2f%% to ensure "
-            "that mamba page size and attention page size are "
-            "exactly equal.",
-            mamba_padding_pct,
-        )
+        cache_config.mamba_page_size_padded = target_page_size
+        if target_page_size > mamba_raw_size:
+            mamba_padding_pct = 100 * (target_page_size - mamba_raw_size) / target_page_size
+            logger.info(
+                "Padding mamba page size by %.2f%% to ensure "
+                "that mamba page size and attention page size are "
+                "exactly equal.",
+                mamba_padding_pct,
+            )
     # The extract_hidden_states connector (ExampleHiddenStatesConnector) only
     # manages the dedicated hidden-state cache-only layer; it does not migrate
     # mamba KV blocks across instances, so it does not require the block-aligned
