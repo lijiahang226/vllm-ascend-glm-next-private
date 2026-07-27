@@ -118,8 +118,6 @@ GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER = WeightsMapper(
     orig_to_new_substr={
         ".self_attn.forget_gate.A_log": ".self_attn.A_log",
         ".self_attn.forget_gate.dt_bias": ".self_attn.dt_bias",
-        ".self_attn.o_norm.weight": ".self_attn.o_norm_weight",
-        ".self_attn.o_norm.bias": ".self_attn.o_norm_bias",
         ".attn_hc.fn": ".hc_attn_fn",
         ".attn_hc.base": ".hc_attn_base",
         ".attn_hc.scale": ".hc_attn_scale",
@@ -128,6 +126,21 @@ GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER = WeightsMapper(
         ".ffn_hc.scale": ".hc_ffn_scale",
     }
 )
+
+
+class AscendGlm5NextGatedRMSNormParams(nn.Module):
+    """保存 gated RMSNorm 参数，并匹配 Transformers checkpoint 命名。"""
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        # Transformers 只保存 o_norm.weight；Ascend kernel 需要显式零 bias。
+        # non-persistent buffer 不参与 checkpoint 和严格参数完整性检查。
+        self.register_buffer(
+            "bias",
+            torch.zeros(hidden_size),
+            persistent=False,
+        )
 
 
 def _get_indexer_kpool_mla_backend() -> type[AttentionBackend]:
@@ -1613,8 +1626,7 @@ class AscendGlm5NextLinearAttention(nn.Module, MambaBase):
             quant_config=None,
             prefix=f"{prefix}.o_proj",
         )
-        self.o_norm_weight = nn.Parameter(torch.ones(self.head_dim))
-        self.o_norm_bias = nn.Parameter(torch.zeros(self.head_dim))
+        self.o_norm = AscendGlm5NextGatedRMSNormParams(self.head_dim)
 
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -1808,8 +1820,8 @@ class AscendGlm5NextLinearAttention(nn.Module, MambaBase):
         core_attn_out = rms_norm_gated(
             core_attn_out,
             gate,
-            self.o_norm_weight,
-            self.o_norm_bias,
+            self.o_norm.weight,
+            self.o_norm.bias,
             activation="sigmoid",
             eps=self.rms_norm_eps,
         )
@@ -2337,12 +2349,6 @@ class AscendGlm5NextModel(nn.Module):
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
-        # Transformers 的 gated RMSNorm checkpoint 可能只保存 scale；Ascend
-        # kernel 还需要一个恒为零的 bias 参数。该参数在构造时已初始化为零，
-        # 将它标记为已初始化，避免严格权重检查把运行时常量误报为缺失权重。
-        loaded_params.update(
-            name for name in params_dict if name.endswith(".self_attn.o_norm_bias")
-        )
         return loaded_params
 
 

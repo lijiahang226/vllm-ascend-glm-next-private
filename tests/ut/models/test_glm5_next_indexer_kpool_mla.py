@@ -35,8 +35,8 @@ from vllm_ascend.models import register_model as register_ascend_models
 from vllm_ascend.models.glm5_next import (
     GLM5_CONDITIONAL_WEIGHTS_MAPPER,
     GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER,
-    GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER,
     AscendGlm5NextCompressorStateCache,
+    AscendGlm5NextGatedRMSNormParams,
     AscendGlm5NextIndexer,
     AscendGlm5NextIndexerKPoolCache,
     AscendSparseAttnIndexerKpool,
@@ -354,8 +354,7 @@ def test_glm5_transformers_internal_weight_names_are_mapped():
         [
             "layers.0.self_attn.forget_gate.A_log",
             "layers.0.self_attn.forget_gate.dt_bias",
-            "layers.0.self_attn.o.norm.weight",
-            "layers.0.self_attn.o.norm.bias",
+            "layers.0.self_attn.o_norm.weight",
             "layers.38.attn_hc.fn",
             "layers.38.attn_hc.base",
             "layers.38.attn_hc.scale",
@@ -368,8 +367,7 @@ def test_glm5_transformers_internal_weight_names_are_mapped():
     assert names == [
         "layers.0.self_attn.A_log",
         "layers.0.self_attn.dt_bias",
-        "layers.0.self_attn.o_norm_weight",
-        "layers.0.self_attn.o_norm_bias",
+        "layers.0.self_attn.o_norm.weight",
         "layers.38.hc_attn_fn",
         "layers.38.hc_attn_base",
         "layers.38.hc_attn_scale",
@@ -377,6 +375,14 @@ def test_glm5_transformers_internal_weight_names_are_mapped():
         "layers.38.hc_ffn_base",
         "layers.38.hc_ffn_scale",
     ]
+
+
+def test_glm5_gated_rms_norm_matches_transformers_state_dict_name():
+    o_norm = AscendGlm5NextGatedRMSNormParams(hidden_size=8)
+
+    assert list(dict(o_norm.named_parameters())) == ["weight"]
+    assert list(o_norm.state_dict()) == ["weight"]
+    assert torch.count_nonzero(o_norm.bias) == 0
 
 
 def test_glm5_kda_gate_exposes_bounded_gate_parameters():
