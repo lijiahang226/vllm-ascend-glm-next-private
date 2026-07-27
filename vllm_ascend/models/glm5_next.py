@@ -36,6 +36,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
+    KimiGatedDeltaNetAttention,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFuncCalculator,
     MambaStateDtypeCalculator,
@@ -62,6 +65,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    WeightsMapper,
     extract_layer_index,
     is_pp_missing_parameter,
     make_layers,
@@ -96,6 +100,34 @@ from vllm_ascend.transformers_utils.configs.glm5_next import Glm5NextTextConfig
 INDEXER_KPOOL_HEAD_DIM = 128
 INDEXER_KPOOL_QUERY_CHUNK_SIZE = 16
 INDEXER_KPOOL_KEY_CHUNK_SIZE = 2048
+
+# 完整 Glm5NextForConditionalGeneration checkpoint 同时包含视觉塔和语言
+# 模型。Ascend 当前为该 architecture 注册纯文本运行 wrapper：保留并跳过
+# 视觉权重，将 HF 多模态 wrapper 下的语言模型前缀映射到纯文本模型。
+GLM5_CONDITIONAL_WEIGHTS_MAPPER = WeightsMapper(
+    orig_to_new_prefix={
+        "model.visual.": None,
+        "visual.": None,
+        "model.language_model.": "model.",
+        "language_model.model.": "model.",
+        "language_model.lm_head.": "lm_head.",
+    }
+)
+
+GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        ".self_attn.forget_gate.A_log": ".self_attn.A_log",
+        ".self_attn.forget_gate.dt_bias": ".self_attn.dt_bias",
+        ".self_attn.o_norm.weight": ".self_attn.o_norm_weight",
+        ".self_attn.o_norm.bias": ".self_attn.o_norm_bias",
+        ".attn_hc.fn": ".hc_attn_fn",
+        ".attn_hc.base": ".hc_attn_base",
+        ".attn_hc.scale": ".hc_attn_scale",
+        ".ffn_hc.fn": ".hc_ffn_fn",
+        ".ffn_hc.base": ".hc_ffn_base",
+        ".ffn_hc.scale": ".hc_ffn_scale",
+    }
+)
 
 
 def _get_indexer_kpool_mla_backend() -> type[AttentionBackend]:
@@ -1982,9 +2014,9 @@ class AscendGlm5NextDecoderLayer(nn.Module):
         self.layer_kind = "kda" if _is_kda_layer(config, layer_idx) else "mla"
 
         if _is_kda_layer(config, layer_idx):
-            self.self_attn = AscendGlm5NextLinearAttention(
-                config=config,
-                vllm_config=vllm_config,
+            self.self_attn = KimiGatedDeltaNetAttention(
+                config,
+                vllm_config,
                 prefix=f"{prefix}.self_attn",
             )
         else:
@@ -2304,6 +2336,13 @@ class AscendGlm5NextModel(nn.Module):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        # Transformers 的 gated RMSNorm checkpoint 可能只保存 scale；Ascend
+        # kernel 还需要一个恒为零的 bias 参数。该参数在构造时已初始化为零，
+        # 将它标记为已初始化，避免严格权重检查把运行时常量误报为缺失权重。
+        loaded_params.update(
+            name for name in params_dict if name.endswith(".self_attn.o_norm_bias")
+        )
         return loaded_params
 
 
@@ -2392,4 +2431,10 @@ class AscendGlm5NextForCausalLM(nn.Module, HasInnerState, SupportsPP, MixtureOfE
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights)
+        return loader.load_weights(
+            weights,
+            mapper=(
+                GLM5_CONDITIONAL_WEIGHTS_MAPPER
+                | GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER
+            ),
+        )

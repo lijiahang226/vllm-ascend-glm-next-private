@@ -33,6 +33,8 @@ from vllm_ascend.core.kv_cache_interface import (
 )
 from vllm_ascend.models import register_model as register_ascend_models
 from vllm_ascend.models.glm5_next import (
+    GLM5_CONDITIONAL_WEIGHTS_MAPPER,
+    GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER,
     AscendGlm5NextCompressorStateCache,
     AscendGlm5NextIndexer,
     AscendGlm5NextIndexerKPoolCache,

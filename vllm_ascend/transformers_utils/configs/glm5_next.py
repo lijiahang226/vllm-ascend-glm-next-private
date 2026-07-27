@@ -185,6 +185,22 @@ class Glm5NextTextConfig(PretrainedConfig):
         )
 
     @property
+    def linear_attn_config(self) -> dict:
+        """Synthesize linear_attn_config from flat attributes for KDA compatibility.
+
+        The upstream ``KimiGatedDeltaNetAttention.__init__`` accesses
+        ``config.linear_attn_config`` directly.  GLM5 Next stores KDA
+        head parameters as top-level fields, so we return a dict mirroring
+        the legacy ``linear_attn_config`` schema.
+        """
+        return {
+            "head_dim": self.linear_head_dim,
+            "num_heads": self.linear_num_heads,
+            "short_conv_kernel_size": self.linear_conv_kernel_dim,
+            "lower_bound": self.linear_lower_bound,
+        }
+
+    @property
     def is_mla(self):
         return (
             self.q_lora_rank is not None
