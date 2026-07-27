@@ -35,6 +35,7 @@ from vllm_ascend.models import register_model as register_ascend_models
 from vllm_ascend.models.glm5_next import (
     GLM5_CONDITIONAL_WEIGHTS_MAPPER,
     GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER,
+    GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER,
     AscendGlm5NextCompressorStateCache,
     AscendGlm5NextIndexer,
     AscendGlm5NextIndexerKPoolCache,
@@ -346,6 +347,36 @@ def test_glm5_conditional_generation_architecture_uses_text_only_ascend_model(
         "vllm_ascend.models.glm5_next:AscendGlm5NextForCausalLM"
     )
     assert registered_models["Glm5NextForConditionalGeneration"] == registered_models["Glm5NextForCausalLM"]
+
+
+def test_glm5_transformers_internal_weight_names_are_mapped():
+    names = GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER.apply_list(
+        [
+            "layers.0.self_attn.forget_gate.A_log",
+            "layers.0.self_attn.forget_gate.dt_bias",
+            "layers.0.self_attn.o.norm.weight",
+            "layers.0.self_attn.o.norm.bias",
+            "layers.38.attn_hc.fn",
+            "layers.38.attn_hc.base",
+            "layers.38.attn_hc.scale",
+            "layers.38.ffn_hc.fn",
+            "layers.38.ffn_hc.base",
+            "layers.38.ffn_hc.scale",
+        ]
+    )
+
+    assert names == [
+        "layers.0.self_attn.A_log",
+        "layers.0.self_attn.dt_bias",
+        "layers.0.self_attn.o_norm_weight",
+        "layers.0.self_attn.o_norm_bias",
+        "layers.38.hc_attn_fn",
+        "layers.38.hc_attn_base",
+        "layers.38.hc_attn_scale",
+        "layers.38.hc_ffn_fn",
+        "layers.38.hc_ffn_base",
+        "layers.38.hc_ffn_scale",
+    ]
 
 
 def test_glm5_kda_gate_exposes_bounded_gate_parameters():
