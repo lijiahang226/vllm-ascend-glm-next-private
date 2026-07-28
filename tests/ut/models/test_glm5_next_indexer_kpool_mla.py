@@ -4,14 +4,17 @@
 import inspect
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 from transformers import AutoConfig
 from vllm import ModelRegistry
+from vllm.config.compilation import CUDAGraphMode
 from vllm.transformers_utils.model_arch_config_convertor import (
     MODEL_ARCH_CONFIG_CONVERTORS,
 )
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
@@ -24,6 +27,7 @@ from vllm_ascend.attention.indexer_kpool_mla_v1 import (
     AscendIndexerKPoolBackend,
     AscendIndexerKPoolMetadataBuilder,
     AscendIndexerKPoolMLAImpl,
+    AscendIndexerKPoolMLAMetadataBuilder,
     AscendIndexerKPoolStateBackend,
 )
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
@@ -33,7 +37,6 @@ from vllm_ascend.core.kv_cache_interface import (
 )
 from vllm_ascend.models import register_model as register_ascend_models
 from vllm_ascend.models.glm5_next import (
-    GLM5_CONDITIONAL_WEIGHTS_MAPPER,
     GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER,
     AscendGlm5NextCompressorStateCache,
     AscendGlm5NextGatedRMSNormParams,
@@ -107,6 +110,26 @@ def test_indexer_kpool_mla_cache_roles_expose_v023_prefill_backend_sentinel():
     assert not hasattr(AscendGlm5NextIndexerKPoolCache, "prefill_backend")
 
 
+def test_indexer_kpool_mla_supports_uniform_decode_aclgraph():
+    assert (
+        AscendIndexerKPoolMLAMetadataBuilder.get_cudagraph_support(
+            SimpleNamespace(),
+            SimpleNamespace(),
+        )
+        is AttentionCGSupport.UNIFORM_BATCH
+    )
+
+
+def test_indexer_kpool_mla_disables_full_graph_for_speculative_decode():
+    assert (
+        AscendIndexerKPoolMLAMetadataBuilder.get_cudagraph_support(
+            SimpleNamespace(speculative_config=SimpleNamespace()),
+            SimpleNamespace(),
+        )
+        is AttentionCGSupport.NEVER
+    )
+
+
 def test_indexer_kpool_mla_participates_in_post_load_weight_processing():
     wrapper = object.__new__(AscendIndexerKPoolMLAAttention)
     assert _is_ascend_attention(wrapper)
@@ -153,7 +176,12 @@ def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
     builder = AscendIndexerKPoolMetadataBuilder(
         spec,
         ["model.layers.0.self_attn.indexer.k_cache"],
-        SimpleNamespace(),
+        SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=16,
+                max_num_seqs=4,
+            )
+        ),
         torch.device("cpu"),
     )
     common_metadata = SimpleNamespace(
@@ -177,6 +205,23 @@ def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
     assert metadata.seq_lens.tolist() == [1]
     assert metadata.seq_lens_cpu.tolist() == [1]
     assert metadata.block_table.tolist() == [[7]]
+
+    first_slot_mapping_ptr = metadata.slot_mapping.data_ptr()
+    first_seq_lens_ptr = metadata.seq_lens.data_ptr()
+    common_metadata.positions = torch.tensor([4, 5, 6, 7])
+    common_metadata.slot_mapping = torch.tensor(
+        [9 * 128 + offset for offset in range(4, 8)]
+    )
+    common_metadata.seq_lens = torch.tensor([8], dtype=torch.int32)
+    common_metadata._seq_lens_cpu = torch.tensor([8], dtype=torch.int32)
+    common_metadata.block_table_tensor = torch.tensor([[9]], dtype=torch.int32)
+
+    replay_metadata = builder.build(0, common_metadata)
+
+    assert replay_metadata.slot_mapping.data_ptr() == first_slot_mapping_ptr
+    assert replay_metadata.seq_lens.data_ptr() == first_seq_lens_ptr
+    assert replay_metadata.slot_mapping.tolist() == [-1, -1, -1, 9 * 32 + 1]
+    assert replay_metadata.seq_lens.tolist() == [2]
 
 
 def test_glm5_latest_config_schema_drives_attention_and_mlp_layout():
@@ -601,6 +646,164 @@ def test_indexer_kpool_mla_kpool_topk_budget_is_cached_during_initialization():
     )
 
     assert op.pool_topk == 512
+
+
+@patch("torch.ops._C_ascend.npu_lightning_indexer", create=True)
+def test_indexer_kpool_mla_decode_topk_uses_graph_compatible_ascend_op(mock_lightning_indexer):
+    expected = torch.tensor(
+        [
+            [[2, -1]],
+            [[1, 0]],
+        ],
+        dtype=torch.int32,
+    )
+    mock_lightning_indexer.return_value = (expected, torch.empty(0))
+    query = torch.zeros((2, 1, 4), dtype=torch.bfloat16)
+    key = torch.zeros((3, 2, 1, 4), dtype=torch.bfloat16)
+    weights = torch.ones((2, 1), dtype=torch.bfloat16)
+    query_lens = torch.tensor([1, 2], dtype=torch.int32)
+    key_lens = torch.tensor([3, 2], dtype=torch.int32)
+    block_table = torch.tensor([[0, 1], [2, 0]], dtype=torch.int32)
+
+    result = AscendSparseAttnIndexerKpool.indexer_kpool_topk_decode(
+        query,
+        key,
+        weights,
+        query_lens,
+        key_lens,
+        block_table,
+        sparse_count=2,
+    )
+
+    torch.testing.assert_close(result, expected.squeeze(1))
+    mock_lightning_indexer.assert_called_once_with(
+        query=query,
+        key=key,
+        weights=weights,
+        actual_seq_lengths_query=query_lens,
+        actual_seq_lengths_key=key_lens,
+        block_table=block_table,
+        layout_query="TND",
+        layout_key="PA_BSND",
+        sparse_count=2,
+        sparse_mode=3,
+    )
+
+
+@patch("vllm_ascend.attention.indexer_kpool_mla_v1.get_forward_context")
+@patch("torch_npu.npu_scatter_nd_update_", create=True)
+def test_indexer_kpool_mla_state_write_maps_negative_slots_to_restored_sentinel(
+    mock_scatter,
+    mock_get_forward_context,
+):
+    mock_get_forward_context.return_value = SimpleNamespace(
+        cudagraph_runtime_mode=CUDAGraphMode.FULL
+    )
+    cache = torch.zeros((1, 4, 8), dtype=torch.bfloat16)
+    slots = torch.tensor([2, -1], dtype=torch.int64)
+    values = torch.ones((2, 1, 8), dtype=torch.bfloat16)
+
+    AscendIndexerKPoolMLAImpl._store_indexer_cache(
+        None,
+        cache,
+        slots,
+        values,
+    )
+
+    scatter_cache, scatter_slots, scatter_values = mock_scatter.call_args.args
+    assert scatter_cache.shape == (4, 8)
+    assert scatter_slots.tolist() == [[2], [0]]
+    assert scatter_values.shape == (2, 8)
+    assert scatter_values[1].tolist() == [0.0] * 8
+
+
+@patch("vllm_ascend.models.glm5_next.get_forward_context")
+@patch("torch.ops._C_ascend.npu_lightning_indexer", create=True)
+@patch("torch_npu.npu_scatter_nd_update_", create=True)
+def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
+    mock_scatter,
+    mock_lightning_indexer,
+    mock_get_forward_context,
+):
+    def scatter_rows(cache, indices, updates):
+        for row, index in enumerate(indices.tolist()):
+            index = tuple(index)
+            cache[index] = updates[row]
+
+    mock_scatter.side_effect = scatter_rows
+    mock_lightning_indexer.return_value = (
+        torch.tensor([[[0]], [[-1]]], dtype=torch.int32),
+        torch.empty(0),
+    )
+
+    state_cache = torch.zeros((1, 4, 4), dtype=torch.bfloat16)
+    indexer_cache = torch.zeros((1, 1, 1, 2), dtype=torch.bfloat16)
+    state_layer = SimpleNamespace(
+        prefix="layer.indexer.state",
+        compress_ratio=4,
+        kv_cache=state_cache,
+    )
+    indexer_layer = SimpleNamespace(
+        prefix="layer.indexer.k_cache",
+        kv_cache=indexer_cache,
+    )
+    state_metadata = SimpleNamespace(
+        slot_mapping=torch.tensor([3, -1], dtype=torch.int64),
+        block_table=torch.tensor([[0], [0]], dtype=torch.int32),
+        block_size=4,
+    )
+    indexer_metadata = SimpleNamespace(
+        slot_mapping=torch.tensor([0, -1], dtype=torch.int64),
+        block_table=torch.tensor([[0], [0]], dtype=torch.int32),
+        seq_lens=torch.tensor([1, 0], dtype=torch.int32),
+        seq_lens_cpu=SimpleNamespace(max=lambda: pytest.fail("full decode must not read CPU max sequence length")),
+    )
+    attn_metadata = SimpleNamespace(
+        cum_query_lens=torch.tensor([1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([4, 1], dtype=torch.int32),
+    )
+    mock_get_forward_context.return_value = SimpleNamespace(
+        virtual_engine=0,
+        cudagraph_runtime_mode=CUDAGraphMode.FULL,
+        attn_metadata={
+            state_layer.prefix: state_metadata,
+            indexer_layer.prefix: indexer_metadata,
+            "layer.attn": attn_metadata,
+        },
+    )
+    op = AscendSparseAttnIndexerKpool(
+        k_cache=indexer_layer,
+        quant_block_size=128,
+        scale_fmt=None,
+        topk_tokens=4,
+        head_dim=2,
+        max_model_len=16,
+        max_total_seq_len=16,
+        topk_indices_buffer=None,
+        state_cache=state_layer,
+        attn_layer_name="layer.attn",
+    )
+    with patch.object(
+        op,
+        "indexer_kpool_topk_pytorch",
+        side_effect=AssertionError("full decode must not use the dynamic PyTorch top-k"),
+    ):
+        result = op.forward_ascend(
+            torch.empty((2, 1)),
+            torch.zeros((2, 1, 2), dtype=torch.bfloat16),
+            torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.bfloat16),
+            torch.ones((2, 1), dtype=torch.bfloat16),
+            gate_score=torch.zeros((2, 2), dtype=torch.bfloat16),
+            compress_ape=torch.zeros((4, 2), dtype=torch.float32),
+            index_kpool=4,
+            positions=torch.tensor([3, 0], dtype=torch.int64),
+        )
+
+    assert result.shape == (2, 1, 7)
+    assert result[0, 0].tolist() == [0, 1, 2, 3, -1, -1, -1]
+    assert result[1, 0].tolist() == [-1, -1, -1, -1, 0, -1, -1]
+    assert indexer_cache[0, 0, 0, 0] > 0
+    assert mock_lightning_indexer.call_count == 1
 
 
 def test_indexer_kpool_mla_indexer_small_ops_use_bfloat16_cache_contract():

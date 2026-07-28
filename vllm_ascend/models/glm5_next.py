@@ -12,6 +12,7 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -398,18 +399,45 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         return cache
 
     @staticmethod
+    def _scatter_rows_graph_safe(
+        cache_rows: torch.Tensor,
+        slots: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        """Scatter fixed-shape rows while treating invalid slots as no-ops."""
+        valid = (slots >= 0) & (slots < cache_rows.shape[0])
+        safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
+        row_mask = valid.view(-1, *([1] * (values.ndim - 1)))
+        row_zero = cache_rows[0].clone()
+        safe_values = torch.where(row_mask, values, row_zero.unsqueeze(0))
+        row_zero_mask = valid & (slots == 0)
+        update_zero = torch.where(
+            row_zero_mask.view(-1, *([1] * (values.ndim - 1))),
+            values,
+            torch.zeros_like(values),
+        ).sum(dim=0)
+        expected_zero = torch.where(row_zero_mask.any(), update_zero, row_zero)
+        torch_npu.npu_scatter_nd_update_(
+            cache_rows,
+            safe_slots.view(-1, 1),
+            safe_values,
+        )
+        cache_rows[0].copy_(expected_zero)
+
+    @staticmethod
     def _scatter_paged_cache(
         cache: torch.Tensor,
         slots: torch.Tensor,
         values: torch.Tensor,
         block_size: int,
     ) -> None:
-        block_ids = torch.div(slots, block_size, rounding_mode="floor")
-        block_offsets = torch.remainder(slots, block_size)
-        indices = torch.stack([block_ids, block_offsets], dim=-1)
-        torch_npu.npu_scatter_nd_update_(
-            cache,
-            indices,
+        if cache.shape[1] != block_size:
+            raise ValueError(
+                f"Cache block size mismatch: expected {block_size}, got {cache.shape[1]}."
+            )
+        AscendSparseAttnIndexerKpool._scatter_rows_graph_safe(
+            cache.view(-1, *cache.shape[2:]),
+            slots,
             values.view(values.shape[0], *cache.shape[2:]),
         )
 
@@ -428,18 +456,44 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             device=end_positions.device,
         )
         logical = end_positions[:, None] - offsets[None, :]
+        safe_logical = logical.clamp_min(0)
         pages = torch.div(
-            logical,
+            safe_logical,
             state_metadata.block_size,
             rounding_mode="floor",
-        )
-        page_offsets = torch.remainder(logical, state_metadata.block_size)
+        ).clamp_max(state_metadata.block_table.shape[1] - 1)
+        page_offsets = torch.remainder(safe_logical, state_metadata.block_size)
         physical_blocks = state_metadata.block_table[
             request_ids[:, None],
             pages,
-        ]
+        ].clamp(min=0, max=state_cache.shape[0] - 1)
         flat_slots = physical_blocks.long() * state_metadata.block_size + page_offsets
         return state_cache.view(-1, 2 * self.head_dim)[flat_slots]
+
+    @staticmethod
+    def indexer_kpool_topk_decode(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        weights: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        block_table: torch.Tensor,
+        sparse_count: int,
+    ) -> torch.Tensor:
+        """Select compressed pools with the graph-compatible Ascend op."""
+        pool_ids, _ = torch.ops._C_ascend.npu_lightning_indexer(
+            query=query,
+            key=key,
+            weights=weights,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+            block_table=block_table,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=sparse_count,
+            sparse_mode=3,
+        )
+        return pool_ids.squeeze(1)
 
     @staticmethod
     def history_group_budget_for_topk(topk: int, pool_size: int) -> int:
@@ -1107,23 +1161,34 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         current_state = torch.cat([k, gate_score], dim=-1).to(state_cache.dtype)
         state_rows = state_cache.view(-1, 2 * self.head_dim)
         state_slots = state_metadata.slot_mapping[:num_tokens]
-        valid_state_rows = (state_slots >= 0).nonzero().flatten()
-        if valid_state_rows.numel() > 0:
-            torch_npu.npu_scatter_nd_update_(
+        is_full_graph = context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+        if is_full_graph:
+            self._scatter_rows_graph_safe(
                 state_rows,
-                state_slots[valid_state_rows].view(-1, 1),
-                current_state[valid_state_rows],
+                state_slots,
+                current_state,
             )
+        else:
+            valid_state_rows = (state_slots >= 0).nonzero().flatten()
+            if valid_state_rows.numel() > 0:
+                torch_npu.npu_scatter_nd_update_(
+                    state_rows,
+                    state_slots[valid_state_rows].view(-1, 1),
+                    current_state[valid_state_rows],
+                )
 
-        complete = indexer_metadata.slot_mapping[:num_tokens] >= 0
-        if torch.any(complete):
+        selected = (
+            torch.arange(num_tokens, device=k.device)
+            if is_full_graph
+            else (indexer_metadata.slot_mapping[:num_tokens] >= 0).nonzero().flatten()
+        )
+        if is_full_graph or selected.numel() > 0:
             token_ids = torch.arange(num_tokens, device=k.device)
             request_ids = torch.bucketize(
                 token_ids,
                 attn_metadata.cum_query_lens,
                 right=True,
-            )
-            selected = complete.nonzero().flatten()
+            ).clamp_max(attn_metadata.seq_lens.shape[0] - 1)
             pool_state = self._gather_compressor_state(
                 state_cache,
                 state_metadata,
@@ -1144,8 +1209,12 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             )
             pool_positions = positions[selected, None] - pool_offsets[None, :]
             local_positions = pool_positions - request_query_starts[:, None]
-            current_mask = local_positions >= 0
-            current_indices = (query_offsets[selected_request_ids, None] + local_positions.clamp_min(0)).long()
+            current_mask = (local_positions >= 0) & (local_positions < query_lens[selected_request_ids, None])
+            current_indices = (
+                (query_offsets[selected_request_ids, None] + local_positions.clamp_min(0))
+                .long()
+                .clamp_max(num_tokens - 1)
+            )
             current_pool_state = current_state[current_indices]
             pool_state = torch.where(
                 current_mask.unsqueeze(-1),
@@ -1164,19 +1233,30 @@ class AscendSparseAttnIndexerKpool(nn.Module):
                 round_scale=False,
             )
 
-        max_pool_seq_len = int(indexer_metadata.seq_lens_cpu.max())
-        pool_ids = self.indexer_kpool_topk_pytorch(
-            query=q_values[:num_tokens],
-            key=indexer_cache,
-            weights=weights[:num_tokens].to(q_values.dtype),
-            actual_seq_lengths_query=attn_metadata.cum_query_lens,
-            actual_seq_lengths_key=indexer_metadata.seq_lens,
-            block_table=indexer_metadata.block_table,
-            query_positions=positions,
-            sparse_count=self.pool_topk,
-            pool_size=index_kpool,
-            max_key_seq_len=max_pool_seq_len,
-        )
+        if is_full_graph:
+            pool_ids = self.indexer_kpool_topk_decode(
+                query=q_values[:num_tokens],
+                key=indexer_cache,
+                weights=weights[:num_tokens].to(q_values.dtype),
+                actual_seq_lengths_query=attn_metadata.cum_query_lens,
+                actual_seq_lengths_key=indexer_metadata.seq_lens,
+                block_table=indexer_metadata.block_table,
+                sparse_count=self.pool_topk,
+            )
+        else:
+            max_pool_seq_len = int(indexer_metadata.seq_lens_cpu.max())
+            pool_ids = self.indexer_kpool_topk_pytorch(
+                query=q_values[:num_tokens],
+                key=indexer_cache,
+                weights=weights[:num_tokens].to(q_values.dtype),
+                actual_seq_lengths_query=attn_metadata.cum_query_lens,
+                actual_seq_lengths_key=indexer_metadata.seq_lens,
+                block_table=indexer_metadata.block_table,
+                query_positions=positions,
+                sparse_count=self.pool_topk,
+                pool_size=index_kpool,
+                max_key_seq_len=max_pool_seq_len,
+            )
         expanded = self.expand_pools_to_tokens(
             pool_ids,
             pool_ids >= 0,

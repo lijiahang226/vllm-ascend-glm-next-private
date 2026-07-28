@@ -9,6 +9,8 @@ from dataclasses import dataclass
 import torch
 import torch_npu
 from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
+from vllm.forward_context import get_forward_context
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -79,6 +81,20 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         self.logical_block_size = kv_cache_spec.block_size
         self.storage_block_size = kv_cache_spec.storage_block_size
         self.compress_ratio = kv_cache_spec.compress_ratio
+        scheduler_config = vllm_config.scheduler_config
+        # ACLGraph replay keeps the addresses captured on the first run. The
+        # derived compressed metadata therefore needs persistent storage that
+        # is refreshed in place on every builder invocation.
+        self._slot_mapping_buffer = torch.empty(
+            scheduler_config.max_num_batched_tokens,
+            dtype=torch.int64,
+            device=device,
+        )
+        self._seq_lens_buffer = torch.empty(
+            scheduler_config.max_num_seqs,
+            dtype=torch.int32,
+            device=device,
+        )
 
     def build(
         self,
@@ -90,16 +106,21 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         num_reqs = common_attn_metadata.num_reqs
         num_input_tokens = common_attn_metadata.num_input_tokens
         positions = common_attn_metadata.positions[:num_input_tokens].long()
-        slot_mapping = format_indexer_kpool_slot_mapping(
-            common_attn_metadata.slot_mapping[:num_input_tokens],
-            positions,
-            self.logical_block_size,
-            self.compress_ratio,
+        slot_mapping = self._slot_mapping_buffer[:num_input_tokens]
+        slot_mapping.copy_(
+            format_indexer_kpool_slot_mapping(
+                common_attn_metadata.slot_mapping[:num_input_tokens],
+                positions,
+                self.logical_block_size,
+                self.compress_ratio,
+            )
         )
-        seq_lens = torch.div(
+        seq_lens = self._seq_lens_buffer[:num_reqs]
+        torch.div(
             common_attn_metadata.seq_lens[:num_reqs],
             self.compress_ratio,
             rounding_mode="floor",
+            out=seq_lens,
         )
         if common_attn_metadata._seq_lens_cpu is not None:
             seq_lens_cpu = common_attn_metadata._seq_lens_cpu[:num_reqs]
@@ -263,8 +284,13 @@ class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
 
     @classmethod
     def get_cudagraph_support(cls, vllm_config: VllmConfig, kv_cache_spec) -> AttentionCGSupport:
-        # Pool completion currently uses dynamic nonzero/gather shapes.
-        return AttentionCGSupport.NEVER
+        if getattr(vllm_config, "speculative_config", None) is not None:
+            # Lightning Indexer's right-down causal mask does not model the
+            # compressed-pool boundary for multi-token speculative queries.
+            return AttentionCGSupport.NEVER
+        # The graph path uses fixed-shape cache updates and is only valid for
+        # uniform decode batches. Prefill keeps the eager implementation.
+        return AttentionCGSupport.UNIFORM_BATCH
 
     def _build(self, common_attn_metadata, draft_index: int | None = None):
         metadata = super()._build(common_attn_metadata, draft_index)
@@ -351,6 +377,35 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
     def _by_role(items) -> dict[str, object]:
         return {item.cache_role: item for item in items}
 
+    @staticmethod
+    def _scatter_rows_graph_safe(
+        cache_rows: torch.Tensor,
+        slots: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        """Scatter fixed-shape rows while treating invalid slots as no-ops."""
+        valid = (slots >= 0) & (slots < cache_rows.shape[0])
+        safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
+        row_mask = valid.view(-1, *([1] * (values.ndim - 1)))
+        row_zero = cache_rows[0].clone()
+        safe_values = torch.where(row_mask, values, row_zero.unsqueeze(0))
+
+        # Invalid rows temporarily target row zero. Preserve its correct value
+        # even when a real row-zero update and padding rows coexist.
+        row_zero_mask = valid & (slots == 0)
+        update_zero = torch.where(
+            row_zero_mask.view(-1, *([1] * (values.ndim - 1))),
+            values,
+            torch.zeros_like(values),
+        ).sum(dim=0)
+        expected_zero = torch.where(row_zero_mask.any(), update_zero, row_zero)
+        torch_npu.npu_scatter_nd_update_(
+            cache_rows,
+            safe_slots.view(-1, 1),
+            safe_values,
+        )
+        cache_rows[0].copy_(expected_zero)
+
     def _get_indexer_slot_mapping(self, attn_metadata):
         return self._indexer_kpool_mla_metadata["indexer_state"].slot_mapping
 
@@ -363,13 +418,18 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
         # Sliding-window metadata marks evicted prompt tokens with -1. Those
         # rows are already compressed and must not be scattered into the tail
         # state page during a long/chunked prefill.
+        cache_rows = cache.view(-1, values.shape[-1])
+        values = values.view(-1, values.shape[-1])
+        if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            self._scatter_rows_graph_safe(cache_rows, slot_mapping, values)
+            return
         valid_rows = (slot_mapping >= 0).nonzero().flatten()
         if valid_rows.numel() == 0:
             return
         torch_npu.npu_scatter_nd_update_(
-            cache.view(-1, values.shape[-1]),
+            cache_rows,
             slot_mapping[valid_rows].view(-1, 1),
-            values[valid_rows].view(-1, values.shape[-1]),
+            values[valid_rows],
         )
 
     def _get_mla_cache_views(
@@ -405,6 +465,13 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
         values: torch.Tensor,
         block_size: int,
     ) -> None:
+        if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            AscendIndexerKPoolMLAImpl._scatter_rows_graph_safe(
+                cache.view(-1, *cache.shape[2:]),
+                slots,
+                values.view(values.shape[0], *cache.shape[2:]),
+            )
+            return
         block_ids = torch.div(slots, block_size, rounding_mode="floor")
         block_offsets = torch.remainder(slots, block_size)
         indices = torch.stack([block_ids, block_offsets], dim=-1)
