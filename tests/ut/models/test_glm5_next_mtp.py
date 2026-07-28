@@ -2,13 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from typing import get_args
+from unittest.mock import MagicMock, patch
 
 import torch
+import vllm.config.speculative as speculative_config
 
-from vllm_ascend.models.glm5_next import _pad_nope_kv_a_weight
+from vllm_ascend.models.glm5_next import (
+    AscendGlm5NextForCausalLM,
+    _pad_nope_kv_a_weight,
+)
 from vllm_ascend.models.glm5_next_mtp import (
     AscendGlm5NextMTP,
+    AscendGlm5NextMultiTokenPredictorLayer,
     _get_spec_layer_idx,
 )
 from vllm_ascend.patch.platform.patch_speculative_config import (
@@ -69,6 +75,44 @@ def test_mtp_compute_logits_delegates_to_predictor():
     predictor.compute_logits.assert_called_once_with(hidden_states, 1)
 
 
+def test_mtp_zeroes_position_zero_embedding_before_normalization():
+    class PassthroughBlock(torch.nn.Module):
+        def forward(self, *, positions, hidden_states, residual):
+            del positions, residual
+            return hidden_states, None
+
+    layer = object.__new__(AscendGlm5NextMultiTokenPredictorLayer)
+    torch.nn.Module.__init__(layer)
+    layer.enorm = torch.nn.Identity()
+    layer.hnorm = torch.nn.Identity()
+    layer.eh_proj = torch.nn.Identity()
+    layer.mtp_block = PassthroughBlock()
+    layer.shared_head = torch.nn.Identity()
+
+    inputs_embeds = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    previous_hidden_states = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+
+    with patch(
+        "vllm_ascend.models.glm5_next_mtp.tensor_model_parallel_all_reduce",
+        side_effect=lambda hidden_states: hidden_states,
+    ):
+        hidden_states, recycled_hidden_states = layer(
+            input_ids=torch.tensor([11, 12]),
+            positions=torch.tensor([0, 3]),
+            previous_hidden_states=previous_hidden_states,
+            inputs_embeds=inputs_embeds,
+        )
+
+    expected = torch.tensor(
+        [
+            [0.0, 0.0, 5.0, 6.0],
+            [3.0, 4.0, 7.0, 8.0],
+        ]
+    )
+    assert torch.equal(hidden_states, expected)
+    assert recycled_hidden_states is hidden_states
+
+
 def test_nope_kv_projection_is_padded_with_zero_rope_rows():
     config = SimpleNamespace(
         mla_nope=True,
@@ -88,6 +132,29 @@ def test_nope_kv_projection_is_padded_with_zero_rope_rows():
     assert torch.count_nonzero(padded[4:]) == 0
 
 
+def test_glm5_mamba_config_shape_reserves_speculative_conv_slot():
+    config = Glm5NextTextConfig()
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=16),
+        model_config=SimpleNamespace(hf_config=config),
+        speculative_config=SimpleNamespace(num_speculative_tokens=1),
+    )
+
+    conv_shape, recurrent_shape = (
+        AscendGlm5NextForCausalLM.get_mamba_state_shape_from_config(
+            vllm_config
+        )
+    )
+
+    assert sorted(conv_shape) == [4, 1536]
+    assert recurrent_shape == (4, 128, 128)
+    conv_bytes = torch.empty(conv_shape, dtype=torch.bfloat16).numel() * 2
+    recurrent_bytes = (
+        torch.empty(recurrent_shape, dtype=torch.float32).numel() * 4
+    )
+    assert conv_bytes + recurrent_bytes == 274432
+
+
 def test_glm5_speculative_config_selects_mtp_architecture():
     config = Glm5NextTextConfig(
         architectures=["Glm5NextForCausalLM"],
@@ -99,3 +166,7 @@ def test_glm5_speculative_config_selects_mtp_architecture():
     assert result.model_type == "glm5_next_mtp"
     assert result.n_predict == 2
     assert result.architectures == ["Glm5NextMTPModel"]
+
+
+def test_glm5_mtp_model_type_is_detected_by_vllm_v023():
+    assert "glm5_next_mtp" in get_args(speculative_config.MTPModelTypes)

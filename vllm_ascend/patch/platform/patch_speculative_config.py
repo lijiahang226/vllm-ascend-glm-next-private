@@ -1,5 +1,6 @@
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
+import vllm.config.speculative as speculative_config
 from vllm.config.speculative import SpeculativeConfig
 from vllm.utils.import_utils import LazyLoader
 
@@ -37,7 +38,7 @@ def _glm5_hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
     """
     if _orig_hf_config_override is not None:
         hf_config = _orig_hf_config_override(hf_config)
-    if hf_config.model_type == "glm5_next":
+    if hf_config.model_type in ("glm5_next", "glm5_next_text"):
         hf_config.model_type = "glm5_next_mtp"
         n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
         hf_config.update(
@@ -48,6 +49,12 @@ def _glm5_hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         )
     return hf_config
 
+
+if "glm5_next_mtp" not in get_args(speculative_config.MTPModelTypes):
+    speculative_config.MTPModelTypes = Literal[
+        *get_args(speculative_config.MTPModelTypes),
+        "glm5_next_mtp",
+    ]
 
 SpeculativeConfig.__post_init__ = _dspark_post_init
 SpeculativeConfig.hf_config_override = staticmethod(_glm5_hf_config_override)

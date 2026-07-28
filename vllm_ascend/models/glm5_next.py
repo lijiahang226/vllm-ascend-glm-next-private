@@ -85,6 +85,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolStateSpec
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
+from vllm_ascend.ops.kimi_kda_state import kimi_kda_state_shape
 from vllm_ascend.ops.indexer_kpool_mla import (
     AscendIndexerKPoolMLAAttention,
     IndexerKPoolMLAModules,
@@ -2495,12 +2496,12 @@ class AscendGlm5NextForCausalLM(nn.Module, HasInnerState, SupportsPP, MixtureOfE
         tp_size = parallel_config.tensor_parallel_size
         num_spec = vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config else 0
         kda_config = resolve_kda_config(hf_config)
-        return MambaStateShapeCalculator.kda_state_shape(
+        return kimi_kda_state_shape(
             tp_size,
             kda_config["num_heads"],
             kda_config["head_dim"],
-            conv_kernel_size=kda_config["short_conv_kernel_size"],
-            num_spec=num_spec,
+            kda_config["short_conv_kernel_size"],
+            num_spec,
         )
 
     @classmethod

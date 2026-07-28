@@ -97,6 +97,13 @@ class AscendGlm5NextMultiTokenPredictorLayer(nn.Module):
         del input_ids, spec_step_index
         if inputs_embeds is None:
             raise ValueError("GLM-5 MTP requires input embeddings.")
+        # The first token in each sequence has no "next token" embedding.
+        # Match the upstream fused_eh_norm semantics without introducing a
+        # device-to-host synchronization in the decode hot path.
+        inputs_embeds = inputs_embeds.masked_fill(
+            positions.eq(0).unsqueeze(-1),
+            0,
+        )
         embeddings = self.enorm(inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
         hidden_states = self.eh_proj(torch.cat([embeddings, previous_hidden_states], dim=-1))
