@@ -475,7 +475,9 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
         block_ids = torch.div(slots, block_size, rounding_mode="floor")
         block_offsets = torch.remainder(slots, block_size)
         indices = torch.stack([block_ids, block_offsets], dim=-1)
-        torch_npu.npu_scatter_nd_update_(
+        # ScatterNdUpdateV2 ignores negative slots, which are used by padded
+        # full-graph decode rows.
+        torch.ops._C_ascend.npu_scatter_nd_update_v2(
             cache,
             indices,
             values.view(values.shape[0], *cache.shape[2:]),

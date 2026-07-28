@@ -2,7 +2,6 @@ from collections.abc import Iterable
 from typing import ClassVar
 
 import torch
-import torch_npu
 from einops import rearrange
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
