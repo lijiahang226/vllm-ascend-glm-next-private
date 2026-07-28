@@ -29,6 +29,7 @@ from vllm_ascend.attention.indexer_kpool_mla_v1 import (
     AscendIndexerKPoolMLAImpl,
     AscendIndexerKPoolMLAMetadataBuilder,
     AscendIndexerKPoolStateBackend,
+    AscendIndexerKPoolStateMetadataBuilder,
 )
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
 from vllm_ascend.core.kv_cache_interface import (
@@ -118,6 +119,20 @@ def test_indexer_kpool_mla_supports_uniform_decode_aclgraph():
         )
         is AttentionCGSupport.UNIFORM_BATCH
     )
+
+
+def test_indexer_kpool_cache_only_builders_do_not_disable_uniform_decode_aclgraph():
+    for builder_cls in (
+        AscendIndexerKPoolMetadataBuilder,
+        AscendIndexerKPoolStateMetadataBuilder,
+    ):
+        assert (
+            builder_cls.get_cudagraph_support(
+                SimpleNamespace(),
+                SimpleNamespace(),
+            )
+            is AttentionCGSupport.UNIFORM_BATCH
+        )
 
 
 def test_indexer_kpool_mla_disables_full_graph_for_speculative_decode():

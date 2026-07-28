@@ -58,6 +58,17 @@ class AscendIndexerKPoolMetadata:
 class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
     """为压缩 Indexer K cache 构造 pool 级寻址信息。"""
 
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec,
+    ) -> AttentionCGSupport:
+        # This cache-only builder still participates in graph capability
+        # reduction. Its decode metadata uses persistent buffers refreshed in
+        # place, so it must not disable the main model's uniform decode graph.
+        return AttentionCGSupport.UNIFORM_BATCH
+
     def __init__(
         self,
         kv_cache_spec: MLAAttentionSpec,
@@ -186,6 +197,17 @@ class AscendIndexerKPoolStateMetadata:
 
 class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
     """为 GLM-5 compressor tail cache 构造独立 metadata。"""
+
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec,
+    ) -> AttentionCGSupport:
+        # Full-graph state writes use the fixed-shape sentinel path. Do not let
+        # the base class default NEVER downgrade FULL_DECODE_ONLY for the main
+        # model merely because this cache-only builder is in the cache group.
+        return AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(
         self,
