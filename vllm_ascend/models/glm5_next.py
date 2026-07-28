@@ -1233,15 +1233,12 @@ class AscendSparseAttnIndexerKpool(nn.Module):
                 pool_state,
             )
             pool_k, pool_gate = pool_state.split(self.head_dim, dim=-1)
-            self.kpool_compress_and_write_cache(
+            torch.ops.vllm.glm5_next_kpool_compress_and_write_cache(
                 indexer_cache,
                 pool_k.to(torch.bfloat16),
                 pool_gate.to(torch.bfloat16),
                 compress_ape,
                 indexer_metadata.slot_mapping[selected].to(torch.int64),
-                pool_size=index_kpool,
-                head_dim=self.head_dim,
-                round_scale=False,
             )
 
         if is_full_graph:
