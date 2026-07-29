@@ -138,6 +138,11 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
         except AttributeError:
             self.moe_all_to_all_group_name = ""
+        except RuntimeError as e:
+            if "same physical device" in str(e):
+                self.moe_all_to_all_group_name = ""
+            else:
+                raise
 
     def get_weight(
         self, num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
