@@ -4197,6 +4197,49 @@ class NPUModelRunner(GPUModelRunner):
             storage_offset_bytes += stride[0] * dtype_size
         return reshaped_kv_tensors
 
+    @staticmethod
+    def _reshape_padded_cache_tensor(
+        raw_tensor: torch.Tensor,
+        cache_shape: tuple[int, ...],
+        dtype: torch.dtype,
+        page_size_bytes: int,
+        page_offset_bytes: int = 0,
+    ) -> torch.Tensor:
+        """Create a cache view whose block stride includes page padding."""
+        dtype_size = get_dtype_size(dtype)
+        if page_size_bytes % dtype_size or page_offset_bytes % dtype_size:
+            raise ValueError(
+                "Physical page stride and payload offset must be aligned to "
+                f"{dtype}: page={page_size_bytes}, offset={page_offset_bytes}."
+            )
+        page_stride = page_size_bytes // dtype_size
+        inner_numel = math.prod(cache_shape[1:])
+        page_offset = page_offset_bytes // dtype_size
+        if page_offset + inner_numel > page_stride:
+            raise ValueError(
+                "Cache payload does not fit in its physical page: "
+                f"shape={cache_shape}, page_size_bytes={page_size_bytes}, "
+                f"page_offset_bytes={page_offset_bytes}."
+            )
+        typed_tensor = raw_tensor.view(dtype)
+        required_numel = (
+            page_offset
+            + (cache_shape[0] - 1) * page_stride
+            + inner_numel
+        )
+        if required_numel > typed_tensor.numel():
+            raise ValueError(
+                "Raw cache tensor is too small for the padded view: "
+                f"required={required_numel}, available={typed_tensor.numel()}."
+            )
+        inner_strides = torch.empty(cache_shape[1:]).stride()
+        return torch.as_strided(
+            typed_tensor,
+            size=cache_shape,
+            stride=(page_stride, *inner_strides),
+            storage_offset=typed_tensor.storage_offset() + page_offset,
+        )
+
     def _reshape_kv_cache_tensors(
         self,
         kv_cache_config: KVCacheConfig,
@@ -4215,6 +4258,10 @@ class NPUModelRunner(GPUModelRunner):
         """
         kv_caches: dict[str, torch.Tensor] = {}
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        is_glm5_cache_plan = any(
+            _is_glm5_indexer_kpool_cache_spec(spec)
+            for spec in layer_kv_cache_spec.values()
+        )
         for group in self._kv_cache_spec_attn_group_iterator():
             attn_backend = group.backend
             current_kv_cache_spec = group.kv_cache_spec
@@ -4276,9 +4323,12 @@ class NPUModelRunner(GPUModelRunner):
                             current_kv_cache_spec.num_kv_heads,
                             current_kv_cache_spec.head_size,
                         )
-                        kv_caches[layer_name] = raw_tensor.view(
-                            current_kv_cache_spec.dtype
-                        ).view(cache_shape)
+                        kv_caches[layer_name] = self._reshape_padded_cache_tensor(
+                            raw_tensor,
+                            cache_shape,
+                            current_kv_cache_spec.dtype,
+                            current_kv_cache_spec.page_size_bytes,
+                        )
                     continue
 
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
@@ -4579,6 +4629,7 @@ class NPUModelRunner(GPUModelRunner):
                     state_tensors = []
                     target_idx = 0
                     start_idx = 0
+                    page_offset_bytes = 0
                     # NOTE(zxr): in order to keep all tensor contiguous, we align ssm and kv block
                     # with same page size, so have to add extra padding block for kv, the overall
                     # layout of hybrid kv_cache on Ascend is:
@@ -4589,6 +4640,20 @@ class NPUModelRunner(GPUModelRunner):
                         # normally, there is conv state and ssm state in this loop. And there is only
                         # a conv state in some special models.
                         target_shape = (num_blocks, *shape)
+
+                        if is_glm5_cache_plan:
+                            tensor = self._reshape_padded_cache_tensor(
+                                raw_tensor,
+                                target_shape,
+                                dtype,
+                                current_kv_cache_spec.page_size_bytes,
+                                page_offset_bytes,
+                            )
+                            page_offset_bytes += math.prod(shape) * get_dtype_size(
+                                dtype
+                            )
+                            state_tensors.append(tensor)
+                            continue
 
                         target_idx += math.prod(target_shape) * get_dtype_size(dtype)
                         tensor = raw_tensor[start_idx:target_idx].view(dtype).view(target_shape)

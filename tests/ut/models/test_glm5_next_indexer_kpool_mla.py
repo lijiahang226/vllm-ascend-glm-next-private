@@ -926,6 +926,61 @@ def test_indexer_kpool_mla_state_write_maps_negative_slots_to_restored_sentinel(
     assert cache.view(-1, 8)[0].tolist() == [0.0] * 8
 
 
+@patch("vllm_ascend.attention.indexer_kpool_mla_v1.get_forward_context")
+@patch("torch_npu.npu_scatter_nd_update_", create=True)
+def test_indexer_kpool_mla_paged_write_preserves_physical_page_stride(
+    mock_scatter,
+    mock_get_forward_context,
+):
+    mock_get_forward_context.return_value = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL)
+    raw_cache = torch.zeros(16, dtype=torch.bfloat16)
+    cache = torch.as_strided(
+        raw_cache,
+        size=(2, 2, 1, 2),
+        stride=(8, 2, 2, 1),
+    )
+    values = torch.tensor(
+        [[[1.0, 2.0]], [[9.0, 9.0]]],
+        dtype=torch.bfloat16,
+    )
+
+    AscendIndexerKPoolMLAImpl._scatter_paged_cache(
+        cache,
+        torch.tensor([3, -1], dtype=torch.int64),
+        values,
+        block_size=2,
+    )
+
+    mock_scatter.assert_not_called()
+    torch.testing.assert_close(cache[1, 1], values[0])
+    torch.testing.assert_close(cache[0, 0], torch.zeros_like(cache[0, 0]))
+    assert raw_cache[4:8].tolist() == [0.0] * 4
+
+
+def test_glm5_indexer_paged_write_preserves_physical_page_stride():
+    raw_cache = torch.zeros(16, dtype=torch.bfloat16)
+    cache = torch.as_strided(
+        raw_cache,
+        size=(2, 2, 1, 2),
+        stride=(8, 2, 2, 1),
+    )
+    values = torch.tensor(
+        [[[3.0, 4.0]], [[9.0, 9.0]]],
+        dtype=torch.bfloat16,
+    )
+
+    AscendSparseAttnIndexerKpool._scatter_paged_cache(
+        cache,
+        torch.tensor([2, -1], dtype=torch.int64),
+        values,
+        block_size=2,
+    )
+
+    torch.testing.assert_close(cache[1, 0], values[0])
+    torch.testing.assert_close(cache[0, 0], torch.zeros_like(cache[0, 0]))
+    assert raw_cache[4:8].tolist() == [0.0] * 4
+
+
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
 @patch("torch.ops._C_ascend.npu_lightning_indexer", create=True)
 @patch("torch_npu.npu_scatter_nd_update_", create=True)
@@ -1243,7 +1298,12 @@ def test_indexer_kpool_mla_sparse_attention_pytorch_matches_golden_semantics():
         ],
         dtype=torch.float32,
     )
-    packed_cache = torch.empty((2, 2, 1, 3), dtype=torch.float32)
+    raw_cache = torch.empty(16, dtype=torch.float32)
+    packed_cache = torch.as_strided(
+        raw_cache,
+        size=(2, 2, 1, 3),
+        stride=(8, 3, 3, 1),
+    )
     packed_cache[1, :, 0, :] = logical_kv[:2]
     packed_cache[0, :, 0, :] = logical_kv[2:]
     latent_view, rope_view = packed_cache.split([2, 1], dim=-1)

@@ -433,11 +433,31 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             raise ValueError(
                 f"Cache block size mismatch: expected {block_size}, got {cache.shape[1]}."
             )
-        AscendSparseAttnIndexerKpool._scatter_rows_graph_safe(
-            cache.view(-1, *cache.shape[2:]),
-            slots,
-            values.view(values.shape[0], *cache.shape[2:]),
+        values = values.view(values.shape[0], *cache.shape[2:])
+        valid = (slots >= 0) & (slots < cache.shape[0] * block_size)
+        safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
+        block_ids = torch.div(
+            safe_slots,
+            block_size,
+            rounding_mode="floor",
         )
+        block_offsets = torch.remainder(safe_slots, block_size)
+        row_mask = valid.view(-1, *([1] * (values.ndim - 1)))
+        row_zero = cache[0, 0].clone()
+        safe_values = torch.where(row_mask, values, row_zero.unsqueeze(0))
+        row_zero_mask = valid & (slots == 0)
+        update_zero = torch.where(
+            row_zero_mask.view(-1, *([1] * (values.ndim - 1))),
+            values,
+            torch.zeros_like(values),
+        ).sum(dim=0)
+        expected_zero = torch.where(
+            row_zero_mask.any(),
+            update_zero,
+            row_zero,
+        )
+        cache[block_ids, block_offsets] = safe_values
+        cache[0, 0].copy_(expected_zero)
 
     def _gather_compressor_state(
         self,

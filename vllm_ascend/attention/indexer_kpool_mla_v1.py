@@ -485,11 +485,35 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
         block_size: int,
     ) -> None:
         if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL:
-            AscendIndexerKPoolMLAImpl._scatter_rows_graph_safe(
-                cache.view(-1, *cache.shape[2:]),
-                slots,
-                values.view(values.shape[0], *cache.shape[2:]),
+            # A GLM-5 logical cache may occupy only the payload prefix of a
+            # larger physical page. Flattening such an as_strided view would
+            # either fail or discard the physical page stride, so address the
+            # page and its token offset independently.
+            values = values.view(values.shape[0], *cache.shape[2:])
+            valid = (slots >= 0) & (slots < cache.shape[0] * block_size)
+            safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
+            block_ids = torch.div(
+                safe_slots,
+                block_size,
+                rounding_mode="floor",
             )
+            block_offsets = torch.remainder(safe_slots, block_size)
+            row_mask = valid.view(-1, *([1] * (values.ndim - 1)))
+            row_zero = cache[0, 0].clone()
+            safe_values = torch.where(row_mask, values, row_zero.unsqueeze(0))
+            row_zero_mask = valid & (slots == 0)
+            update_zero = torch.where(
+                row_zero_mask.view(-1, *([1] * (values.ndim - 1))),
+                values,
+                torch.zeros_like(values),
+            ).sum(dim=0)
+            expected_zero = torch.where(
+                row_zero_mask.any(),
+                update_zero,
+                row_zero,
+            )
+            cache[block_ids, block_offsets] = safe_values
+            cache[0, 0].copy_(expected_zero)
             return
         block_ids = torch.div(slots, block_size, rounding_mode="floor")
         block_offsets = torch.remainder(slots, block_size)
@@ -809,13 +833,14 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
                 max=packed_kv_cache.shape[0] - 1,
             )
 
-            # Advanced indexing materializes one contiguous [C,K,576] tensor
-            # from the packed cache. The source cache itself stays packed.
-            flat_cache_slots = safe_physical_blocks * block_size + page_offsets
-            gathered_packed_kv = packed_kv_cache.view(
-                -1,
-                packed_kv_cache.shape[-1],
-            )[flat_cache_slots]
+            # Index both page dimensions so padded physical-page strides are
+            # preserved. Advanced indexing materializes a contiguous [C,K,D]
+            # result without requiring the source cache itself to be contiguous.
+            gathered_packed_kv = packed_kv_cache[
+                safe_physical_blocks,
+                page_offsets,
+                0,
+            ]
             gathered_kv, gathered_rope = gathered_packed_kv.split(
                 [
                     ql_nope.shape[-1],

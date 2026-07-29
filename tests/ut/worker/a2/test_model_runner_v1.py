@@ -139,6 +139,61 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(k_cache.shape, (2, 16, 8, 64))
         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
 
+    def test_reshape_padded_glm5_cache_uses_physical_page_stride(self):
+        cases = (
+            ((2, 128, 1, 512), 271360),
+            ((2, 8, 1, 128), 8192),
+        )
+        for cache_shape, page_size_bytes in cases:
+            with self.subTest(cache_shape=cache_shape):
+                raw_tensor = torch.empty(
+                    cache_shape[0] * page_size_bytes,
+                    dtype=torch.uint8,
+                )
+
+                cache = NPUModelRunner._reshape_padded_cache_tensor(
+                    raw_tensor,
+                    cache_shape,
+                    torch.bfloat16,
+                    page_size_bytes,
+                )
+
+                self.assertEqual(cache.shape, cache_shape)
+                self.assertEqual(
+                    cache.stride(0),
+                    page_size_bytes // torch.bfloat16.itemsize,
+                )
+                self.assertEqual(
+                    cache[1].data_ptr() - cache[0].data_ptr(),
+                    page_size_bytes,
+                )
+
+    def test_reshape_padded_glm5_mamba_states_stay_within_each_page(self):
+        raw_tensor = torch.empty(2 * 64, dtype=torch.uint8)
+        conv_state = NPUModelRunner._reshape_padded_cache_tensor(
+            raw_tensor,
+            (2, 2, 4),
+            torch.bfloat16,
+            64,
+        )
+        recurrent_state = NPUModelRunner._reshape_padded_cache_tensor(
+            raw_tensor,
+            (2, 2, 2),
+            torch.float32,
+            64,
+            page_offset_bytes=16,
+        )
+
+        self.assertEqual(conv_state[1].data_ptr() - conv_state[0].data_ptr(), 64)
+        self.assertEqual(
+            recurrent_state[1].data_ptr() - recurrent_state[0].data_ptr(),
+            64,
+        )
+        self.assertEqual(
+            recurrent_state[0].data_ptr() - conv_state[0].data_ptr(),
+            16,
+        )
+
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
     def test_sparse_layer_without_indexer_allocates_only_mla_kv_cache(
