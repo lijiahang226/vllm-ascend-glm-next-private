@@ -12,6 +12,8 @@ from vllm_ascend.ops.triton.compute_slot_mapping import (
     _next_power_of_2,
 )
 
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+
 
 class BlockTable:
     def __init__(
@@ -34,7 +36,15 @@ class BlockTable:
         if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
             kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()), None)
         compress_ratio = 1
-        if kv_cache_spec is not None and hasattr(kv_cache_spec, "compress_ratio"):
+        # Only AscendMLAAttentionSpec is registered with a compress-aware
+        # manager (CompressAttentionManager) that divides the token count by
+        # compress_ratio when allocating blocks. For other specs that merely
+        # carry a compress_ratio field (e.g. the GLM-5 indexer kpool cache,
+        # which uses the upstream MLAAttentionSpec -> FullAttentionManager),
+        # the scheduler still allocates cdiv(tokens, block_size) blocks per
+        # request, so shrinking the row capacity here would overflow the
+        # block table row on long sequences and kill the engine.
+        if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
             compress_ratio = kv_cache_spec.compress_ratio
         if (
             kv_cache_group is not None
