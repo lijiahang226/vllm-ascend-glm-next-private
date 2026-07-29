@@ -396,35 +396,6 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
     def _by_role(items) -> dict[str, object]:
         return {item.cache_role: item for item in items}
 
-    @staticmethod
-    def _scatter_rows_graph_safe(
-        cache_rows: torch.Tensor,
-        slots: torch.Tensor,
-        values: torch.Tensor,
-    ) -> None:
-        """Scatter fixed-shape rows while treating invalid slots as no-ops."""
-        valid = (slots >= 0) & (slots < cache_rows.shape[0])
-        safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
-        row_mask = valid.view(-1, *([1] * (values.ndim - 1)))
-        row_zero = cache_rows[0].clone()
-        safe_values = torch.where(row_mask, values, row_zero.unsqueeze(0))
-
-        # Invalid rows temporarily target row zero. Preserve its correct value
-        # even when a real row-zero update and padding rows coexist.
-        row_zero_mask = valid & (slots == 0)
-        update_zero = torch.where(
-            row_zero_mask.view(-1, *([1] * (values.ndim - 1))),
-            values,
-            torch.zeros_like(values),
-        ).sum(dim=0)
-        expected_zero = torch.where(row_zero_mask.any(), update_zero, row_zero)
-        # Do not use npu_scatter_nd_update_ here: graph compilation resolves
-        # it to aclnnScatterNdUpdateV2, which is unavailable in older CANN
-        # libopapi builds. The fixed-shape indexed assignment is graphable and
-        # row zero is restored below after padded rows temporarily target it.
-        cache_rows[safe_slots] = safe_values
-        cache_rows[0].copy_(expected_zero)
-
     def _get_indexer_slot_mapping(self, attn_metadata):
         return self._indexer_kpool_mla_metadata["indexer_state"].slot_mapping
 
@@ -437,18 +408,14 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
         # Sliding-window metadata marks evicted prompt tokens with -1. Those
         # rows are already compressed and must not be scattered into the tail
         # state page during a long/chunked prefill.
-        cache_rows = cache.view(-1, values.shape[-1])
-        values = values.view(-1, values.shape[-1])
-        if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL:
-            self._scatter_rows_graph_safe(cache_rows, slot_mapping, values)
-            return
-        valid_rows = (slot_mapping >= 0).nonzero().flatten()
-        if valid_rows.numel() == 0:
-            return
-        torch_npu.npu_scatter_nd_update_(
-            cache_rows,
-            slot_mapping[valid_rows].view(-1, 1),
-            values[valid_rows],
+        # The state payload may be an as_strided prefix of a padded physical
+        # page. Keep the block dimension explicit instead of flattening across
+        # page padding with view().
+        AscendIndexerKPoolMLAImpl._scatter_paged_cache(
+            cache,
+            slot_mapping,
+            values,
+            cache.shape[1],
         )
 
     def _get_mla_cache_views(
@@ -489,7 +456,7 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
             # larger physical page. Flattening such an as_strided view would
             # either fail or discard the physical page stride, so address the
             # page and its token offset independently.
-            values = values.view(values.shape[0], *cache.shape[2:])
+            values = values.reshape(values.shape[0], *cache.shape[2:])
             valid = (slots >= 0) & (slots < cache.shape[0] * block_size)
             safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
             block_ids = torch.div(
@@ -515,15 +482,25 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
             cache[block_ids, block_offsets] = safe_values
             cache[0, 0].copy_(expected_zero)
             return
-        block_ids = torch.div(slots, block_size, rounding_mode="floor")
-        block_offsets = torch.remainder(slots, block_size)
+        valid_rows = (
+            (slots >= 0) & (slots < cache.shape[0] * block_size)
+        ).nonzero().flatten()
+        if valid_rows.numel() == 0:
+            return
+        valid_slots = slots[valid_rows]
+        block_ids = torch.div(
+            valid_slots,
+            block_size,
+            rounding_mode="floor",
+        )
+        block_offsets = torch.remainder(valid_slots, block_size)
         indices = torch.stack([block_ids, block_offsets], dim=-1)
         # ScatterNdUpdateV2 ignores negative slots, which are used by padded
         # full-graph decode rows.
         torch.ops._C_ascend.npu_scatter_nd_update_v2(
             cache,
             indices,
-            values.view(values.shape[0], *cache.shape[2:]),
+            values.reshape(values.shape[0], *cache.shape[2:])[valid_rows],
         )
 
     def indexer_select_pre_process(

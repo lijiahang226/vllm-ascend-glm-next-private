@@ -573,7 +573,12 @@ def test_indexer_kpool_mla_nope_packs_only_latent_cache_values():
 
 def test_indexer_kpool_mla_state_block_table_maps_request_tail_pages():
     op = SimpleNamespace(head_dim=1)
-    state_cache = torch.zeros((4, 4, 2), dtype=torch.bfloat16)
+    raw_state_cache = torch.zeros(48, dtype=torch.bfloat16)
+    state_cache = torch.as_strided(
+        raw_state_cache,
+        size=(4, 4, 2),
+        stride=(12, 2, 1),
+    )
     state_cache[2] = torch.tensor([[20.0, 200.0], [21.0, 201.0], [22.0, 202.0], [23.0, 203.0]])
     state_cache[3] = torch.tensor([[30.0, 300.0], [31.0, 301.0], [32.0, 302.0], [33.0, 303.0]])
     metadata = SimpleNamespace(
@@ -989,8 +994,13 @@ def test_indexer_kpool_mla_state_write_maps_negative_slots_to_restored_sentinel(
     mock_get_forward_context,
 ):
     mock_get_forward_context.return_value = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL)
-    cache = torch.zeros((1, 4, 8), dtype=torch.bfloat16)
-    slots = torch.tensor([2, -1], dtype=torch.int64)
+    raw_cache = torch.zeros(80, dtype=torch.bfloat16)
+    cache = torch.as_strided(
+        raw_cache,
+        size=(2, 4, 8),
+        stride=(40, 8, 1),
+    )
+    slots = torch.tensor([6, -1], dtype=torch.int64)
     values = torch.ones((2, 1, 8), dtype=torch.bfloat16)
 
     AscendIndexerKPoolMLAImpl._store_indexer_cache(
@@ -1001,8 +1011,41 @@ def test_indexer_kpool_mla_state_write_maps_negative_slots_to_restored_sentinel(
     )
 
     mock_scatter.assert_not_called()
-    assert cache.view(-1, 8)[2].tolist() == [1.0] * 8
-    assert cache.view(-1, 8)[0].tolist() == [0.0] * 8
+    assert cache[1, 2].tolist() == [1.0] * 8
+    assert cache[0, 0].tolist() == [0.0] * 8
+    assert raw_cache[32:40].tolist() == [0.0] * 8
+
+
+@patch("vllm_ascend.attention.indexer_kpool_mla_v1.get_forward_context")
+@patch("torch_npu.npu_scatter_nd_update_", create=True)
+def test_indexer_kpool_mla_eager_state_write_uses_paged_indices(
+    mock_scatter,
+    mock_get_forward_context,
+):
+    mock_get_forward_context.return_value = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.NONE)
+    raw_cache = torch.zeros(80, dtype=torch.bfloat16)
+    cache = torch.as_strided(
+        raw_cache,
+        size=(2, 4, 8),
+        stride=(40, 8, 1),
+    )
+    values = torch.arange(16, dtype=torch.bfloat16).view(2, 1, 8)
+
+    AscendIndexerKPoolMLAImpl._store_indexer_cache(
+        None,
+        cache,
+        torch.tensor([6, -1], dtype=torch.int64),
+        values,
+    )
+
+    mock_scatter.assert_called_once()
+    args = mock_scatter.call_args.args
+    assert args[0] is cache
+    torch.testing.assert_close(
+        args[1],
+        torch.tensor([[1, 2]], dtype=torch.int64),
+    )
+    torch.testing.assert_close(args[2], values[:1, 0])
 
 
 @patch("vllm_ascend.attention.indexer_kpool_mla_v1.get_forward_context")

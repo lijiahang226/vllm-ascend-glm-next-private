@@ -433,7 +433,7 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             raise ValueError(
                 f"Cache block size mismatch: expected {block_size}, got {cache.shape[1]}."
             )
-        values = values.view(values.shape[0], *cache.shape[2:])
+        values = values.reshape(values.shape[0], *cache.shape[2:])
         valid = (slots >= 0) & (slots < cache.shape[0] * block_size)
         safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
         block_ids = torch.div(
@@ -485,8 +485,10 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             request_ids[:, None],
             pages,
         ].clamp(min=0, max=state_cache.shape[0] - 1)
-        flat_slots = physical_blocks.long() * state_metadata.block_size + page_offsets
-        return state_cache.view(-1, 2 * self.head_dim)[flat_slots]
+        return state_cache[
+            physical_blocks.long(),
+            page_offsets,
+        ]
 
     @staticmethod
     def indexer_kpool_topk_decode(
@@ -1177,23 +1179,14 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         k = k[:num_tokens].reshape(-1, self.head_dim)
         gate_score = gate_score[:num_tokens].reshape(-1, self.head_dim)
         current_state = torch.cat([k, gate_score], dim=-1).to(state_cache.dtype)
-        state_rows = state_cache.view(-1, 2 * self.head_dim)
         state_slots = state_metadata.slot_mapping[:num_tokens]
         is_full_graph = context.cudagraph_runtime_mode == CUDAGraphMode.FULL
-        if is_full_graph:
-            self._scatter_rows_graph_safe(
-                state_rows,
-                state_slots,
-                current_state,
-            )
-        else:
-            valid_state_rows = (state_slots >= 0).nonzero().flatten()
-            if valid_state_rows.numel() > 0:
-                torch_npu.npu_scatter_nd_update_(
-                    state_rows,
-                    state_slots[valid_state_rows].view(-1, 1),
-                    current_state[valid_state_rows],
-                )
+        self._scatter_paged_cache(
+            state_cache,
+            state_slots,
+            current_state,
+            state_metadata.block_size,
+        )
 
         selected = (
             torch.arange(num_tokens, device=k.device)
