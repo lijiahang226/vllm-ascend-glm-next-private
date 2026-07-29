@@ -682,6 +682,50 @@ class BaseDeviceAdaptor:
         return {}
 
     @staticmethod
+    def supports_glm5_kv_quant_sparse_attn() -> bool:
+        """Whether GLM-5 may use the A5 quantized shared-KV kernel.
+
+        A3 keeps the existing small-op implementation.  Do not fall back to
+        ``npu_sparse_attn_sharedkv`` here: its cache contract differs from the
+        GLM-5 BF16 paged cache used by that path.
+        """
+        return False
+
+    @staticmethod
+    def get_glm5_mla_cache_layout(
+        kv_lora_rank: int,
+        rope_head_dim: int,
+    ) -> tuple[torch.dtype, int]:
+        """Return the physical GLM-5 MLA cache dtype and head dimension."""
+        return torch.bfloat16, kv_lora_rank + rope_head_dim
+
+    @staticmethod
+    def get_glm5_sparse_attn_metadata_op():
+        raise NotImplementedError("GLM-5 fused sparse attention is A5-only.")
+
+    @staticmethod
+    def get_glm5_sparse_attn_metadata_kwargs(device):
+        del device
+        raise NotImplementedError("GLM-5 fused sparse attention is A5-only.")
+
+    @staticmethod
+    def get_glm5_sparse_attn_op():
+        raise NotImplementedError("GLM-5 fused sparse attention is A5-only.")
+
+    @staticmethod
+    def get_glm5_sparse_attn_base_kwargs():
+        raise NotImplementedError("GLM-5 fused sparse attention is A5-only.")
+
+    @staticmethod
+    def store_glm5_mla_cache(
+        cache: torch.Tensor,
+        values: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        del cache, values, slot_mapping
+        raise NotImplementedError("GLM-5 fused sparse attention is A5-only.")
+
+    @staticmethod
     def get_dsa_compressor_slot_mapping_format():
         """Slot mapping side output format consumed by the DSA scatter op."""
         return DSA_COMPRESSOR_SLOT_MAPPING_BLOCK_OFFSET
@@ -1457,6 +1501,65 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
     @staticmethod
     def get_dsa_sparse_attn_base_kwargs():
         return {"kv_quant_mode": 1, "tile_size": 64, "rope_head_dim": 64}
+
+    @staticmethod
+    def supports_glm5_kv_quant_sparse_attn() -> bool:
+        return True
+
+    @staticmethod
+    def get_glm5_mla_cache_layout(
+        kv_lora_rank: int,
+        rope_head_dim: int,
+    ) -> tuple[torch.dtype, int]:
+        # The A5 cache stores FP8 latent tiles, BF16 RoPE values, and one
+        # float32 scale per latent tile.  GLM-5 currently has rope_head_dim=0,
+        # but retaining the general formula makes the physical contract
+        # explicit and keeps validation useful if the config changes.
+        tile_size = 64
+        if kv_lora_rank % tile_size:
+            raise ValueError(
+                "GLM-5 kv_lora_rank must be divisible by the A5 sparse "
+                f"attention tile size, got {kv_lora_rank} and {tile_size}."
+            )
+        scale_bytes = kv_lora_rank // tile_size * torch.float32.itemsize
+        rope_bytes = rope_head_dim * torch.bfloat16.itemsize
+        return torch.float8_e4m3fn, kv_lora_rank + rope_bytes + scale_bytes
+
+    @staticmethod
+    def get_glm5_sparse_attn_metadata_op():
+        return torch.ops._C_ascend.npu_kv_quant_sparse_attn_sharedkv_metadata
+
+    @staticmethod
+    def get_glm5_sparse_attn_metadata_kwargs(device):
+        del device
+        return {"kv_quant_mode": 1}
+
+    @staticmethod
+    def get_glm5_sparse_attn_op():
+        return torch.ops._C_ascend.npu_kv_quant_sparse_attn_sharedkv
+
+    @staticmethod
+    def get_glm5_sparse_attn_base_kwargs():
+        # Keep DSA's rope_head_dim=64 contract untouched.  The newly enabled
+        # GLM-5 kernel variant explicitly accepts the NoPE value 0.
+        return {"kv_quant_mode": 1, "tile_size": 64, "rope_head_dim": 0}
+
+    @staticmethod
+    def store_glm5_mla_cache(
+        cache: torch.Tensor,
+        values: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Pack BF16 GLM-5 MLA values into a contiguous A5 staging cache."""
+        torch.ops._C_ascend.kv_compress_epilog(
+            kv_compress_cache=cache.view(-1, 1, cache.shape[-1]),
+            x=values.view(-1, values.shape[-1]),
+            slot_mapping=slot_mapping,
+            quant_group_size=64,
+            quant_mode=2,
+            round_scale_flag=True,
+            layout=1,
+        )
 
     @staticmethod
     def get_dsa_compressor_slot_mapping_format():

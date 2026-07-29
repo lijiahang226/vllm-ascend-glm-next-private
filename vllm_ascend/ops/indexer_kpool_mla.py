@@ -13,12 +13,12 @@ from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import (
     direct_register_custom_op,
-    kv_cache_dtype_str_to_dtype,
 )
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 from vllm_ascend.attention.indexer_kpool_mla_v1 import AscendIndexerKPoolMLABackend
+from vllm_ascend.device.device_op import DeviceOperator
 
 
 @dataclass
@@ -70,9 +70,14 @@ class IndexerKPoolMLACacheLayer(nn.Module, AttentionLayerBase):
         self.head_size = kv_lora_rank + qk_rope_head_dim
         if cache_config is None:
             raise ValueError("GLM-5 Indexer KPool MLA requires cache_config.")
-        # GLM-5 Next 的完整 MLA KV cache 固定使用 BF16，与 Indexer K 和
-        # compressor state 的缓存精度保持一致，不接受全局量化 cache 覆盖。
+        # This remains the semantic dtype seen by the shared SFA projection
+        # code. DeviceOperator independently selects the physical cache
+        # contract: BF16 on A3, packed FP8+scale on A5.
         self.kv_cache_dtype = "bfloat16"
+        self.physical_cache_dtype, self.physical_cache_head_size = DeviceOperator.get_glm5_mla_cache_layout(
+            kv_lora_rank,
+            qk_rope_head_dim,
+        )
         self.block_size = cache_config.block_size
         self.attn_backend = AscendIndexerKPoolMLABackend
         self.kv_cache = [
@@ -118,15 +123,12 @@ class IndexerKPoolMLACacheLayer(nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        cache_dtype = kv_cache_dtype_str_to_dtype(
-            self.kv_cache_dtype,
-            vllm_config.model_config,
-        )
+        del vllm_config
         return MLAAttentionSpec(
             block_size=self.block_size,
             num_kv_heads=1,
-            head_size=self.head_size,
-            dtype=cache_dtype,
+            head_size=self.physical_cache_head_size,
+            dtype=self.physical_cache_dtype,
             cache_dtype_str=None,
             compress_ratio=1,
             model_version="glm5_next",

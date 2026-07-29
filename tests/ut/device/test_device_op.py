@@ -71,6 +71,51 @@ def test_kv_cache_load_makes_seq_lens_contiguous():
     assert mock_gather.call_args.kwargs["value"] is value
 
 
+
+def test_glm5_sparse_attention_device_contract_is_a5_only():
+    assert not BaseDeviceAdaptor.supports_glm5_kv_quant_sparse_attn()
+    assert BaseDeviceAdaptor.get_glm5_mla_cache_layout(512, 0) == (
+        torch.bfloat16,
+        512,
+    )
+
+    assert A5DeviceAdaptor.supports_glm5_kv_quant_sparse_attn()
+    assert A5DeviceAdaptor.get_glm5_mla_cache_layout(512, 0) == (
+        torch.float8_e4m3fn,
+        544,
+    )
+    assert A5DeviceAdaptor.get_glm5_sparse_attn_metadata_kwargs(torch.device("cpu")) == {"kv_quant_mode": 1}
+    assert A5DeviceAdaptor.get_glm5_sparse_attn_base_kwargs() == {
+        "kv_quant_mode": 1,
+        "tile_size": 64,
+        "rope_head_dim": 0,
+    }
+    # The existing DSA contract must retain its 64-dimensional RoPE.
+    assert A5DeviceAdaptor.get_dsa_sparse_attn_base_kwargs()["rope_head_dim"] == 64
+
+
+def test_a5_glm5_cache_writer_uses_quantized_epilog():
+    cache = torch.empty((2, 4, 1, 544), dtype=torch.float8_e4m3fn)
+    values = torch.randn((3, 512), dtype=torch.bfloat16)
+    slots = torch.tensor([0, 3, 5], dtype=torch.int64)
+
+    with mock.patch.object(
+        torch.ops._C_ascend,
+        "kv_compress_epilog",
+        create=True,
+    ) as mock_epilog:
+        A5DeviceAdaptor.store_glm5_mla_cache(cache, values, slots)
+
+    mock_epilog.assert_called_once()
+    kwargs = mock_epilog.call_args.kwargs
+    assert kwargs["kv_compress_cache"].shape == (8, 1, 544)
+    assert kwargs["x"].shape == (3, 512)
+    assert kwargs["slot_mapping"] is slots
+    assert kwargs["quant_group_size"] == 64
+    assert kwargs["quant_mode"] == 2
+    assert kwargs["layout"] == 1
+
+
 def test_npu_flash_attention_uses_fusion_attention_for_fp32():
     query = torch.randn(5, 4, 64, dtype=torch.float32)
     key = torch.randn_like(query)

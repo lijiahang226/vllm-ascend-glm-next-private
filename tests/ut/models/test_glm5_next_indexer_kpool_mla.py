@@ -4,7 +4,7 @@
 import inspect
 import json
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -38,6 +38,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolStateSpec,
     format_indexer_kpool_slot_mapping,
 )
+from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models import register_model as register_ascend_models
 from vllm_ascend.models.glm5_next import (
     GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER,
@@ -146,6 +147,68 @@ def test_indexer_kpool_mla_supports_uniform_decode_aclgraph():
             )
             is AttentionCGSupport.UNIFORM_BATCH
         )
+
+
+def test_indexer_kpool_mla_a5_metadata_refreshes_graph_stable_buffer():
+    builder = object.__new__(AscendIndexerKPoolMLAMetadataBuilder)
+    builder._sas_metadata_buffer = torch.zeros(1024, dtype=torch.int32)
+    builder._spec_sas_metadata_buffers = None
+    builder._seqused_q = torch.empty(0, dtype=torch.int32)
+    builder.model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(
+            num_attention_heads=32,
+            kv_lora_rank=512,
+            index_topk=512,
+            index_kpool=4,
+        )
+    )
+    builder.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=4))
+    common_metadata = SimpleNamespace(
+        num_reqs=2,
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([17, 33], dtype=torch.int32),
+    )
+    generated_metadata = torch.arange(1024, dtype=torch.int32)
+    metadata_op = MagicMock(return_value=generated_metadata)
+    base_metadata = SimpleNamespace(cache_role="", sas_metadata=None)
+
+    with (
+        patch.object(
+            AscendSFAMetadataBuilder,
+            "_build",
+            return_value=base_metadata,
+        ),
+        patch.object(
+            DeviceOperator,
+            "supports_glm5_kv_quant_sparse_attn",
+            return_value=True,
+        ),
+        patch.object(
+            DeviceOperator,
+            "get_glm5_sparse_attn_metadata_kwargs",
+            return_value={"kv_quant_mode": 1},
+        ),
+        patch.object(
+            DeviceOperator,
+            "get_glm5_sparse_attn_metadata_op",
+            return_value=metadata_op,
+        ),
+    ):
+        metadata = builder._build(common_metadata)
+
+    assert metadata.cache_role == "kv"
+    assert metadata.sas_metadata is builder._sas_metadata_buffer
+    assert metadata.sas_metadata.data_ptr() == builder._sas_metadata_buffer.data_ptr()
+    assert metadata.query_start_loc is common_metadata.query_start_loc
+    torch.testing.assert_close(metadata.sas_metadata, generated_metadata)
+    metadata_op.assert_called_once()
+    kwargs = metadata_op.call_args.kwargs
+    assert kwargs["num_heads_q"] == 8
+    assert kwargs["head_dim"] == 512
+    assert kwargs["cmp_topk"] == 515
+    assert kwargs["cmp_ratio"] == 1
+    assert not kwargs["has_ori_kv"]
+    assert kwargs["has_cmp_kv"]
 
 
 def test_indexer_kpool_cache_only_builders_do_not_disable_uniform_decode_aclgraph():
@@ -1483,6 +1546,120 @@ def test_indexer_kpool_mla_sparse_attention_pytorch_matches_golden_semantics():
         expected[query_idx, 0] = probabilities @ selected_tensor[:, :2]
 
     torch.testing.assert_close(result, expected)
+
+
+def test_indexer_kpool_mla_a3_keeps_pytorch_sparse_attention_path():
+    impl = object.__new__(AscendIndexerKPoolMLAImpl)
+    torch.nn.Module.__init__(impl)
+    impl.kv_lora_rank = 2
+    impl.qk_rope_head_dim = 0
+    impl.scale = 0.5
+    impl.use_glm5_kv_quant_sparse_attn = False
+    packed_cache = torch.zeros((1, 1, 1, 2), dtype=torch.bfloat16)
+    impl._indexer_kpool_mla_caches = {"kv": packed_cache}
+    expected = torch.ones((1, 1, 2), dtype=torch.bfloat16)
+    metadata = SimpleNamespace(
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        num_actual_tokens=1,
+        sas_metadata=None,
+    )
+
+    with patch.object(
+        impl,
+        "_sparse_attention_pytorch",
+        return_value=expected,
+    ) as pytorch_sparse_attention:
+        result = impl._execute_sparse_flash_attention_process(
+            torch.zeros((1, 1, 2), dtype=torch.bfloat16),
+            torch.empty((1, 1, 0), dtype=torch.bfloat16),
+            (
+                packed_cache[..., :2],
+                packed_cache[..., 2:2],
+            ),
+            torch.zeros((1, 1, 4), dtype=torch.int32),
+            metadata,
+            torch.tensor([1], dtype=torch.int32),
+            torch.tensor([1], dtype=torch.int32),
+        )
+
+    assert result is expected
+    pytorch_sparse_attention.assert_called_once()
+
+
+def test_indexer_kpool_mla_a5_calls_quantized_sharedkv_with_nope_contract():
+    impl = object.__new__(AscendIndexerKPoolMLAImpl)
+    torch.nn.Module.__init__(impl)
+    impl.kv_lora_rank = 512
+    impl.qk_rope_head_dim = 0
+    impl.scale = 0.125
+    impl.use_glm5_kv_quant_sparse_attn = True
+    packed_cache = torch.zeros(
+        (1, 128, 1, 544),
+        dtype=torch.float8_e4m3fn,
+    )
+    impl._indexer_kpool_mla_caches = {"kv": packed_cache}
+    query = torch.zeros((1, 8, 512), dtype=torch.bfloat16)
+    query_rope = torch.empty((1, 8, 0), dtype=torch.bfloat16)
+    topk_indices = torch.zeros((1, 1, 515), dtype=torch.int32)
+    block_table = torch.zeros((1, 1), dtype=torch.int32)
+    query_lens = torch.tensor([1], dtype=torch.int32)
+    key_lens = torch.tensor([1], dtype=torch.int32)
+    sas_metadata = torch.zeros(1024, dtype=torch.int32)
+    metadata = SimpleNamespace(
+        block_table=block_table,
+        num_actual_tokens=1,
+        sas_metadata=sas_metadata,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+    )
+    expected = torch.ones_like(query)
+    fused_op = MagicMock(return_value=(expected,))
+
+    with (
+        patch.object(
+            DeviceOperator,
+            "get_glm5_sparse_attn_op",
+            return_value=fused_op,
+        ),
+        patch.object(
+            DeviceOperator,
+            "get_glm5_sparse_attn_base_kwargs",
+            return_value={
+                "kv_quant_mode": 1,
+                "tile_size": 64,
+                "rope_head_dim": 0,
+            },
+        ),
+        patch.object(
+            impl,
+            "_sparse_attention_pytorch",
+            side_effect=AssertionError("A5 must not use the PyTorch path"),
+        ),
+    ):
+        result = impl._execute_sparse_flash_attention_process(
+            query,
+            query_rope,
+            (
+                packed_cache[..., :512],
+                packed_cache[..., 512:512],
+            ),
+            topk_indices,
+            metadata,
+            query_lens,
+            key_lens,
+        )
+
+    assert result is expected
+    fused_op.assert_called_once()
+    args, kwargs = fused_op.call_args
+    assert args == (query,)
+    assert kwargs["cmp_kv"] is packed_cache
+    assert kwargs["cmp_sparse_indices"] is topk_indices
+    assert kwargs["cmp_block_table"] is block_table
+    assert kwargs["cu_seqlens_q"] is metadata.query_start_loc
+    assert kwargs["metadata"] is sas_metadata
+    assert kwargs["cmp_ratio"] == 1
+    assert kwargs["cmp_mask_mode"] == 3
+    assert kwargs["rope_head_dim"] == 0
 
 
 def test_indexer_kpool_mla_sparse_attention_pytorch_maps_each_request_block_table():
