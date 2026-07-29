@@ -168,6 +168,30 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
                     page_size_bytes,
                 )
 
+    def test_reshape_padded_glm5_cache_matches_reported_runtime_shape(self):
+        num_blocks = 995
+        block_size = 128
+        head_size = 512
+        page_size_bytes = 271360
+        raw_tensor = torch.empty(
+            num_blocks * page_size_bytes,
+            dtype=torch.uint8,
+            device="meta",
+        )
+
+        cache = NPUModelRunner._reshape_padded_cache_tensor(
+            raw_tensor,
+            (num_blocks, block_size, 1, head_size),
+            torch.bfloat16,
+            page_size_bytes,
+        )
+
+        self.assertEqual(cache.shape, (995, 128, 1, 512))
+        self.assertEqual(
+            cache.stride(0),
+            page_size_bytes // torch.bfloat16.itemsize,
+        )
+
     def test_reshape_padded_glm5_mamba_states_stay_within_each_page(self):
         raw_tensor = torch.empty(2 * 64, dtype=torch.uint8)
         conv_state = NPUModelRunner._reshape_padded_cache_tensor(

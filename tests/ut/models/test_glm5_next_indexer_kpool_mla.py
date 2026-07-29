@@ -12,6 +12,7 @@ import vllm.v1.core.kv_cache_utils as upstream_kv_cache_utils
 from transformers import AutoConfig
 from vllm import ModelRegistry
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.models.config import HybridAttentionMambaModelConfig
 from vllm.transformers_utils.model_arch_config_convertor import (
     MODEL_ARCH_CONFIG_CONVERTORS,
 )
@@ -64,6 +65,7 @@ from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _max_memory_usage_bytes_from_groups,
 )
 from vllm_ascend.patch.platform.patch_mamba_config import (
+    GLM5_LOGICAL_BLOCK_SIZE,
     _get_mamba_target_page_size,
 )
 from vllm_ascend.patch.worker.patch_process_weights_after_loading import (
@@ -310,6 +312,83 @@ def test_glm5_kda_page_covers_ssm_and_conv_states():
     )
 
     assert target_page_size == 271360
+
+
+def test_glm5_logical_block_size_is_not_inflated_to_physical_page():
+    assert GLM5_LOGICAL_BLOCK_SIZE == 128
+    physical_page_size = 271360
+    mla_payload_size = (
+        GLM5_LOGICAL_BLOCK_SIZE
+        * 1
+        * 512
+        * torch.bfloat16.itemsize
+    )
+
+    assert mla_payload_size == 131072
+    assert physical_page_size > mla_payload_size
+
+
+@patch(
+    "vllm_ascend.patch.platform.patch_mamba_config."
+    "MambaModelConfig.verify_and_update_config"
+)
+@patch(
+    "vllm_ascend.patch.platform.patch_mamba_config."
+    "ModelRegistry.resolve_model_cls"
+)
+def test_glm5_mamba_config_keeps_128_token_logical_block(
+    mock_resolve_model_cls,
+    mock_mamba_verify,
+):
+    class FakeGlm5Model:
+        @classmethod
+        def get_mamba_state_shape_from_config(cls, vllm_config):
+            del vllm_config
+            return (3, 1536), (4, 128, 128)
+
+        @classmethod
+        def get_mamba_state_dtype_from_config(cls, vllm_config):
+            del vllm_config
+            return torch.bfloat16, torch.float32
+
+    mock_resolve_model_cls.return_value = FakeGlm5Model, None
+    cache_config = SimpleNamespace(
+        block_size=512,
+        cache_dtype="auto",
+        mamba_page_size_padded=None,
+        enable_prefix_caching=False,
+        mamba_cache_mode="none",
+        mamba_block_size=None,
+    )
+    model_config = SimpleNamespace(
+        architecture="Glm5NextForCausalLM",
+        dtype=torch.bfloat16,
+        hf_config=SimpleNamespace(model_type="glm5_next"),
+        hf_text_config=SimpleNamespace(
+            kv_lora_rank=512,
+            qk_rope_head_dim=0,
+        ),
+        max_model_len=131072,
+        use_mla=True,
+        get_num_kv_heads=lambda parallel_config: 1,
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=cache_config,
+        model_config=model_config,
+        parallel_config=SimpleNamespace(),
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=False,
+        ),
+        speculative_config=None,
+        kv_transfer_config=None,
+    )
+
+    HybridAttentionMambaModelConfig.verify_and_update_config(vllm_config)
+
+    mock_mamba_verify.assert_called_once_with(vllm_config)
+    assert cache_config.block_size == GLM5_LOGICAL_BLOCK_SIZE
+    assert cache_config.mamba_page_size_padded == 271360
+    assert cache_config.mamba_block_size == model_config.max_model_len
 
 
 def test_glm5_mamba_groups_use_uniform_type_wrapper():

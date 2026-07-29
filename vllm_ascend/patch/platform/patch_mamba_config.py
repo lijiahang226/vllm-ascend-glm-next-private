@@ -8,6 +8,8 @@ from vllm.model_executor.models.config import MambaModelConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
 
+GLM5_LOGICAL_BLOCK_SIZE = 128
+
 
 def _using_kv_store(vllm_config) -> bool:
     """
@@ -64,6 +66,19 @@ def verify_and_update_config(cls, vllm_config) -> None:
     cache_config = vllm_config.cache_config
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
+    is_glm5_next = model_config.hf_config.model_type == "glm5_next"
+
+    # GLM-5 uses two independently padded physical page classes. Its logical
+    # MLA block size must therefore not be enlarged to the KDA state size by
+    # the generic hybrid-model policy. The MLA backend and Indexer compression
+    # metadata both use a 128-token logical block; only page_size_padded grows.
+    if is_glm5_next and cache_config.block_size != GLM5_LOGICAL_BLOCK_SIZE:
+        logger.info(
+            "Setting GLM-5 logical attention block size to %d tokens; "
+            "KDA state alignment is handled by physical page padding.",
+            GLM5_LOGICAL_BLOCK_SIZE,
+        )
+        cache_config.block_size = GLM5_LOGICAL_BLOCK_SIZE
 
     if cache_config.cache_dtype == "auto":
         kv_cache_dtype = model_config.dtype
@@ -121,7 +136,10 @@ def verify_and_update_config(cls, vllm_config) -> None:
     # override attention block size if either (a) the
     # user has not set it or (b) the user has set it
     # too small.
-    if cache_config.block_size is None or cache_config.block_size < attn_block_size:
+    if not is_glm5_next and (
+        cache_config.block_size is None
+        or cache_config.block_size < attn_block_size
+    ):
         cache_config.block_size = attn_block_size
         logger.info(
             "Setting attention block size to %d tokens to ensure that attention page size is >= mamba page size.",
@@ -137,7 +155,6 @@ def verify_and_update_config(cls, vllm_config) -> None:
     # page-size class. Other hybrid models retain the established extra conv
     # padding behavior.
     mamba_raw_size = sum(mamba_sizes)
-    is_glm5_next = model_config.hf_config.model_type == "glm5_next"
     target_page_size = _get_mamba_target_page_size(
         is_glm5_next=is_glm5_next,
         attn_page_size=attn_page_size,
