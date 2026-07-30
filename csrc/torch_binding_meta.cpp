@@ -345,6 +345,60 @@ at::Tensor npu_msa_index_score_meta(
         output_size, query.options().dtype(at::kFloat).device(c10::kMeta));
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_sparse_flash_mla_meta(
+    const at::Tensor &q, const c10::optional<at::Tensor> &ori_kv,
+    const c10::optional<at::Tensor> &cmp_kv,
+    const c10::optional<at::Tensor> &ori_sparse_indices,
+    const c10::optional<at::Tensor> &cmp_sparse_indices,
+    const c10::optional<at::Tensor> &ori_block_table,
+    const c10::optional<at::Tensor> &cmp_block_table,
+    const c10::optional<at::Tensor> &cu_seqlens_q,
+    const c10::optional<at::Tensor> &cu_seqlens_ori_kv,
+    const c10::optional<at::Tensor> &cu_seqlens_cmp_kv,
+    const c10::optional<at::Tensor> &seqused_q,
+    const c10::optional<at::Tensor> &seqused_ori_kv,
+    const c10::optional<at::Tensor> &seqused_cmp_kv,
+    const c10::optional<at::Tensor> &cmp_residual_kv,
+    const c10::optional<at::Tensor> &ori_topk_length,
+    const c10::optional<at::Tensor> &cmp_topk_length,
+    const c10::optional<at::Tensor> &sinks,
+    const c10::optional<at::Tensor> &metadata, double softmax_scale,
+    int64_t cmp_ratio, int64_t ori_mask_mode, int64_t cmp_mask_mode,
+    int64_t ori_win_left, int64_t ori_win_right, c10::string_view layout_q,
+    c10::string_view layout_kv, int64_t topk_value_mode,
+    bool return_softmax_lse)
+{
+    constexpr int64_t DIM_0 = 0;
+    constexpr int64_t DIM_1 = 1;
+    constexpr int64_t DIM_2 = 2;
+    constexpr int64_t QUERY_TND_DIM = 3;
+
+    at::Tensor output = at::empty_symint(q.sym_sizes(), q.options());
+    if (!return_softmax_lse) {
+        return {output, at::empty({0}, q.options().dtype(at::kFloat))};
+    }
+
+    TORCH_CHECK(ori_kv.has_value() || cmp_kv.has_value(),
+                "At least one of ori_kv and cmp_kv must be provided.");
+    const at::Tensor &kv = ori_kv.has_value() ? *ori_kv : *cmp_kv;
+    const auto kv_head_num = std::string(layout_kv) == "TND"
+                                 ? kv.sym_size(DIM_1)
+                                 : kv.sym_size(DIM_2);
+    at::SmallVector<c10::SymInt, 4> softmax_lse_size;
+    if (q.dim() == QUERY_TND_DIM) {
+        softmax_lse_size = {kv_head_num, q.sym_size(DIM_0),
+                            q.sym_size(DIM_1) / kv_head_num};
+    } else {
+        softmax_lse_size = {q.sym_size(DIM_0), kv_head_num,
+                            q.sym_size(DIM_1),
+                            q.sym_size(DIM_2) / kv_head_num};
+    }
+    return {output,
+            at::empty_symint(c10::SymIntArrayRef(softmax_lse_size),
+                             q.options().dtype(at::kFloat))};
+}
+
+>>>>>>> 6a38911f0 (feat(ops): migrate sparse flash MLA attention)
 std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_kv_quant_sparse_flash_attention_meta(
     const at::Tensor &query,
     const at::Tensor &key,
@@ -982,6 +1036,46 @@ at::Tensor npu_sparse_attn_sharedkv_metadata_meta(
             torch::dtype(torch::kInt32).device(at::Device(device_str)));
     }
     return output;
+}
+
+at::Tensor npu_sparse_flash_mla_metadata_meta(
+    int64_t num_heads_q, int64_t num_heads_kv, int64_t head_dim,
+    const c10::optional<at::Tensor> &cu_seqlens_q,
+    const c10::optional<at::Tensor> &cu_seqlens_ori_kv,
+    const c10::optional<at::Tensor> &cu_seqlens_cmp_kv,
+    const c10::optional<at::Tensor> &seqused_q,
+    const c10::optional<at::Tensor> &seqused_ori_kv,
+    const c10::optional<at::Tensor> &seqused_cmp_kv,
+    const c10::optional<at::Tensor> &cmp_residual_kv,
+    const c10::optional<at::Tensor> &ori_topk_length,
+    const c10::optional<at::Tensor> &cmp_topk_length, int64_t batch_size,
+    int64_t max_seqlen_q, int64_t max_seqlen_ori_kv,
+    int64_t max_seqlen_cmp_kv, int64_t ori_topk, int64_t cmp_topk,
+    int64_t cmp_ratio, int64_t ori_mask_mode, int64_t cmp_mask_mode,
+    int64_t ori_win_left, int64_t ori_win_right, c10::string_view layout_q,
+    c10::string_view layout_kv, bool has_ori_kv, bool has_cmp_kv,
+    c10::string_view device)
+{
+    constexpr int64_t METADATA_SIZE = 1024;
+    const c10::optional<at::Tensor> *inputs[] = {
+        &cu_seqlens_q,      &cu_seqlens_ori_kv, &cu_seqlens_cmp_kv,
+        &seqused_q,         &seqused_ori_kv,     &seqused_cmp_kv,
+        &cmp_residual_kv,   &ori_topk_length,    &cmp_topk_length,
+    };
+    for (const auto *input : inputs) {
+        if (input->has_value()) {
+            return at::empty({METADATA_SIZE},
+                             input->value().options().dtype(at::kInt));
+        }
+    }
+
+    const at::Device requested_device = at::Device(std::string(device));
+    std::string meta_device = "meta";
+    if (requested_device.has_index()) {
+        meta_device += ":" + std::to_string(requested_device.index());
+    }
+    return at::empty({METADATA_SIZE},
+                     at::TensorOptions().dtype(at::kInt).device(meta_device));
 }
 
 at::Tensor npu_vllm_quant_lightning_indexer_metadata_meta(
@@ -1811,6 +1905,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_sparse_attention_score_prefill",
              &vllm_ascend::meta::npu_sparse_attention_score_prefill_meta);
     ops.impl("npu_msa_index_score", &vllm_ascend::meta::npu_msa_index_score_meta);
+    ops.impl("npu_sparse_flash_mla", &vllm_ascend::meta::npu_sparse_flash_mla_meta);
+    ops.impl("npu_sparse_flash_mla_metadata",
+             &vllm_ascend::meta::npu_sparse_flash_mla_metadata_meta);
     ops.impl("npu_kv_quant_sparse_flash_attention",
              &vllm_ascend::meta::npu_kv_quant_sparse_flash_attention_meta);
     // MoE dispatch-ffn-combine
