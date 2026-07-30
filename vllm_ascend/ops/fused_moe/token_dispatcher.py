@@ -110,36 +110,14 @@ class MoETokenDispatcher(ABC, Generic[TMoECombineMetadata]):
         raise NotImplementedError("Combine function not implemented.")
 
 
-def _get_hccl_comm_name_fallback(device_group: torch.distributed.ProcessGroup,
-                                  local_rank: int) -> str:
-    """Return the HCCL communicator name, falling back to '' on benign failures.
-
-    When DP > 1 and DP ranks are co-located on the same node, the MC2/EP
-    communicator includes ranks that share physical NPU devices.
-    get_hccl_comm_name creates a sub-communicator that HCCL rejects in this
-    topology (Communication_Error_Ranktable_Detect / same physical device).
-    Passing an empty string to the NPU MoE operators lets them use the default
-    communicator, which works correctly.
-    """
-    backend = device_group._get_backend(torch.device("npu"))
-    try:
-        return backend.get_hccl_comm_name(local_rank)
-    except AttributeError:
-        return ""
-    except RuntimeError as e:
-        if "same physical device" in str(e):
-            return ""
-        raise
-
-
 class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         device_group = get_mc2_group().device_group
         # TODO: Try local_rank = ep_group.rank_in_group
         local_rank = torch.distributed.get_rank(group=device_group)
-        self.moe_all_to_all_group_name = _get_hccl_comm_name_fallback(
-            device_group, local_rank)
+        backend = device_group._get_backend(torch.device("npu"))
+        self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
         self.ep_rank_id = get_mc2_group().rank_in_group
         self.ep_world_size = get_mc2_group().world_size
         self.enable_dispatch_v2 = hasattr(torch_npu, "npu_moe_distribute_dispatch_v2")
@@ -182,8 +160,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         """Refresh MC2 communicator metadata after HCCL groups are recreated."""
         device_group = get_mc2_group().device_group
         local_rank = torch.distributed.get_rank(group=device_group)
-        self.moe_all_to_all_group_name = _get_hccl_comm_name_fallback(
-            device_group, local_rank)
+        backend = device_group._get_backend(torch.device("npu"))
+        self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
 
     def get_dispatch_mc2_kwargs(
         self,
@@ -513,8 +491,8 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
 
         # TODO: Try local_rank = ep_group.rank_in_group
         local_rank = torch.distributed.get_rank(group=self.ep_group)
-        self.moe_all_to_all_group_name = _get_hccl_comm_name_fallback(
-            self.ep_group, local_rank)
+        backend = self.ep_group._get_backend(torch.device("npu"))
+        self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
 
     def token_dispatch(
         self,

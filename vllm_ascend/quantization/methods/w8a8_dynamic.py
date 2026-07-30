@@ -194,11 +194,6 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 "falling back to empty moe_all_to_all_group_name."
             )
             self.moe_all_to_all_group_name = ""
-        except RuntimeError as e:
-            if "same physical device" in str(e):
-                self.moe_all_to_all_group_name = ""
-            else:
-                raise
 
     def get_weight(
         self, num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
