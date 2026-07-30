@@ -592,6 +592,40 @@ class BaseDeviceAdaptor:
             return result[0]
 
     @staticmethod
+    def execute_sparse_attention_indexer_kpool_mla(
+        sfa_impl,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        packed_kv_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        *,
+        block_table: torch.Tensor | None = None,
+        sparse_mode: int = 3,
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Execute Indexer KPool MLA attention as a sequence of small ops."""
+        if return_lse:
+            raise NotImplementedError("Indexer KPool MLA small-op attention does not expose LSE.")
+        if sparse_mode != 3:
+            raise ValueError(f"Indexer KPool MLA only supports sparse_mode=3, got {sparse_mode}.")
+        if block_table is None:
+            block_table = attn_metadata.block_table
+        return sfa_impl._sparse_attention_pytorch(
+            ql_nope=ql_nope,
+            q_pe=q_pe,
+            packed_kv_cache=packed_kv_cache,
+            topk_indices=topk_indices,
+            block_table=block_table,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+            scale=sfa_impl.scale,
+            num_actual_tokens=attn_metadata.num_actual_tokens,
+        )
+
+    @staticmethod
     def _execute_kv_quant_sparse_flash_attention(
         sfa_impl,
         ql_nope: torch.Tensor,
@@ -682,48 +716,18 @@ class BaseDeviceAdaptor:
         return {}
 
     @staticmethod
-    def supports_glm5_kv_quant_sparse_attn() -> bool:
-        """Whether GLM-5 may use the A5 quantized shared-KV kernel.
-
-        A3 keeps the existing small-op implementation.  Do not fall back to
-        ``npu_sparse_attn_sharedkv`` here: its cache contract differs from the
-        GLM-5 BF16 paged cache used by that path.
-        """
+    def supports_sharedkv_indexer_kpool_mla() -> bool:
+        """Whether Indexer KPool MLA should build A5 shared-KV metadata."""
         return False
 
     @staticmethod
-    def get_glm5_mla_cache_layout(
-        kv_lora_rank: int,
-        rope_head_dim: int,
-    ) -> tuple[torch.dtype, int]:
-        """Return the physical GLM-5 MLA cache dtype and head dimension."""
-        return torch.bfloat16, kv_lora_rank + rope_head_dim
+    def get_sparse_attention_metadata_op_indexer_kpool_mla():
+        raise NotImplementedError("Indexer KPool MLA fused sparse attention is A5-only.")
 
     @staticmethod
-    def get_glm5_sparse_attn_metadata_op():
-        raise NotImplementedError("GLM-5 fused sparse attention is A5-only.")
-
-    @staticmethod
-    def get_glm5_sparse_attn_metadata_kwargs(device):
+    def get_sparse_attention_metadata_kwargs_indexer_kpool_mla(device):
         del device
-        raise NotImplementedError("GLM-5 fused sparse attention is A5-only.")
-
-    @staticmethod
-    def get_glm5_sparse_attn_op():
-        raise NotImplementedError("GLM-5 fused sparse attention is A5-only.")
-
-    @staticmethod
-    def get_glm5_sparse_attn_base_kwargs():
-        raise NotImplementedError("GLM-5 fused sparse attention is A5-only.")
-
-    @staticmethod
-    def store_glm5_mla_cache(
-        cache: torch.Tensor,
-        values: torch.Tensor,
-        slot_mapping: torch.Tensor,
-    ) -> None:
-        del cache, values, slot_mapping
-        raise NotImplementedError("GLM-5 fused sparse attention is A5-only.")
+        raise NotImplementedError("Indexer KPool MLA fused sparse attention is A5-only.")
 
     @staticmethod
     def get_dsa_compressor_slot_mapping_format():
@@ -1503,63 +1507,71 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         return {"kv_quant_mode": 1, "tile_size": 64, "rope_head_dim": 64}
 
     @staticmethod
-    def supports_glm5_kv_quant_sparse_attn() -> bool:
+    def supports_sharedkv_indexer_kpool_mla() -> bool:
         return True
 
     @staticmethod
-    def get_glm5_mla_cache_layout(
-        kv_lora_rank: int,
-        rope_head_dim: int,
-    ) -> tuple[torch.dtype, int]:
-        # The A5 cache stores FP8 latent tiles, BF16 RoPE values, and one
-        # float32 scale per latent tile.  GLM-5 currently has rope_head_dim=0,
-        # but retaining the general formula makes the physical contract
-        # explicit and keeps validation useful if the config changes.
-        tile_size = 64
-        if kv_lora_rank % tile_size:
+    def get_sparse_attention_metadata_op_indexer_kpool_mla():
+        return torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata
+
+    @staticmethod
+    def get_sparse_attention_metadata_kwargs_indexer_kpool_mla(device):
+        return {"device": str(device)}
+
+    @staticmethod
+    def execute_sparse_attention_indexer_kpool_mla(
+        sfa_impl,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        packed_kv_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        *,
+        block_table: torch.Tensor | None = None,
+        sparse_mode: int = 3,
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if return_lse:
+            raise NotImplementedError("GLM-5 A5 shared-KV sparse attention does not expose LSE.")
+        if sfa_impl.qk_rope_head_dim != 0 or q_pe.shape[-1] != 0:
+            raise ValueError("GLM-5 A5 shared-KV sparse attention requires qk_rope_head_dim=0.")
+        if packed_kv_cache.dtype != torch.bfloat16:
             raise ValueError(
-                "GLM-5 kv_lora_rank must be divisible by the A5 sparse "
-                f"attention tile size, got {kv_lora_rank} and {tile_size}."
+                "Indexer KPool MLA A5 shared-KV cache must use BF16, "
+                f"got {packed_kv_cache.dtype}."
             )
-        scale_bytes = kv_lora_rank // tile_size * torch.float32.itemsize
-        rope_bytes = rope_head_dim * torch.bfloat16.itemsize
-        return torch.float8_e4m3fn, kv_lora_rank + rope_bytes + scale_bytes
+        if packed_kv_cache.shape[-1] != sfa_impl.kv_lora_rank:
+            raise ValueError(
+                "Indexer KPool MLA A5 shared-KV cache head dim must be "
+                f"{sfa_impl.kv_lora_rank}, got {packed_kv_cache.shape[-1]}."
+            )
+        if attn_metadata.sas_metadata is None:
+            raise RuntimeError("GLM-5 A5 shared-KV sparse attention metadata is missing.")
+        if attn_metadata.query_start_loc is None:
+            raise RuntimeError("GLM-5 A5 query_start_loc metadata is missing.")
+        if block_table is None:
+            block_table = attn_metadata.block_table
 
-    @staticmethod
-    def get_glm5_sparse_attn_metadata_op():
-        return torch.ops._C_ascend.npu_kv_quant_sparse_attn_sharedkv_metadata
-
-    @staticmethod
-    def get_glm5_sparse_attn_metadata_kwargs(device):
-        del device
-        return {"kv_quant_mode": 1}
-
-    @staticmethod
-    def get_glm5_sparse_attn_op():
-        return torch.ops._C_ascend.npu_kv_quant_sparse_attn_sharedkv
-
-    @staticmethod
-    def get_glm5_sparse_attn_base_kwargs():
-        # Keep DSA's rope_head_dim=64 contract untouched.  The newly enabled
-        # GLM-5 kernel variant explicitly accepts the NoPE value 0.
-        return {"kv_quant_mode": 1, "tile_size": 64, "rope_head_dim": 0}
-
-    @staticmethod
-    def store_glm5_mla_cache(
-        cache: torch.Tensor,
-        values: torch.Tensor,
-        slot_mapping: torch.Tensor,
-    ) -> None:
-        """Pack BF16 GLM-5 MLA values into a contiguous A5 staging cache."""
-        torch.ops._C_ascend.kv_compress_epilog(
-            kv_compress_cache=cache.view(-1, 1, cache.shape[-1]),
-            x=values.view(-1, values.shape[-1]),
-            slot_mapping=slot_mapping,
-            quant_group_size=64,
-            quant_mode=2,
-            round_scale_flag=True,
-            layout=1,
+        result = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
+            ql_nope,
+            cmp_kv=packed_kv_cache,
+            cmp_sparse_indices=topk_indices,
+            cmp_block_table=block_table,
+            cu_seqlens_q=attn_metadata.query_start_loc,
+            seqused_kv=actual_seq_lengths_key,
+            metadata=attn_metadata.sas_metadata,
+            softmax_scale=sfa_impl.scale,
+            cmp_ratio=1,
+            ori_mask_mode=4,
+            cmp_mask_mode=sparse_mode,
+            ori_win_left=0,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_ND",
         )
+        return result[0] if isinstance(result, tuple) else result
 
     @staticmethod
     def get_dsa_compressor_slot_mapping_format():

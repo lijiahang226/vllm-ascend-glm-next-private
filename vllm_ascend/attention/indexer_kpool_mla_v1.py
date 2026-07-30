@@ -310,7 +310,7 @@ class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
         self._sas_metadata_buffer: torch.Tensor | None = None
         self._spec_sas_metadata_buffers: list[torch.Tensor] | None = None
         self._seqused_q: torch.Tensor | None = None
-        if DeviceOperator.supports_glm5_kv_quant_sparse_attn():
+        if DeviceOperator.supports_sharedkv_indexer_kpool_mla():
             self._sas_metadata_buffer = torch.zeros(
                 INDEXER_KPOOL_MLA_SAS_METADATA_SIZE,
                 dtype=torch.int32,
@@ -341,7 +341,7 @@ class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
     def _build(self, common_attn_metadata, draft_index: int | None = None):
         metadata = super()._build(common_attn_metadata, draft_index)
         metadata.cache_role = "kv"
-        if not DeviceOperator.supports_glm5_kv_quant_sparse_attn():
+        if not DeviceOperator.supports_sharedkv_indexer_kpool_mla():
             return metadata
 
         if draft_index is None:
@@ -359,9 +359,9 @@ class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         hf_config = self.model_config.hf_text_config
-        metadata_op = DeviceOperator.get_glm5_sparse_attn_metadata_op()
+        metadata_op = DeviceOperator.get_sparse_attention_metadata_op_indexer_kpool_mla()
         generated_metadata = metadata_op(
-            **DeviceOperator.get_glm5_sparse_attn_metadata_kwargs(query_start_loc.device),
+            **DeviceOperator.get_sparse_attention_metadata_kwargs_indexer_kpool_mla(query_start_loc.device),
             num_heads_q=hf_config.num_attention_heads // self.vllm_config.parallel_config.tensor_parallel_size,
             num_heads_kv=1,
             head_dim=hf_config.kv_lora_rank,
@@ -453,32 +453,6 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
         self.use_sparse_c8_sfa = False
         self.enable_sfa_prolog_v3 = False
         self.enable_mlapo = False
-        self.use_glm5_kv_quant_sparse_attn = DeviceOperator.supports_glm5_kv_quant_sparse_attn()
-        self._glm5_packed_kv_staging: torch.Tensor | None = None
-        self._glm5_packed_kv_staging_slots: torch.Tensor | None = None
-        if self.use_glm5_kv_quant_sparse_attn:
-            if self.topk_indices_buffer is None:
-                raise ValueError(
-                    "GLM-5 A5 sparse attention requires the persistent "
-                    "top-k buffer to size its graph-stable cache staging."
-                )
-            cache_dtype, cache_head_dim = DeviceOperator.get_glm5_mla_cache_layout(
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-            )
-            max_num_tokens = self.topk_indices_buffer.shape[0]
-            self._glm5_packed_kv_staging = torch.empty(
-                max_num_tokens,
-                1,
-                cache_head_dim,
-                dtype=cache_dtype,
-                device=self.topk_indices_buffer.device,
-            )
-            self._glm5_packed_kv_staging_slots = torch.arange(
-                max_num_tokens,
-                dtype=torch.int64,
-                device=self.topk_indices_buffer.device,
-            )
         self.index_kpool = self.indexer.index_kpool
         self.index_topk = self.indexer.topk_tokens
         if self.index_topk % self.index_kpool:
@@ -527,27 +501,6 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         mla_cache = self._indexer_kpool_mla_caches["kv"]
         if isinstance(mla_cache, torch.Tensor):
-            if self.use_glm5_kv_quant_sparse_attn:
-                cache_dtype, cache_head_dim = DeviceOperator.get_glm5_mla_cache_layout(
-                    self.kv_lora_rank,
-                    self.qk_rope_head_dim,
-                )
-                if mla_cache.dtype != cache_dtype or mla_cache.shape[-1] != cache_head_dim:
-                    raise ValueError(
-                        "GLM-5 A5 packed MLA cache must have dtype/head_dim "
-                        f"{cache_dtype}/{cache_head_dim}, got "
-                        f"{mla_cache.dtype}/{mla_cache.shape[-1]}."
-                    )
-                # These semantic views are only compatibility placeholders for
-                # AscendSFAImpl.  GLM-5's overridden cache writer and sparse
-                # attention both consume the complete packed cache.
-                return (
-                    mla_cache[..., : self.kv_lora_rank],
-                    mla_cache[
-                        ...,
-                        self.kv_lora_rank : self.kv_lora_rank + self.qk_rope_head_dim,
-                    ],
-                )
             return mla_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim],
                 dim=-1,
@@ -686,35 +639,12 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
         mla_cache = self._indexer_kpool_mla_caches["kv"]
         if isinstance(mla_cache, torch.Tensor):
             packed_kv = self._pack_mla_cache_values(kv_c, k_pe, num_tokens)
-            if self.use_glm5_kv_quant_sparse_attn:
-                if (
-                    self._glm5_packed_kv_staging is None
-                    or self._glm5_packed_kv_staging_slots is None
-                ):
-                    raise RuntimeError("Missing GLM-5 A5 packed-KV staging buffers.")
-                packed_staging = self._glm5_packed_kv_staging[:num_tokens]
-                DeviceOperator.store_glm5_mla_cache(
-                    packed_staging,
-                    packed_kv,
-                    self._glm5_packed_kv_staging_slots[:num_tokens],
-                )
-                # GLM-5's shared physical pages give the MLA view a padded
-                # block stride, so it cannot be flattened for
-                # kv_compress_epilog. Quantize into contiguous persistent
-                # staging, then use the existing graph-safe paged scatter.
-                self._scatter_paged_cache(
-                    mla_cache,
-                    kv_slots,
-                    packed_staging,
-                    attn_metadata.block_size,
-                )
-            else:
-                self._scatter_paged_cache(
-                    mla_cache,
-                    kv_slots,
-                    packed_kv,
-                    attn_metadata.block_size,
-                )
+            self._scatter_paged_cache(
+                mla_cache,
+                kv_slots,
+                packed_kv,
+                attn_metadata.block_size,
+            )
         else:
             kv_latent_cache, rope_cache = self._get_mla_cache_views()
             self._scatter_paged_cache(
@@ -1033,43 +963,19 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
 
         packed_kv_cache = self._indexer_kpool_mla_caches.get("kv")
         if not isinstance(packed_kv_cache, torch.Tensor):
-            raise ValueError("Indexer KPool MLA PyTorch sparse attention requires the packed MLA cache.")
-        if self.use_glm5_kv_quant_sparse_attn:
-            if self.qk_rope_head_dim != 0 or q_pe.shape[-1] != 0:
-                raise ValueError("GLM-5 A5 shared-KV sparse attention currently requires qk_rope_head_dim=0.")
-            if attn_metadata.sas_metadata is None:
-                raise RuntimeError("GLM-5 A5 shared-KV sparse attention metadata is missing.")
-            if attn_metadata.query_start_loc is None:
-                raise RuntimeError("GLM-5 A5 query_start_loc metadata is missing.")
-            attn_op = DeviceOperator.get_glm5_sparse_attn_op()
-            return attn_op(
-                ql_nope,
-                cmp_kv=packed_kv_cache,
-                cmp_sparse_indices=topk_indices,
-                cmp_block_table=attn_metadata.block_table,
-                cu_seqlens_q=attn_metadata.query_start_loc,
-                seqused_kv=actual_seq_lengths_key,
-                metadata=attn_metadata.sas_metadata,
-                softmax_scale=self.scale,
-                cmp_ratio=1,
-                ori_mask_mode=4,
-                cmp_mask_mode=3,
-                ori_win_left=0,
-                ori_win_right=0,
-                layout_q="TND",
-                layout_kv="PA_ND",
-                **DeviceOperator.get_glm5_sparse_attn_base_kwargs(),
-            )[0]
-        return self._sparse_attention_pytorch(
-            ql_nope=ql_nope,
-            q_pe=q_pe,
-            packed_kv_cache=packed_kv_cache,
-            topk_indices=topk_indices,
+            raise ValueError("Indexer KPool MLA sparse attention requires the packed MLA cache.")
+        return DeviceOperator.execute_sparse_attention_indexer_kpool_mla(
+            self,
+            ql_nope,
+            q_pe,
+            packed_kv_cache,
+            topk_indices,
+            attn_metadata,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
             block_table=attn_metadata.block_table,
-            actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_key=actual_seq_lengths_key,
-            scale=self.scale,
-            num_actual_tokens=attn_metadata.num_actual_tokens,
+            sparse_mode=3,
+            return_lse=False,
         )
 
     def indexer_select_post_process(
