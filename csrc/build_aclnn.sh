@@ -211,6 +211,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "hc_pre"
         "swiglu_group_quant"
         "situ_mx_quant"
+        "sparse_flash_mla"
+        "sparse_flash_mla_metadata"
         "indexer_compress_epilog_v2"
         "causal_conv1d"
         "recurrent_gated_delta_rule"

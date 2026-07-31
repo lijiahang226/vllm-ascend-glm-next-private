@@ -42,6 +42,7 @@ class AscendIndexerKPoolMLAMetadata(AscendSFAMetadata):
 
     cache_role: str = "kv"
     sas_metadata: torch.Tensor | None = None
+    sas_sinks: torch.Tensor | None = None
     query_start_loc: torch.Tensor | None = None
 
 
@@ -309,12 +310,20 @@ class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
         )
         self._sas_metadata_buffer: torch.Tensor | None = None
         self._spec_sas_metadata_buffers: list[torch.Tensor] | None = None
+        self._sas_sinks: torch.Tensor | None = None
         self._seqused_q: torch.Tensor | None = None
         if DeviceOperator.supports_sharedkv_indexer_kpool_mla():
             self._sas_metadata_buffer = torch.zeros(
                 INDEXER_KPOOL_MLA_SAS_METADATA_SIZE,
                 dtype=torch.int32,
                 device=device,
+            )
+            num_heads_q = (
+                self.model_config.hf_text_config.num_attention_heads
+                // self.vllm_config.parallel_config.tensor_parallel_size
+            )
+            self._sas_sinks = torch.ones(
+                num_heads_q, dtype=torch.float32, device=device
             )
             self._seqused_q = torch.empty(
                 0,
@@ -369,10 +378,14 @@ class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
             cu_seqlens_ori_kv=None,
             cu_seqlens_cmp_kv=None,
             seqused_q=self._seqused_q,
-            seqused_kv=seq_lens,
+            seqused_ori_kv=None,
+            seqused_cmp_kv=seq_lens,
+            cmp_residual_kv=None,
             max_seqlen_q=query_lens.max(),
-            max_seqlen_kv=seq_lens.max(),
+            max_seqlen_ori_kv=0,
+            max_seqlen_cmp_kv=seq_lens.max(),
             batch_size=num_reqs,
+            ori_topk=0,
             cmp_topk=hf_config.index_topk + hf_config.index_kpool - 1,
             cmp_ratio=1,
             ori_mask_mode=4,
@@ -380,7 +393,7 @@ class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
             ori_win_left=0,
             ori_win_right=0,
             layout_q="TND",
-            layout_kv="PA_ND",
+            layout_kv="PA_BBND",
             has_ori_kv=False,
             has_cmp_kv=True,
         )
@@ -392,6 +405,7 @@ class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
             )
         sas_metadata_buffer.copy_(generated_metadata)
         metadata.sas_metadata = sas_metadata_buffer
+        metadata.sas_sinks = self._sas_sinks
         return metadata
 
 

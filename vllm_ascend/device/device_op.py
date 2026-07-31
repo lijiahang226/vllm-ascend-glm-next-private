@@ -1506,13 +1506,94 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
     def get_dsa_sparse_attn_base_kwargs():
         return {"kv_quant_mode": 1, "tile_size": 64, "rope_head_dim": 64}
 
+    # ---- Sparse Flash MLA ----
+
+    @staticmethod
+    def get_sparse_flash_mla_op():
+        """Return the sparse flash MLA attention op for A5 (ascend950)."""
+        return torch.ops._C_ascend.npu_sparse_flash_mla
+
+    @staticmethod
+    def get_sparse_flash_mla_metadata_op():
+        """Return the sparse flash MLA metadata op for A5 (ascend950)."""
+        return torch.ops._C_ascend.npu_sparse_flash_mla_metadata
+
+    @staticmethod
+    def execute_sparse_flash_mla(
+        q: torch.Tensor,
+        *,
+        ori_kv: torch.Tensor | None = None,
+        cmp_kv: torch.Tensor | None = None,
+        ori_sparse_indices: torch.Tensor | None = None,
+        cmp_sparse_indices: torch.Tensor | None = None,
+        ori_block_table: torch.Tensor | None = None,
+        cmp_block_table: torch.Tensor | None = None,
+        cu_seqlens_q: torch.Tensor | None = None,
+        cu_seqlens_ori_kv: torch.Tensor | None = None,
+        cu_seqlens_cmp_kv: torch.Tensor | None = None,
+        seqused_q: torch.Tensor | None = None,
+        seqused_ori_kv: torch.Tensor | None = None,
+        seqused_cmp_kv: torch.Tensor | None = None,
+        cmp_residual_kv: torch.Tensor | None = None,
+        ori_topk_length: torch.Tensor | None = None,
+        cmp_topk_length: torch.Tensor | None = None,
+        sinks: torch.Tensor | None = None,
+        metadata: torch.Tensor | None = None,
+        softmax_scale: float = 0.0,
+        cmp_ratio: int = 4,
+        ori_mask_mode: int = 4,
+        cmp_mask_mode: int = 3,
+        ori_win_left: int = 128,
+        ori_win_right: int = 0,
+        layout_q: str = "BSND",
+        layout_kv: str = "PA_BBND",
+        topk_value_mode: int = 0,
+        return_softmax_lse: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Execute sparse flash MLA attention on A5.
+
+        Returns:
+            tuple of (attention_output, softmax_lse).
+            softmax_lse is an empty tensor when return_softmax_lse is False.
+        """
+        return torch.ops._C_ascend.npu_sparse_flash_mla(
+            q,
+            ori_kv=ori_kv,
+            cmp_kv=cmp_kv,
+            ori_sparse_indices=ori_sparse_indices,
+            cmp_sparse_indices=cmp_sparse_indices,
+            ori_block_table=ori_block_table,
+            cmp_block_table=cmp_block_table,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_ori_kv=cu_seqlens_ori_kv,
+            cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+            seqused_q=seqused_q,
+            seqused_ori_kv=seqused_ori_kv,
+            seqused_cmp_kv=seqused_cmp_kv,
+            cmp_residual_kv=cmp_residual_kv,
+            ori_topk_length=ori_topk_length,
+            cmp_topk_length=cmp_topk_length,
+            sinks=sinks,
+            metadata=metadata,
+            softmax_scale=softmax_scale,
+            cmp_ratio=cmp_ratio,
+            ori_mask_mode=ori_mask_mode,
+            cmp_mask_mode=cmp_mask_mode,
+            ori_win_left=ori_win_left,
+            ori_win_right=ori_win_right,
+            layout_q=layout_q,
+            layout_kv=layout_kv,
+            topk_value_mode=topk_value_mode,
+            return_softmax_lse=return_softmax_lse,
+        )
+
     @staticmethod
     def supports_sharedkv_indexer_kpool_mla() -> bool:
         return True
 
     @staticmethod
     def get_sparse_attention_metadata_op_indexer_kpool_mla():
-        return torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata
+        return torch.ops._C_ascend.npu_sparse_flash_mla_metadata
 
     @staticmethod
     def get_sparse_attention_metadata_kwargs_indexer_kpool_mla(device):
@@ -1554,13 +1635,48 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         if block_table is None:
             block_table = attn_metadata.block_table
 
-        result = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
+        if attn_metadata.sas_sinks is None:
+            raise RuntimeError("GLM-5 A5 sparse attention sinks (sas_sinks) is missing.")
+
+        # sparse_flash_mla unconditionally requires ori_kv, and (when PA_BBND)
+        # ori_block_table and seqused_ori_kv to be non-null tensors, even when
+        # the metadata signals has_ori_kv=False. Supply empty placeholders that
+        # pass the null-checks without contributing any tokens to the compute
+        # graph.
+        ori_kv_placeholder = torch.empty(
+            (0, *packed_kv_cache.shape[1:]),
+            dtype=packed_kv_cache.dtype,
+            device=packed_kv_cache.device,
+        )
+        ori_block_table_placeholder = torch.empty(
+            (block_table.shape[0], 0),
+            dtype=torch.int32,
+            device=block_table.device,
+        )
+        seqused_ori_kv_placeholder = torch.zeros(
+            actual_seq_lengths_key.shape[0],
+            dtype=torch.int32,
+            device=actual_seq_lengths_key.device,
+        )
+
+        result = torch.ops._C_ascend.npu_sparse_flash_mla(
             ql_nope,
+            ori_kv=ori_kv_placeholder,
             cmp_kv=packed_kv_cache,
+            ori_sparse_indices=None,
             cmp_sparse_indices=topk_indices,
+            ori_block_table=ori_block_table_placeholder,
             cmp_block_table=block_table,
             cu_seqlens_q=attn_metadata.query_start_loc,
-            seqused_kv=actual_seq_lengths_key,
+            cu_seqlens_ori_kv=None,
+            cu_seqlens_cmp_kv=None,
+            seqused_q=None,
+            seqused_ori_kv=seqused_ori_kv_placeholder,
+            seqused_cmp_kv=actual_seq_lengths_key,
+            cmp_residual_kv=None,
+            ori_topk_length=None,
+            cmp_topk_length=None,
+            sinks=attn_metadata.sas_sinks,
             metadata=attn_metadata.sas_metadata,
             softmax_scale=sfa_impl.scale,
             cmp_ratio=1,
@@ -1569,9 +1685,11 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             ori_win_left=0,
             ori_win_right=0,
             layout_q="TND",
-            layout_kv="PA_ND",
+            layout_kv="PA_BBND",
+            topk_value_mode=1,
+            return_softmax_lse=False,
         )
-        return result[0] if isinstance(result, tuple) else result
+        return result[0]
 
     @staticmethod
     def get_dsa_compressor_slot_mapping_format():

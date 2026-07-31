@@ -81,7 +81,7 @@ def test_glm5_sparse_attention_device_contract_is_a5_only():
     ) == {"device": "cpu"}
     with mock.patch.object(
         torch.ops._C_ascend,
-        "npu_sparse_attn_sharedkv_metadata",
+        "npu_sparse_flash_mla_metadata",
         create=True,
     ) as metadata_op:
         assert A5DeviceAdaptor.get_sparse_attention_metadata_op_indexer_kpool_mla() is metadata_op
@@ -129,19 +129,21 @@ def test_a5_glm5_sparse_attention_uses_non_quantized_sharedkv():
     query_lens = torch.tensor([1], dtype=torch.int32)
     key_lens = torch.tensor([1], dtype=torch.int32)
     sas_metadata = torch.zeros(1024, dtype=torch.int32)
+    sas_sinks = torch.ones(8, dtype=torch.float32)
     metadata = SimpleNamespace(
         block_table=block_table,
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         sas_metadata=sas_metadata,
+        sas_sinks=sas_sinks,
     )
     expected = torch.ones_like(query)
 
     with mock.patch.object(
         torch.ops._C_ascend,
-        "npu_sparse_attn_sharedkv",
-        return_value=(expected,),
+        "npu_sparse_flash_mla",
+        return_value=(expected, torch.empty(0)),
         create=True,
-    ) as sharedkv_op:
+    ) as sparse_op:
         result = A5DeviceAdaptor.execute_sparse_attention_indexer_kpool_mla(
             SimpleNamespace(scale=0.125, qk_rope_head_dim=0, kv_lora_rank=512),
             query,
@@ -155,16 +157,29 @@ def test_a5_glm5_sparse_attention_uses_non_quantized_sharedkv():
         )
 
     assert result is expected
-    sharedkv_op.assert_called_once()
-    call_args, kwargs = sharedkv_op.call_args
+    sparse_op.assert_called_once()
+    call_args, kwargs = sparse_op.call_args
     assert call_args == (query,)
     assert kwargs["cmp_kv"] is kv
     assert kwargs["cmp_sparse_indices"] is topk_indices
     assert kwargs["cmp_block_table"] is block_table
     assert kwargs["cu_seqlens_q"] is metadata.query_start_loc
-    assert kwargs["seqused_kv"] is key_lens
+    assert kwargs["seqused_cmp_kv"] is key_lens
     assert kwargs["metadata"] is sas_metadata
+    assert kwargs["sinks"] is sas_sinks
     assert kwargs["cmp_mask_mode"] == 3
+    assert kwargs["layout_kv"] == "PA_BBND"
+    assert kwargs["topk_value_mode"] == 1
+    assert kwargs["ori_kv"] is not None
+    assert kwargs["ori_kv"].shape == (0, 128, 1, 512)
+    assert kwargs["ori_kv"].dtype == torch.bfloat16
+    assert kwargs["ori_block_table"] is not None
+    assert kwargs["ori_block_table"].shape == (1, 0)
+    assert kwargs["ori_block_table"].dtype == torch.int32
+    assert kwargs["seqused_ori_kv"] is not None
+    assert kwargs["seqused_ori_kv"].shape == (1,)
+    assert kwargs["seqused_ori_kv"].dtype == torch.int32
+    assert kwargs["seqused_q"] is None
     assert "kv_quant_mode" not in kwargs
 
 
