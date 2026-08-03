@@ -160,25 +160,21 @@ def test_a5_glm5_sparse_attention_uses_non_quantized_sharedkv():
     sparse_op.assert_called_once()
     call_args, kwargs = sparse_op.call_args
     assert call_args == (query,)
-    assert kwargs["cmp_kv"] is kv
-    assert kwargs["cmp_sparse_indices"] is topk_indices
-    assert kwargs["cmp_block_table"] is block_table
+    # GLM-5 passes its only KV cache as the original (ori) KV — no compressed path.
+    assert kwargs["ori_kv"] is kv
+    assert kwargs["cmp_kv"] is None
+    assert kwargs["ori_sparse_indices"] is topk_indices
+    assert kwargs["cmp_sparse_indices"] is None
+    assert kwargs["ori_block_table"] is block_table
+    assert kwargs["cmp_block_table"] is None
     assert kwargs["cu_seqlens_q"] is metadata.query_start_loc
-    assert kwargs["seqused_cmp_kv"] is key_lens
+    assert kwargs["seqused_ori_kv"] is key_lens
+    assert kwargs["seqused_cmp_kv"] is None
     assert kwargs["metadata"] is sas_metadata
     assert kwargs["sinks"] is sas_sinks
-    assert kwargs["cmp_mask_mode"] == 3
+    assert kwargs["ori_mask_mode"] == 3
     assert kwargs["layout_kv"] == "PA_BBND"
     assert kwargs["topk_value_mode"] == 1
-    assert kwargs["ori_kv"] is not None
-    assert kwargs["ori_kv"].shape == (0, 128, 1, 512)
-    assert kwargs["ori_kv"].dtype == torch.bfloat16
-    assert kwargs["ori_block_table"] is not None
-    assert kwargs["ori_block_table"].shape == (1, 0)
-    assert kwargs["ori_block_table"].dtype == torch.int32
-    assert kwargs["seqused_ori_kv"] is not None
-    assert kwargs["seqused_ori_kv"].shape == (1,)
-    assert kwargs["seqused_ori_kv"].dtype == torch.int32
     assert kwargs["seqused_q"] is None
     assert "kv_quant_mode" not in kwargs
 
