@@ -1241,49 +1241,23 @@ class AscendSparseAttnIndexerKpool(nn.Module):
                 indexer_metadata.slot_mapping[selected].to(torch.int64),
             )
 
-        if is_full_graph:
-            pool_ids = self.indexer_kpool_topk_decode(
-                query=q_values[:num_tokens],
-                key=indexer_cache,
-                weights=weights[:num_tokens].to(q_values.dtype),
-                actual_seq_lengths_query=attn_metadata.cum_query_lens,
-                actual_seq_lengths_key=indexer_metadata.seq_lens,
-                block_table=indexer_metadata.block_table,
-                sparse_count=self.pool_topk,
-            )
-        else:
-            max_pool_seq_len = int(indexer_metadata.seq_lens_cpu.max())
-            pool_ids = self.indexer_kpool_topk_pytorch(
-                query=q_values[:num_tokens],
-                key=indexer_cache,
-                weights=weights[:num_tokens].to(q_values.dtype),
-                actual_seq_lengths_query=attn_metadata.cum_query_lens,
-                actual_seq_lengths_key=indexer_metadata.seq_lens,
-                block_table=indexer_metadata.block_table,
-                query_positions=positions,
-                sparse_count=self.pool_topk,
-                pool_size=index_kpool,
-                max_key_seq_len=max_pool_seq_len,
-            )
-        expanded = self.expand_pools_to_tokens(
-            pool_ids,
-            pool_ids >= 0,
-            self.topk_tokens,
-            index_kpool,
+        max_pool_seq_len = (
+            indexer_metadata.block_table.shape[1] * indexer_cache.shape[1]
+            if is_full_graph
+            else int(indexer_metadata.seq_lens_cpu.max())
         )
-        query_seq_lens = positions.to(torch.int32) + 1
-        pool_lens = torch.div(
-            query_seq_lens,
-            index_kpool,
-            rounding_mode="floor",
+        return torch.ops.vllm.glm5_next_lightning_indexer(
+            q_values[:num_tokens],
+            indexer_cache,
+            weights[:num_tokens].to(q_values.dtype),
+            attn_metadata.cum_query_lens,
+            indexer_metadata.seq_lens,
+            indexer_metadata.block_table,
+            positions,
+            index_topk=self.topk_tokens,
+            index_kpool=index_kpool,
+            max_pool_seq_len=max_pool_seq_len,
         )
-        expanded = self.append_tail_to_topk(
-            expanded,
-            query_seq_lens,
-            pool_lens,
-            index_kpool,
-        )
-        return expanded.unsqueeze(1)
 
 
 class AscendGlm5NextIndexer(nn.Module):

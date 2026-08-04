@@ -1320,17 +1320,21 @@ def test_glm5_indexer_paged_write_preserves_physical_page_stride():
 
 
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
-@patch("torch.ops._C_ascend.npu_lightning_indexer", create=True)
+@patch("torch.ops.vllm.glm5_next_lightning_indexer", create=True)
 @patch("torch_npu.npu_scatter_nd_update_", create=True)
 def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
     mock_scatter,
     mock_lightning_indexer,
     mock_get_forward_context,
 ):
-    mock_lightning_indexer.return_value = (
-        torch.tensor([[[0]], [[-1]]], dtype=torch.int32),
-        torch.empty(0),
+    expected = torch.tensor(
+        [
+            [[0, 1, 2, 3, -1, -1, -1]],
+            [[-1, -1, -1, -1, 0, -1, -1]],
+        ],
+        dtype=torch.int32,
     )
+    mock_lightning_indexer.return_value = expected
 
     state_cache = torch.zeros((1, 4, 4), dtype=torch.bfloat16)
     indexer_cache = torch.zeros((1, 1, 1, 2), dtype=torch.bfloat16)
@@ -1352,7 +1356,9 @@ def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
         slot_mapping=torch.tensor([0, -1], dtype=torch.int64),
         block_table=torch.tensor([[0], [0]], dtype=torch.int32),
         seq_lens=torch.tensor([1, 0], dtype=torch.int32),
-        seq_lens_cpu=SimpleNamespace(max=lambda: pytest.fail("full decode must not read CPU max sequence length")),
+        seq_lens_cpu=SimpleNamespace(
+            max=lambda: pytest.fail("full decode must not read CPU max sequence length")
+        ),
     )
     attn_metadata = SimpleNamespace(
         cum_query_lens=torch.tensor([1, 2], dtype=torch.int32),
@@ -1395,11 +1401,12 @@ def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
             positions=torch.tensor([3, 0], dtype=torch.int64),
         )
 
-    assert result.shape == (2, 1, 7)
-    assert result[0, 0].tolist() == [0, 1, 2, 3, -1, -1, -1]
-    assert result[1, 0].tolist() == [-1, -1, -1, -1, 0, -1, -1]
+    torch.testing.assert_close(result, expected)
     assert indexer_cache[0, 0, 0, 0] > 0
     assert mock_lightning_indexer.call_count == 1
+    assert mock_lightning_indexer.call_args.kwargs["index_topk"] == 4
+    assert mock_lightning_indexer.call_args.kwargs["index_kpool"] == 4
+    assert mock_lightning_indexer.call_args.kwargs["max_pool_seq_len"] == 1
     mock_scatter.assert_not_called()
 
 
