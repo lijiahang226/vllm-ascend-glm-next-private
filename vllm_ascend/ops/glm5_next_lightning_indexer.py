@@ -27,6 +27,13 @@ else:
     glm5_next_lightning_indexer_triton = None
 
 
+def _align_key_chunk_size(cache_block_size: int) -> int:
+    return max(
+        cache_block_size,
+        INDEXER_KPOOL_KEY_CHUNK_SIZE // cache_block_size * cache_block_size,
+    )
+
+
 def _validate_common_inputs(
     query: torch.Tensor,
     indexer_cache: torch.Tensor,
@@ -240,6 +247,7 @@ def _pool_topk(
     causal_pool_lens = torch.minimum(causal_pool_lens, request_pool_lens)
 
     cache_block_size = indexer_cache.shape[1]
+    key_chunk_size = _align_key_chunk_size(cache_block_size)
     score_mask_value = torch.finfo(torch.float32).min
 
     for query_start in range(0, query.shape[0], INDEXER_KPOOL_QUERY_CHUNK_SIZE):
@@ -262,8 +270,8 @@ def _pool_topk(
             device=query.device,
         )
 
-        for key_start in range(0, max_pool_seq_len, INDEXER_KPOOL_KEY_CHUNK_SIZE):
-            key_end = min(key_start + INDEXER_KPOOL_KEY_CHUNK_SIZE, max_pool_seq_len)
+        for key_start in range(0, max_pool_seq_len, key_chunk_size):
+            key_end = min(key_start + key_chunk_size, max_pool_seq_len)
             keys_per_row = key_end - key_start
             if key_start % cache_block_size:
                 raise ValueError(

@@ -890,6 +890,10 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         causal_pool_lens = torch.minimum(causal_pool_lens, request_pool_lens)
 
         cache_block_size = key.shape[1]
+        key_chunk_size = max(
+            cache_block_size,
+            key_chunk_size // cache_block_size * cache_block_size,
+        )
         score_mask_value = torch.finfo(torch.float32).min
 
         for query_start in range(0, query.shape[0], query_chunk_size):

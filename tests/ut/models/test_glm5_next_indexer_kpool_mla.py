@@ -1691,6 +1691,43 @@ def test_glm5_next_lightning_indexer_matches_reference_chain():
     torch.testing.assert_close(indexer_cache, indexer_cache_before)
 
 
+def test_glm5_next_lightning_indexer_fallback_aligns_cache_block_chunks():
+    index_topk = 2
+    index_kpool = 2
+    max_pool_seq_len = 2050
+    cache_block_size = 96
+    head_dim = 2
+    num_pages = (max_pool_seq_len + cache_block_size - 1) // cache_block_size
+
+    query = torch.tensor([[[1.0, 0.0]]], dtype=torch.bfloat16)
+    weights = torch.ones((1, 1), dtype=torch.bfloat16)
+    indexer_cache = torch.zeros(
+        (num_pages, cache_block_size, 1, head_dim),
+        dtype=torch.bfloat16,
+    )
+    indexer_cache[0, 0, 0, 0] = 1.0
+    indexer_block_table = torch.arange(num_pages, dtype=torch.int32).unsqueeze(0)
+    cum_query_lens = torch.tensor([1], dtype=torch.int32)
+    indexer_seq_lens = torch.tensor([max_pool_seq_len], dtype=torch.int32)
+    positions = torch.tensor([max_pool_seq_len * index_kpool - 1], dtype=torch.int64)
+
+    result = glm5_next_lightning_indexer(
+        query,
+        indexer_cache,
+        weights,
+        cum_query_lens,
+        indexer_seq_lens,
+        indexer_block_table,
+        positions,
+        index_topk=index_topk,
+        index_kpool=index_kpool,
+        max_pool_seq_len=max_pool_seq_len,
+    )
+
+    assert result.shape == (1, 1, index_topk + index_kpool - 1)
+    assert result[0, 0].tolist() == [0, 1, -1]
+
+
 def test_indexer_kpool_mla_kpool_compress_returns_bfloat16_without_quant_scale():
     indexer_cache = torch.zeros((1, 2, 1, 2), dtype=torch.bfloat16)
     slot_k = torch.tensor(
