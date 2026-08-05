@@ -78,6 +78,32 @@ class Glm5NextTextConfig(PretrainedConfig):
         swiglu_limit: float | None = None,
         **kwargs,
     ):
+        # Checkpoints may ship a nested ``linear_attn_config`` dict under
+        # ``text_config``.  Pop it before super().__init__ so PretrainedConfig
+        # does not store it as a raw-dict attribute (which would shadow the
+        # property below).
+        linear_attn_cfg = kwargs.pop("linear_attn_config", None)
+        if linear_attn_cfg is not None:
+            linear_head_dim = linear_attn_cfg.get("head_dim", linear_head_dim)
+            linear_num_heads = linear_attn_cfg.get("num_heads", linear_num_heads)
+            linear_conv_kernel_dim = linear_attn_cfg.get(
+                "short_conv_kernel_size", linear_conv_kernel_dim
+            )
+            linear_lower_bound = linear_attn_cfg.get(
+                "gate_lower_bound",
+                linear_attn_cfg.get("lower_bound", linear_lower_bound),
+            )
+            self._kda_layers = linear_attn_cfg.get("kda_layers", None)
+            self._full_attn_layers = linear_attn_cfg.get("full_attn_layers", None)
+        else:
+            self._kda_layers = None
+            self._full_attn_layers = None
+
+        # Checkpoints may use ``mla_use_nope`` instead of ``mla_nope``.
+        # Pop so PretrainedConfig doesn't store the alias.
+        if "mla_use_nope" in kwargs:
+            mla_nope = kwargs.pop("mla_use_nope")
+
         # The checkpoint ships sglang/standard field names that differ from our
         # __init__ params (num_experts_per_tok / hc_mult / hc_sinkhorn_iters).
         # Use .get (not .pop) so BOTH names stay exposed at the checkpoint
@@ -191,14 +217,20 @@ class Glm5NextTextConfig(PretrainedConfig):
         The upstream ``KimiGatedDeltaNetAttention.__init__`` accesses
         ``config.linear_attn_config`` directly.  GLM5 Next stores KDA
         head parameters as top-level fields, so we return a dict mirroring
-        the legacy ``linear_attn_config`` schema.
+        the ``linear_attn_config`` schema.
         """
-        return {
+        result: dict = {
             "head_dim": self.linear_head_dim,
             "num_heads": self.linear_num_heads,
             "short_conv_kernel_size": self.linear_conv_kernel_dim,
+            "gate_lower_bound": self.linear_lower_bound,
             "lower_bound": self.linear_lower_bound,
         }
+        if self._kda_layers is not None:
+            result["kda_layers"] = self._kda_layers
+        if self._full_attn_layers is not None:
+            result["full_attn_layers"] = self._full_attn_layers
+        return result
 
     @property
     def is_mla(self):
