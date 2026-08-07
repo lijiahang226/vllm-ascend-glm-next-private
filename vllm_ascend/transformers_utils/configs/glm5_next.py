@@ -164,7 +164,11 @@ class Glm5NextTextConfig(PretrainedConfig):
         # Per-layer attention / MLP layout. Normalize mlp_layer_types from
         # first_k_dense_replace when the new-schema field is absent so layer
         # construction sees a consistent layout (mirrors cohere2_moe).
-        self.layer_types = layer_types
+        # NOTE: ``self.layer_types`` is deliberately assigned AFTER
+        # super().__init__() below: transformers' @strict PretrainedConfig
+        # validates ``layer_types`` against ALLOWED_LAYER_TYPES at the end of
+        # super().__init__(), and rejects GLM5-Next's custom
+        # "deepseek_sparse_attention" entries.
         if mlp_layer_types is None:
             n = self.num_hidden_layers
             if first_k_dense_replace is not None:
@@ -209,6 +213,11 @@ class Glm5NextTextConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+        # Assigned after super().__init__() so the @strict layer_types
+        # validator (which only knows upstream ALLOWED_LAYER_TYPES) does not
+        # see GLM5-Next's custom entries.
+        self.layer_types = layer_types
 
     @property
     def linear_attn_config(self) -> dict:
