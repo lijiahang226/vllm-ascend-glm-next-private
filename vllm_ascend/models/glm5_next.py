@@ -2339,6 +2339,27 @@ class AscendGlm5NextModel(nn.Module):
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 continue
+            layer_prefix = "layers."
+            if name.startswith(layer_prefix):
+                try:
+                    layer_idx = int(name[len(layer_prefix):].split(".", 1)[0])
+                except ValueError:
+                    layer_idx = -1
+                if layer_idx >= self.config.num_hidden_layers:
+                    # 0808 checkpoints append a nextn (multi-token-prediction)
+                    # block as layer <num_hidden_layers>; this codebase defines
+                    # no params for it, so skip its weights.
+                    continue
+            if name.endswith((".q_conv1d.weight", ".k_conv1d.weight", ".v_conv1d.weight")) and name in params_dict:
+                # GLM-5-Next 0808 checkpoint: q/k/v short-conv weights are saved
+                # as three separate 3D tensors (out, 1, kernel), which match the
+                # module parameters directly. Load them as-is instead of
+                # treating them as a single fused conv1d.weight.
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+                continue
             if "conv1d.weight" in name:
                 if loaded_weight.dim() == 3:
                     loaded_weight = loaded_weight.squeeze(1)
