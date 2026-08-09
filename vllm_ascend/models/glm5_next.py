@@ -102,19 +102,6 @@ INDEXER_KPOOL_HEAD_DIM = 128
 INDEXER_KPOOL_QUERY_CHUNK_SIZE = 16
 INDEXER_KPOOL_KEY_CHUNK_SIZE = 2048
 
-# 完整 Glm5NextForConditionalGeneration checkpoint 同时包含视觉塔和语言
-# 模型。Ascend 当前为该 architecture 注册纯文本运行 wrapper：保留并跳过
-# 视觉权重，将 HF 多模态 wrapper 下的语言模型前缀映射到纯文本模型。
-GLM5_CONDITIONAL_WEIGHTS_MAPPER = WeightsMapper(
-    orig_to_new_prefix={
-        "model.visual.": None,
-        "visual.": None,
-        "model.language_model.": "model.",
-        "language_model.model.": "model.",
-        "language_model.lm_head.": "lm_head.",
-    }
-)
-
 GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER = WeightsMapper(
     orig_to_new_substr={
         ".self_attn.forget_gate.A_log": ".self_attn.A_log",
@@ -2524,10 +2511,4 @@ class AscendGlm5NextForCausalLM(nn.Module, HasInnerState, SupportsPP, MixtureOfE
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(
-            weights,
-            mapper=(
-                GLM5_CONDITIONAL_WEIGHTS_MAPPER
-                | GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER
-            ),
-        )
+        return loader.load_weights(weights)

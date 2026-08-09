@@ -1,0 +1,160 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from typing import ClassVar, Literal
+
+import torch
+from vllm.config import VllmConfig
+from vllm.model_executor.models.glm4_1v import (
+    Glm4vDummyInputsBuilder,
+    Glm4vForConditionalGeneration,
+    Glm4vMultiModalProcessor,
+    Glm4vProcessingInfo,
+)
+from vllm.model_executor.models.glm_ocr import (
+    GlmOcrPatchMerger,
+    GlmOcrVisionTransformer,
+)
+from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
+from vllm.model_executor.models.utils import (
+    AutoWeightsLoader,
+    WeightsMapper,
+    init_vllm_registered_model,
+    maybe_prefix,
+)
+from vllm.multimodal import MULTIMODAL_REGISTRY
+
+
+class AscendGlm5NextVisionPatchMerger(GlmOcrPatchMerger):
+    pass
+
+
+class AscendGlm5NextVisionTransformer(GlmOcrVisionTransformer):
+    def __init__(
+        self,
+        text_config,
+        vision_config,
+        norm_eps: float = 1e-5,
+        quant_config=None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(
+            text_config,
+            vision_config,
+            norm_eps=norm_eps,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+        self.merger = AscendGlm5NextVisionPatchMerger(
+            d_model=vision_config.out_hidden_size,
+            context_dim=vision_config.projection_intermediate_size,
+            quant_config=quant_config,
+            bias=False,
+            prefix=f"{prefix}.merger",
+        )
+
+
+class AscendGlm5NextProcessingInfo(Glm4vProcessingInfo):
+    def get_hf_processor(self, **kwargs: object):
+        proc = getattr(self, "_glm5_hf_processor", None)
+        if proc is None:
+            import json
+            import os
+
+            import transformers
+            from transformers import (
+                AutoTokenizer,
+                Glm4vImageProcessor,
+                Glm4vProcessor,
+            )
+            from transformers.models.auto.image_processing_auto import (
+                get_image_processor_config,
+            )
+
+            model_path = self.ctx.model_config.model
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            ip_cfg = get_image_processor_config(model_path)
+            _MM_MAX_PIXELS = 1_254_400
+            if isinstance(ip_cfg.get("size"), dict):
+                ip_cfg["size"]["longest_edge"] = min(
+                    ip_cfg["size"].get("longest_edge", _MM_MAX_PIXELS),
+                    _MM_MAX_PIXELS,
+                )
+            image_processor = Glm4vImageProcessor(
+                **{k: v for k, v in ip_cfg.items() if k != "image_processor_type"}
+            )
+            with open(os.path.join(model_path, "processor_config.json")) as f:
+                vp_cfg = json.load(f)["video_processor"]
+            if isinstance(vp_cfg.get("size"), dict):
+                vp_cfg["size"]["longest_edge"] = min(
+                    vp_cfg["size"].get("longest_edge", _MM_MAX_PIXELS),
+                    _MM_MAX_PIXELS,
+                )
+            video_cls = transformers.Glm4vVideoProcessor
+            video_processor = video_cls(
+                **{k: v for k, v in vp_cfg.items() if k != "video_processor_type"}
+            )
+            proc = Glm4vProcessor(
+                image_processor=image_processor,
+                video_processor=video_processor,
+                tokenizer=tokenizer,
+            )
+            self._glm5_hf_processor = proc
+        return proc
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    Glm4vMultiModalProcessor,
+    info=AscendGlm5NextProcessingInfo,
+    dummy_inputs=Glm4vDummyInputsBuilder,
+)
+class AscendGlm5NextForConditionalGeneration(
+    Glm4vForConditionalGeneration, HasInnerState, IsHybrid
+):
+    has_inner_state: ClassVar[Literal[True]] = True
+    is_hybrid: ClassVar[Literal[True]] = True
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
+        from vllm_ascend.models.glm5_next import AscendGlm5NextForCausalLM
+        return AscendGlm5NextForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
+
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
+        from vllm_ascend.models.glm5_next import AscendGlm5NextForCausalLM
+        return AscendGlm5NextForCausalLM.get_mamba_state_shape_from_config(vllm_config)
+
+    @classmethod
+    def get_mamba_state_copy_func(cls):
+        from vllm_ascend.models.glm5_next import AscendGlm5NextForCausalLM
+        return AscendGlm5NextForCausalLM.get_mamba_state_copy_func()
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super(Glm4vForConditionalGeneration, self).__init__()
+        config = vllm_config.model_config.hf_config
+        multimodal_config = vllm_config.model_config.multimodal_config
+        assert multimodal_config is not None
+
+        self.config = config
+        self.model_config = vllm_config.model_config
+        self.multimodal_config = multimodal_config
+        self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
+        self.is_multimodal_pruning_enabled = (
+            multimodal_config.is_multimodal_pruning_enabled()
+        )
+
+        with self._mark_tower_model(vllm_config, {"image", "video"}):
+            self.visual = AscendGlm5NextVisionTransformer(
+                config.text_config,
+                config.vision_config,
+                norm_eps=config.vision_config.rms_norm_eps,
+                quant_config=None,
+                prefix=maybe_prefix(prefix, "visual"),
+            )
+
+        with self._mark_language_model(vllm_config):
+            self.language_model = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                hf_config=config.text_config,
+                prefix=maybe_prefix(prefix, "language_model"),
+                architectures=["Glm5NextForCausalLM"],
+            )

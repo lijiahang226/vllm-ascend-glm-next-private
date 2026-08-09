@@ -332,11 +332,28 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 self.device,
             )
 
+        if self.supports_mm_inputs:
+            try:
+                dummy_input_ids = torch.tensor([[1]], device=self.input_ids.device)
+                self.model.embed_input_ids(dummy_input_ids, multimodal_embeddings=None)
+            except (NotImplementedError, AttributeError, TypeError):
+                logger.warning(
+                    "Draft model does not support multimodal inputs, "
+                    "falling back to text-only mode"
+                )
+                self.supports_mm_inputs = False
+
         if supports_multimodal(model):
             # handle multimodality
-            model_name = self.get_model_name(model)
-            self.model.config.image_token_index = self._get_multimodal_image_token_index(model_name, model.config)
-            if model_name == "Glm5NextForConditionalGeneration":
+            if self.get_model_name(model) in [
+                "Qwen2_5_VLForConditionalGeneration",
+                "Qwen3VLForConditionalGeneration",
+                "Qwen3VLMoeForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+                "Step3p7ForConditionalGeneration",
+                "AscendGlm5NextForConditionalGeneration",
+            ]:
                 self.model.config.image_token_index = model.config.image_token_id
             target_language_model = model.get_language_model()
         else:
