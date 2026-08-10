@@ -606,23 +606,53 @@ class BaseDeviceAdaptor:
         sparse_mode: int = 3,
         return_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Execute Indexer KPool MLA attention as a sequence of small ops."""
+        """Execute Indexer KPool MLA attention via npu_sparse_flash_attention with rope=None."""
         if return_lse:
-            raise NotImplementedError("Indexer KPool MLA small-op attention does not expose LSE.")
+            raise NotImplementedError("Indexer KPool MLA attention does not expose LSE.")
         if sparse_mode != 3:
             raise ValueError(f"Indexer KPool MLA only supports sparse_mode=3, got {sparse_mode}.")
         if block_table is None:
             block_table = attn_metadata.block_table
-        return sfa_impl._sparse_attention_pytorch(
-            ql_nope=ql_nope,
-            q_pe=q_pe,
-            packed_kv_cache=packed_kv_cache,
-            topk_indices=topk_indices,
+        query = torch.cat([ql_nope, q_pe], dim=-1).contiguous()
+        # In MTP/draft scenarios the indexer may produce per-request indices
+        # (e.g. shape [1, 1, 2051]) while the query carries all draft tokens
+        # (e.g. shape [10, N, D]). Expand to match the query token count.
+        if topk_indices.shape[0] != query.shape[0]:
+            if topk_indices.shape[0] == 1:
+                topk_indices = topk_indices.expand(query.shape[0], -1, -1).contiguous()
+            else:
+                raise RuntimeError(
+                    f"topk_indices batch dim {topk_indices.shape[0]} "
+                    f"does not match query tokens {query.shape[0]}."
+                )
+        result = torch.ops._C_ascend.npu_sparse_flash_attention(
+            query=query,
+            key=packed_kv_cache,
+            value=packed_kv_cache,
+            sparse_indices=topk_indices,
+            scale_value=sfa_impl.scale,
+            sparse_block_size=1,
             block_table=block_table,
             actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_key=actual_seq_lengths_key,
-            scale=sfa_impl.scale,
-            num_actual_tokens=attn_metadata.num_actual_tokens,
+            actual_seq_lengths_kv=actual_seq_lengths_key,
+            query_rope=None,
+            key_rope=None,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=sparse_mode,
+            attention_mode=2,
+            return_softmax_lse=return_lse,
+        )
+        if not isinstance(result, tuple):
+            if return_lse:
+                raise RuntimeError("Sparse flash attention did not return softmax max/sum for DCP LSE merge.")
+            return result
+        attn_output, softmax_max, softmax_sum = result
+        return BaseDeviceAdaptor._format_sparse_flash_attention_output(
+            attn_output,
+            softmax_max,
+            softmax_sum,
+            return_lse,
         )
 
     @staticmethod
