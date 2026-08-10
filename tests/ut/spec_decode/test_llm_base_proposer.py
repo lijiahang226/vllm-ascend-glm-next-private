@@ -22,25 +22,73 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
-from vllm.config import CUDAGraphMode
+def test_mtp_indexer_builder_keeps_shared_manager_block_size():
+    class _Backend:
+        @classmethod
+        def full_cls_name(cls):
+            return cls.__name__
 
-from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
+    class _KVBackend(_Backend):
+        pass
 
-# CUDAGraphMode values whose ``has_full_cudagraphs()`` is True: FULL plus the
-# two composite modes that mix FULL with NONE / PIECEWISE.
-FULL_CUDAGRAPH_MODES = [
-    CUDAGraphMode.FULL,
-    CUDAGraphMode.FULL_DECODE_ONLY,
-    CUDAGraphMode.FULL_AND_PIECEWISE,
-]
+    class _IndexerBackend(_Backend):
+        pass
 
-# Modes without a full cudagraph.
-NON_FULL_CUDAGRAPH_MODES = [
-    CUDAGraphMode.NONE,
-    CUDAGraphMode.PIECEWISE,
-]
+    layers = {
+        "draft.kv": SimpleNamespace(
+            cache_role="kv",
+            get_attn_backend=lambda: _KVBackend,
+        ),
+        "draft.indexer": SimpleNamespace(
+            cache_role="indexer",
+            get_attn_backend=lambda: _IndexerBackend,
+        ),
+    }
+    builder_kernel_sizes = {}
 
+    def record_builder(group, _vllm_config, _device, kernel_block_size=None):
+        builder_kernel_sizes[tuple(group.layer_names)] = kernel_block_size
+        group.metadata_builders = [
+            SimpleNamespace(kv_cache_spec=group.kv_cache_spec)
+        ]
+
+    proposer = AscendSpecDecodeBaseProposer.__new__(
+        AscendSpecDecodeBaseProposer
+    )
+    proposer.vllm_config = SimpleNamespace()
+    proposer.device = torch.device("cpu")
+    proposer._draft_attn_layer_names = set(layers)
+    proposer.attn_layer_names = ["draft.kv", "draft.indexer"]
+    proposer.slot_mapping_group = [torch.zeros(8, dtype=torch.int32)]
+    proposer.num_speculative_tokens = 3
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(
+                layer_names=list(layers),
+                kv_cache_spec=SimpleNamespace(block_size=640),
+            )
+        ]
+    )
+
+    with (
+        patch(
+            "vllm_ascend.spec_decode.llm_base_proposer."
+            "get_layers_from_vllm_config",
+            return_value=layers,
+        ),
+        patch(
+            "vllm_ascend.spec_decode.llm_base_proposer."
+            "AttentionGroup.create_metadata_builders",
+            new=record_builder,
+        ),
+    ):
+        proposer.initialize_attn_backend(
+            kv_cache_config,
+            kernel_block_sizes=[128],
+        )
+
+    assert builder_kernel_sizes[("draft.kv",)] == 128
+    assert builder_kernel_sizes[("draft.indexer",)] is None
 
 class TestMultimodalImageTokenIndex:
     @pytest.mark.parametrize(
@@ -134,6 +182,8 @@ def test_load_model_reads_validated_draft_window_size():
 
     assert proposer.draft_window_size == 4096
     mock_adapter.assert_called_once_with(4096, 16, 8, 4, "cpu")
+
+
 
 
 class TestDisablePaddedDrafterBatchWithFullGraph:

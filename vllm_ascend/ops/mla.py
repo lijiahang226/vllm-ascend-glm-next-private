@@ -32,6 +32,9 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.utils import parse_layer_idx, uses_global_inputs_embeds
+
 
 class IndexerWrapper(nn.Module):
     """
@@ -134,7 +137,16 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
 
         self.mla_attn.process_weights_after_loading = wrapped_process_weights
 
+        # Multimodal inputs_embeds at layer 0 are full [N, H], but a model whose
+        # top-level config merely contains a vision config can still use the
+        # token-sharded input_ids path. Keep this decision static for Dynamo,
+        # while distinguishing those two model-runner layouts.
         vllm_config = get_current_vllm_config()
+        _layer_idx = parse_layer_idx(prefix)
+        self.is_vl_first_layer = bool(
+            uses_global_inputs_embeds(vllm_config, "image") and _layer_idx == 0
+        )
+
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
