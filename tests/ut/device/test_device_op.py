@@ -90,55 +90,35 @@ def test_glm5_sparse_attention_device_contract_is_a5_only():
 
 
 def test_base_glm5_sparse_attention_delegates_to_small_op_path():
-    """BaseDeviceAdaptor routes Indexer KPool MLA through npu_sparse_flash_attention."""
     expected = torch.randn((1, 8, 512), dtype=torch.bfloat16)
+    small_op_path = mock.MagicMock(return_value=expected)
     packed_kv_cache = torch.zeros((1, 128, 1, 512), dtype=torch.bfloat16)
     block_table = torch.zeros((1, 1), dtype=torch.int32)
-    ql_nope = torch.zeros_like(expected)
-    q_pe = torch.empty((1, 8, 0), dtype=torch.bfloat16)
-    topk_indices = torch.zeros((1, 1, 515), dtype=torch.int32)
-    query_lens = torch.tensor([1], dtype=torch.int32)
-    key_lens = torch.tensor([1], dtype=torch.int32)
+    args = (
+        SimpleNamespace(scale=0.125, _sparse_attention_pytorch=small_op_path),
+        torch.zeros_like(expected),
+        torch.empty((1, 8, 0), dtype=torch.bfloat16),
+        packed_kv_cache,
+        torch.zeros((1, 1, 515), dtype=torch.int32),
+        SimpleNamespace(block_table=block_table, num_actual_tokens=1),
+        torch.tensor([1], dtype=torch.int32),
+        torch.tensor([1], dtype=torch.int32),
+    )
 
-    with mock.patch.object(
-        torch.ops._C_ascend,
-        "npu_sparse_flash_attention",
-        return_value=expected,
-        create=True,
-    ) as sparse_op:
-        result = BaseDeviceAdaptor.execute_sparse_attention_indexer_kpool_mla(
-            SimpleNamespace(scale=0.125),
-            ql_nope,
-            q_pe,
-            packed_kv_cache,
-            topk_indices,
-            SimpleNamespace(block_table=block_table, num_actual_tokens=1),
-            query_lens,
-            key_lens,
-        )
+    result = BaseDeviceAdaptor.execute_sparse_attention_indexer_kpool_mla(*args)
 
     assert result is expected
-    sparse_op.assert_called_once()
-    call_kwargs = sparse_op.call_args.kwargs
-    assert call_kwargs["key"] is packed_kv_cache
-    assert call_kwargs["value"] is packed_kv_cache
-    assert call_kwargs["sparse_indices"] is topk_indices
-    assert call_kwargs["scale_value"] == 0.125
-    assert call_kwargs["sparse_block_size"] == 1
-    assert call_kwargs["block_table"] is block_table
-    assert call_kwargs["actual_seq_lengths_query"] is query_lens
-    assert call_kwargs["actual_seq_lengths_kv"] is key_lens
-    assert call_kwargs["query_rope"] is None
-    assert call_kwargs["key_rope"] is None
-    assert call_kwargs["layout_query"] == "TND"
-    assert call_kwargs["layout_kv"] == "PA_BSND"
-    assert call_kwargs["sparse_mode"] == 3
-    assert call_kwargs["attention_mode"] == 2
-    assert call_kwargs["return_softmax_lse"] is False
-    # query must be cat(ql_nope, q_pe) contiguous
-    query = call_kwargs["query"]
-    assert query.shape == (1, 8, 512)
-    assert query.is_contiguous()
+    small_op_path.assert_called_once_with(
+        ql_nope=args[1],
+        q_pe=args[2],
+        packed_kv_cache=packed_kv_cache,
+        topk_indices=args[4],
+        block_table=block_table,
+        actual_seq_lengths_query=args[6],
+        actual_seq_lengths_key=args[7],
+        scale=0.125,
+        num_actual_tokens=1,
+    )
 
 
 def test_a5_glm5_sparse_attention_uses_non_quantized_sharedkv():
