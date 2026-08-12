@@ -614,17 +614,30 @@ class BaseDeviceAdaptor:
         if block_table is None:
             block_table = attn_metadata.block_table
         query = torch.cat([ql_nope, q_pe], dim=-1).contiguous()
-        # In MTP/draft scenarios the indexer may produce per-request indices
-        # (e.g. shape [1, 1, 2051]) while the query carries all draft tokens
-        # (e.g. shape [10, N, D]). Expand to match the query token count.
+        # In eager MTP/draft steps the draft model forwards the full
+        # first-pass token buffer (num_input_tokens rows) while the attention
+        # metadata only describes the real query rows (num_actual_tokens, one
+        # per request).  The indexer truncates to the real rows, so
+        # topk_indices carries exactly one row per actual token, aligned with
+        # the leading rows of `query`.  npu_sparse_flash_attention (TND) only
+        # processes the first actual_seq_lengths_query[-1] query rows, so pad
+        # the sparse indices up to the padded query length with in-bounds
+        # zeros; the extra rows are never consumed by the kernel.
         if topk_indices.shape[0] != query.shape[0]:
-            if topk_indices.shape[0] == 1:
-                topk_indices = topk_indices.expand(query.shape[0], -1, -1).contiguous()
-            else:
+            num_actual_tokens = attn_metadata.num_actual_tokens
+            if topk_indices.shape[0] != num_actual_tokens or num_actual_tokens > query.shape[0]:
                 raise RuntimeError(
-                    f"topk_indices batch dim {topk_indices.shape[0]} "
-                    f"does not match query tokens {query.shape[0]}."
+                    f"topk_indices rows {topk_indices.shape[0]} align with neither "
+                    f"query tokens {query.shape[0]} nor actual tokens {num_actual_tokens}."
                 )
+            pad_rows = query.shape[0] - num_actual_tokens
+            topk_indices = torch.cat(
+                [
+                    topk_indices,
+                    topk_indices.new_zeros((pad_rows, *topk_indices.shape[1:])),
+                ],
+                dim=0,
+            )
         result = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=query,
             key=packed_kv_cache,

@@ -141,6 +141,77 @@ def test_base_glm5_sparse_attention_delegates_to_small_op_path():
     assert query.is_contiguous()
 
 
+def test_base_glm5_sparse_attention_pads_actual_token_indices_to_query_rows():
+    """Eager MTP draft: topk_indices carry num_actual_tokens rows, aligned with
+    the leading query rows; they must be zero-padded to the padded query length."""
+    num_tokens = 76
+    num_actual_tokens = 2
+    expected = torch.randn((num_tokens, 8, 512), dtype=torch.bfloat16)
+    packed_kv_cache = torch.zeros((1, 128, 1, 512), dtype=torch.bfloat16)
+    block_table = torch.zeros((num_actual_tokens, 1), dtype=torch.int32)
+    ql_nope = torch.zeros_like(expected)
+    q_pe = torch.empty((num_tokens, 8, 0), dtype=torch.bfloat16)
+    # per-actual-token topk_indices: shape [num_actual_tokens, 1, K]
+    topk_indices = torch.arange(num_actual_tokens * 515, dtype=torch.int32).reshape(num_actual_tokens, 1, 515)
+    # cumulative query lengths: 2 requests with 1 real draft token each
+    cum_query_lens = torch.tensor([1, 2], dtype=torch.int32)
+    key_lens = torch.tensor([40, 40], dtype=torch.int32)
+
+    with mock.patch.object(
+        torch.ops._C_ascend,
+        "npu_sparse_flash_attention",
+        return_value=expected,
+        create=True,
+    ) as sparse_op:
+        result = BaseDeviceAdaptor.execute_sparse_attention_indexer_kpool_mla(
+            SimpleNamespace(scale=0.125),
+            ql_nope,
+            q_pe,
+            packed_kv_cache,
+            topk_indices,
+            SimpleNamespace(block_table=block_table, num_actual_tokens=num_actual_tokens),
+            cum_query_lens,
+            key_lens,
+        )
+
+    assert result is expected
+    sparse_op.assert_called_once()
+    call_kwargs = sparse_op.call_args.kwargs
+    # sparse_indices must cover all padded query rows: [num_tokens, 1, 515]
+    sparse_indices = call_kwargs["sparse_indices"]
+    assert sparse_indices.shape == (num_tokens, 1, 515)
+    # the leading real rows keep their per-token indices
+    assert (sparse_indices[:num_actual_tokens] == topk_indices).all()
+    # padded rows are in-bounds zeros and are never consumed by the kernel
+    assert (sparse_indices[num_actual_tokens:] == 0).all()
+
+
+def test_base_glm5_sparse_attention_rejects_unaligned_indices():
+    """topk_indices that match neither query rows nor actual tokens must raise."""
+    num_tokens = 76
+    expected = torch.randn((num_tokens, 8, 512), dtype=torch.bfloat16)
+    packed_kv_cache = torch.zeros((1, 128, 1, 512), dtype=torch.bfloat16)
+    block_table = torch.zeros((2, 1), dtype=torch.int32)
+    ql_nope = torch.zeros_like(expected)
+    q_pe = torch.empty((num_tokens, 8, 0), dtype=torch.bfloat16)
+    # 3 rows: neither the padded query length (76) nor num_actual_tokens (2)
+    topk_indices = torch.zeros((3, 1, 515), dtype=torch.int32)
+    cum_query_lens = torch.tensor([1, 2], dtype=torch.int32)
+    key_lens = torch.tensor([40, 40], dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="topk_indices rows"):
+        BaseDeviceAdaptor.execute_sparse_attention_indexer_kpool_mla(
+            SimpleNamespace(scale=0.125),
+            ql_nope,
+            q_pe,
+            packed_kv_cache,
+            topk_indices,
+            SimpleNamespace(block_table=block_table, num_actual_tokens=2),
+            cum_query_lens,
+            key_lens,
+        )
+
+
 def test_a5_glm5_sparse_attention_uses_non_quantized_sharedkv():
     query = torch.zeros((1, 8, 512), dtype=torch.bfloat16)
     kv = torch.zeros((1, 128, 1, 512), dtype=torch.bfloat16)
