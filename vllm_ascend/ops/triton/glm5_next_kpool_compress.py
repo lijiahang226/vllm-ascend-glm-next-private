@@ -33,6 +33,7 @@ def _glm5_next_kpool_compress_kernel(
     compressed_stride_n: tl.constexpr,
     compressed_stride_d: tl.constexpr,
     cache_block_size: tl.constexpr,
+    cache_num_slots: tl.constexpr,
     POOL_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_P: tl.constexpr,
@@ -85,15 +86,19 @@ def _glm5_next_kpool_compress_kernel(
             should_write = tl.load(write_mask_ptr + pool_idx) != 0
 
         flat_slot = tl.load(loc_ptr + pool_idx).to(tl.int64)
-        block_id = flat_slot // cache_block_size
-        block_offset = flat_slot % cache_block_size
+        valid_slot = (flat_slot >= 0) & (flat_slot < cache_num_slots)
+        # Full ACL graphs retain padded rows whose slot mapping is -1.
+        # Keep their pointer arithmetic in bounds even though the store is masked.
+        safe_slot = tl.where(valid_slot, flat_slot, 0)
+        block_id = safe_slot // cache_block_size
+        block_offset = safe_slot % cache_block_size
         tl.store(
             kv_cache_ptr
             + block_id * cache_stride_block
             + block_offset * cache_stride_offset
             + dim_offsets * cache_stride_d,
             compressed,
-            mask=dim_mask & should_write,
+            mask=dim_mask & should_write & valid_slot,
         )
 
 
@@ -227,6 +232,7 @@ def glm5_next_kpool_compress_and_write_cache_triton(
         compressed_stride_n,
         compressed_stride_d,
         kv_cache.shape[1],
+        kv_cache.shape[0] * kv_cache.shape[1],
         pool_size,
         head_dim,
         block_p,
