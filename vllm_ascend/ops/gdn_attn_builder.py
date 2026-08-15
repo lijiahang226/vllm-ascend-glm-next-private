@@ -441,6 +441,12 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 0,
                 out=spec_sequence_masks_cpu,
             )
+            # NOTE: spec-sized (num_spec + 1) prefill tail chunks are not
+            # folded into the spec metadata. The model runner only dispatches
+            # a decode graph once every prompt is fully computed, so such
+            # chunks always run on the live prefill path; folding them would
+            # force an all-tokens-accepted state commit that corrupts the
+            # request's conv/recurrent state under concurrent batches.
             num_spec_decodes = spec_sequence_masks_cpu.sum().item()
             if num_spec_decodes == 0:
                 spec_sequence_masks = None

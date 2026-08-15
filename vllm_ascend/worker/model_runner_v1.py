@@ -2754,7 +2754,24 @@ class NPUModelRunner(GPUModelRunner):
         num_encoder_reqs: int = 0,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
-        is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
+        # A one-token chunk can still be a prefill, notably at a PD handoff.
+        # Dispatch a decode graph only after every prompt is fully computed.
+        # With speculative decoding, requests whose prompt is only partially
+        # computed (e.g. a final prompt chunk of num_spec+1 tokens) satisfy
+        # num_computed > 0 while still prefilling. In a concurrent batch their
+        # uniform shape lets the step replay a decode graph whose padded
+        # buffers were never filled for that row, corrupting its state with
+        # another request's leftover data. Require the prompt to be fully
+        # computed before treating the batch as all-decode.
+        if self.speculative_config:
+            is_all_decode = bool(
+                np.all(
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                    >= self.input_batch.num_prompt_tokens[:num_reqs]
+                )
+            )
+        else:
+            is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
         uniform_decode = (
             (
                 (is_all_decode if self.speculative_config else True)
