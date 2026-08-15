@@ -1605,6 +1605,27 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         # original KV, so route real data through the ori_* (original) path
         # and leave cmp_* (compressed) parameters at their None defaults.
 
+        # The indexer emits top-k positions in score order, so adjacent
+        # columns can jump between far-apart KV tokens. sparse_flash_mla's
+        # A5 kernel merges each adjacent column pair into one strided DMA
+        # copy; large jumps overflow the copy stride and read the wrong
+        # cache bytes (NaN outputs in some cache layouts). Sort every row
+        # ascending (-1 padding sinks to the tail) so each adjacent column
+        # pair maps to consecutive KV tokens. The attended set is unchanged.
+        sorted_topk = torch.where(
+            topk_indices >= 0,
+            topk_indices,
+            torch.iinfo(torch.int32).max,
+        )
+        sorted_topk, _ = torch.sort(sorted_topk, dim=-1)
+        sorted_topk = torch.where(
+            sorted_topk != torch.iinfo(torch.int32).max,
+            sorted_topk,
+            -1,
+        )
+        topk_indices = sorted_topk
+        ori_topk_length = (topk_indices >= 0).sum(dim=-1, keepdim=True).to(torch.int32)
+
         result = torch.ops._C_ascend.npu_sparse_flash_mla(
             ql_nope,
             ori_kv=packed_kv_cache,
@@ -1620,7 +1641,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             seqused_ori_kv=actual_seq_lengths_key,
             seqused_cmp_kv=None,
             cmp_residual_kv=None,
-            ori_topk_length=None,
+            ori_topk_length=ori_topk_length,
             cmp_topk_length=None,
             sinks=attn_metadata.sas_sinks,
             metadata=attn_metadata.sas_metadata,
