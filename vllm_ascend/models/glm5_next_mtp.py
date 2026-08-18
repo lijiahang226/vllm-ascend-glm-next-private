@@ -26,6 +26,9 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from vllm_ascend.models.glm5_next import (
+    GLM5_PACKED_MODULES_MAPPING,
+    GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER,
+    MTP_ROT_WEIGHT_NAME,
     AscendGlm5NextDecoderLayer,
     AscendGlm5NextMoE,
     _pad_nope_kv_a_weight,
@@ -40,7 +43,11 @@ class AscendGlm5NextMultiTokenPredictorLayer(nn.Module):
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
         quant_config = vllm_config.quant_config
-
+        quant_description = getattr(quant_config, "quant_description", None)
+        self.is_rot_used = bool(
+            quant_description
+            and quant_description.get("is_rot_used", False)
+        )
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = nn.Linear(
@@ -48,6 +55,12 @@ class AscendGlm5NextMultiTokenPredictorLayer(nn.Module):
             config.hidden_size,
             bias=False,
         )
+        if self.is_rot_used:
+            self.rot = nn.Linear(
+                config.hidden_size,
+                config.hidden_size,
+                bias=False,
+            )
 
         topk_tokens = config.index_topk
         if topk_tokens is None:
@@ -97,6 +110,8 @@ class AscendGlm5NextMultiTokenPredictorLayer(nn.Module):
             0,
         )
         embeddings = self.enorm(inputs_embeds)
+        if self.is_rot_used:
+            previous_hidden_states = self.rot(previous_hidden_states)
         previous_hidden_states = self.hnorm(previous_hidden_states)
         hidden_states = self.eh_proj(torch.cat([embeddings, previous_hidden_states], dim=-1))
         hidden_states, _ = self.mtp_block(
@@ -169,6 +184,9 @@ class AscendGlm5NextMultiTokenPredictor(nn.Module):
 
 
 class AscendGlm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+    hf_to_vllm_mapper = GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER
+    packed_modules_mapping = GLM5_PACKED_MODULES_MAPPING
+    
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -224,6 +242,8 @@ class AscendGlm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
+        if name == MTP_ROT_WEIGHT_NAME:
+            return f"model.layers.{spec_layer}.rot.weight"
         if name.startswith("layers."):
             name = f"model.{name}"
         layer_prefix = f"model.layers.{spec_layer}."

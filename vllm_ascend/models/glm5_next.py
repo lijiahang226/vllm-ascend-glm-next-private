@@ -101,11 +101,14 @@ from vllm_ascend.transformers_utils.configs.glm5_next import Glm5NextTextConfig
 INDEXER_KPOOL_HEAD_DIM = 128
 INDEXER_KPOOL_QUERY_CHUNK_SIZE = 16
 INDEXER_KPOOL_KEY_CHUNK_SIZE = 2048
+MTP_ROT_WEIGHT_NAME = "rot.weight"
 
 GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER = WeightsMapper(
     orig_to_new_substr={
         ".self_attn.forget_gate.A_log": ".self_attn.A_log",
         ".self_attn.forget_gate.dt_bias": ".self_attn.dt_bias",
+        ".self_attn.forget_gate.f_a_proj": ".self_attn.f_a_proj",
+        ".self_attn.forget_gate.f_b_proj": ".self_attn.f_b_proj",
         ".attn_hc.fn": ".hc_attn_fn",
         ".attn_hc.base": ".hc_attn_base",
         ".attn_hc.scale": ".hc_attn_scale",
@@ -115,12 +118,24 @@ GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER = WeightsMapper(
     }
 )
 
+GLM5_PACKED_MODULES_MAPPING = {
+    "gate_up_proj": ["gate_proj", "up_proj"],
+    "experts": [
+        "experts.0.gate_proj",
+        "experts.0.up_proj",
+        "experts.0.down_proj",
+    ],
+    "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+}
+
 
 def get_spec_layer_idx_from_weight_name(config, weight_name: str) -> int | None:
     num_mtp_layers = getattr(config, "num_nextn_predict_layers", 0)
     if num_mtp_layers <= 0:
         return None
     first_mtp_layer = config.num_hidden_layers
+    if weight_name == MTP_ROT_WEIGHT_NAME:
+        return first_mtp_layer
     for layer_idx in range(first_mtp_layer, first_mtp_layer + num_mtp_layers):
         if f"layers.{layer_idx}." in weight_name:
             return layer_idx
@@ -2443,6 +2458,8 @@ class AscendGlm5NextModel(nn.Module):
 class AscendGlm5NextForCausalLM(nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid):
     has_inner_state: ClassVar[bool] = True
     is_hybrid: ClassVar[bool] = True
+    hf_to_vllm_mapper = GLM5_TRANSFORMERS_INTERNAL_WEIGHTS_MAPPER
+    packed_modules_mapping = GLM5_PACKED_MODULES_MAPPING
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -2521,8 +2538,16 @@ class AscendGlm5NextForCausalLM(nn.Module, HasInnerState, SupportsPP, MixtureOfE
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        skip_prefixes = [MTP_ROT_WEIGHT_NAME]
+        if self.config.tie_word_embeddings:
+            skip_prefixes.append("lm_head.")
+
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
+            skip_prefixes=skip_prefixes,
         )
-        return loader.load_weights(weights)
+
+        return loader.load_weights(
+            weights,
+            mapper=self.hf_to_vllm_mapper,
+        )

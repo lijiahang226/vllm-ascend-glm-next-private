@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from collections.abc import Iterable
 from typing import ClassVar, Literal
 
 import torch
@@ -158,3 +159,16 @@ class AscendGlm5NextForConditionalGeneration(
                 prefix=maybe_prefix(prefix, "language_model"),
                 architectures=["Glm5NextForCausalLM"],
             )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        skip_prefixes = ["rot.weight"]
+
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=skip_prefixes,
+        )
+
+        return loader.load_weights(
+            weights,
+            mapper=self.hf_to_vllm_mapper,
+        )
