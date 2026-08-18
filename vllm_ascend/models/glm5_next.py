@@ -83,6 +83,7 @@ from vllm.v1.attention.backends.mla.indexer import (
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolStateSpec
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.kimi_kda_state import kimi_kda_state_shape
@@ -97,6 +98,7 @@ from vllm_ascend.ops.triton.kda.kda import (
     rms_norm_gated,
 )
 from vllm_ascend.transformers_utils.configs.glm5_next import Glm5NextTextConfig
+from vllm_ascend.utils import uses_global_inputs_embeds
 
 INDEXER_KPOOL_HEAD_DIM = 128
 INDEXER_KPOOL_QUERY_CHUNK_SIZE = 16
@@ -2119,6 +2121,9 @@ class AscendGlm5NextDecoderLayer(nn.Module):
         self.is_mtp_layer = is_mtp_layer
         self.mhc = config.mhc
         self.layer_kind = "kda" if _is_kda_layer(config, layer_idx) else "mla"
+        self.is_vl_first_layer = bool(
+            uses_global_inputs_embeds(vllm_config, "vision_chunk") and self.layer_idx == 0
+        )
 
         if _is_kda_layer(config, layer_idx):
             self.self_attn = KimiGatedDeltaNetAttention(
@@ -2211,6 +2216,24 @@ class AscendGlm5NextDecoderLayer(nn.Module):
             comb.unsqueeze(0),
         ).squeeze(0)
 
+    def _make_attention_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """FlashComm1 attention layers emit the local token shard.
+
+        The first multimodal layer still receives the full embedding sequence,
+        so its attention output buffer must be sized N/tp (and the residual
+        chunked by ``maybe_chunk_residual`` before the add), matching the
+        o_proj reduce-scatter layout used by every other layer.
+        """
+        if self.is_vl_first_layer and _EXTRA_CTX.flash_comm_v1_enabled:
+            tp_size = get_tensor_model_parallel_world_size()
+            n_out = (hidden_states.shape[0] + tp_size - 1) // tp_size
+            return torch.empty(
+                (n_out, hidden_states.shape[-1]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        return torch.empty_like(hidden_states)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -2220,12 +2243,13 @@ class AscendGlm5NextDecoderLayer(nn.Module):
         if not self.mhc or self.is_mtp_layer:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-            attn_output = torch.empty_like(hidden_states)
+            attn_output = self._make_attention_output(hidden_states)
             self.self_attn(
                 hidden_states=hidden_states,
                 positions=positions,
                 output=attn_output,
             )
+            residual = torch.ops.vllm.maybe_chunk_residual(attn_output, residual)
             hidden_states = residual + attn_output
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
@@ -2240,8 +2264,11 @@ class AscendGlm5NextDecoderLayer(nn.Module):
 
         layer_input, residual_mhc, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         hidden_states = self.input_layernorm(layer_input)
-        attn_output = torch.empty_like(hidden_states)
+        attn_output = self._make_attention_output(hidden_states)
         self.self_attn(hidden_states=hidden_states, positions=positions, output=attn_output)
+        residual_mhc = torch.ops.vllm.maybe_chunk_residual(attn_output, residual_mhc)
+        post = torch.ops.vllm.maybe_chunk_residual(attn_output, post)
+        comb = torch.ops.vllm.maybe_chunk_residual(attn_output, comb)
         hidden_states = self.hc_post(attn_output, residual_mhc, post, comb)
 
         residual_mhc = hidden_states

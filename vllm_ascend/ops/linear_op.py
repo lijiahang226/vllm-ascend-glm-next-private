@@ -305,6 +305,7 @@ def _get_column_parallel_op(
         return DSV4OProjColumnParallelOp(layer)
     if "gate_up_proj" in prefix and mlp_tp_enable() and not is_moe_layer(prefix):
         return MLPColumnParallelOp(layer)
+
     return None
 
 
@@ -315,6 +316,7 @@ def _get_row_parallel_op(prefix, layer) -> MLPRowParallelOp | OProjRowParallelOp
         return MLPRowParallelOp(layer)
     if "o_proj" in prefix and oproj_tp_enable():
         return OProjRowParallelOp(layer)
+
     return None
 
 
