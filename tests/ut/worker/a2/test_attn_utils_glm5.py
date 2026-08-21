@@ -347,3 +347,29 @@ def test_reshape_kv_cache_v2_glm5_mamba():
     assert state_tensors[1].shape == (64, 4, 128, 128)
     # Both states live in the same padded page class as the main MLA.
     assert state_tensors[0].stride(0) == MAIN_PAGE_SIZE // 2
+
+
+def test_ascend_bind_kv_cache_allows_multiple_caches_per_layer_index():
+    from vllm_ascend.patch.worker.patch_v2.patch_attn_utils import (
+        _ascend_bind_kv_cache,
+    )
+
+    # GLM-5 owns four caches per layer index; upstream raises
+    # NotImplementedError for non-CUDA platforms in this case.
+    kv_caches = {
+        "model.layers.3.self_attn.attn": torch.zeros(2, 3),
+        "model.layers.3.self_attn.indexer.k_cache": torch.zeros(2, 4),
+        "model.layers.3.self_attn.indexer.compressor.state_cache": torch.zeros(2, 5),
+        "model.layers.3.mamba": torch.zeros(2, 6),
+        "model.layers.7.self_attn.attn": torch.zeros(2, 7),
+    }
+    forward_context = {name: SimpleNamespace() for name in kv_caches}
+    runner_kv_caches: list[torch.Tensor] = []
+
+    _ascend_bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
+
+    # Layer-3 caches keep their insertion order; layer 7 follows.
+    assert runner_kv_caches == [kv_caches[name] for name in kv_caches]
+    # Every layer's kv_cache attribute is bound.
+    for name, cache in kv_caches.items():
+        assert forward_context[name].kv_cache is cache
