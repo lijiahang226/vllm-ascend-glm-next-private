@@ -96,9 +96,34 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         if not layer_names or any(not name.endswith(".indexer.k_cache") for name in layer_names):
             raise ValueError(f"Invalid Indexer KPool cache layer names: {layer_names}.")
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self.logical_block_size = kv_cache_spec.block_size
-        self.storage_block_size = kv_cache_spec.storage_block_size
-        self.compress_ratio = kv_cache_spec.compress_ratio
+        # vLLM v2's init_attn_backend passes a kernel-block-size-copied spec to
+        # create_metadata_builders (copy_with_new_block_size).  The GLM-5
+        # indexer needs the original logical block size, so recover the
+        # layer's own spec from the model instead of trusting the passed-in
+        # one.  Under the v1 runner the passed-in spec is already the original,
+        # so this recovery is a no-op there.
+        from vllm.config import get_layers_from_vllm_config
+        from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+
+        attn_layers = get_layers_from_vllm_config(
+            vllm_config,
+            AttentionLayerBase,
+            layer_names,
+        )
+        layer_spec = attn_layers[layer_names[0]].get_kv_cache_spec(vllm_config)
+        if not isinstance(layer_spec, MLAAttentionSpec):
+            raise TypeError(
+                "Ascend Indexer KPool backend requires MLAAttentionSpec, "
+                f"got {type(layer_spec).__name__}."
+            )
+        if layer_spec.compress_ratio <= 1:
+            raise ValueError(
+                "Ascend Indexer KPool cache requires compress_ratio > 1, "
+                f"got {layer_spec.compress_ratio}."
+            )
+        self.logical_block_size = layer_spec.block_size
+        self.storage_block_size = layer_spec.storage_block_size
+        self.compress_ratio = layer_spec.compress_ratio
         if self.logical_block_size % GLM5_SFA_KERNEL_BLOCK_SIZE:
             raise ValueError(
                 "GLM-5 logical block size must be divisible by the SFA "

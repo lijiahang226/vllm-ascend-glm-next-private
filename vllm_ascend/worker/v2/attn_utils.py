@@ -26,6 +26,8 @@ from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vll
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -33,6 +35,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MLAAttentionSpec,
+    MambaSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -41,11 +44,30 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, AscendPrefillContextParallelMetadata
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.core.kv_cache_interface import (
+    AscendIndexerKPoolStateSpec,
+    AscendMLAAttentionSpec,
+)
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import calc_split_factor
 
 _ATTENTION_MASK_BUILDER = None
+
+
+def _is_glm5_indexer_kpool_cache_spec(spec: KVCacheSpec) -> bool:
+    """Whether a KV cache spec belongs to GLM-5's Indexer KPool MLA layout.
+
+    GLM-5 owns three independent physical caches per MLA layer: the main MLA
+    cache (``MLAAttentionSpec`` with ``model_version="glm5_next"`` and
+    ``compress_ratio == 1``), the compressed indexer K cache (same spec with
+    ``compress_ratio > 1``), and the compressor tail state cache
+    (``AscendIndexerKPoolStateSpec``).  All three are discovered through the
+    ``cache_role`` marker on the owning layer.
+    """
+    return (
+        isinstance(spec, MLAAttentionSpec)
+        and spec.model_version == "glm5_next"
+    ) or isinstance(spec, AscendIndexerKPoolStateSpec)
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
@@ -79,6 +101,27 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 dtype=dtype,
                 cache_dtype_str=cache_dtype_str,
             )
+            continue
+        if hasattr(attn_module, "cache_role"):
+            # GLM-5 Indexer KPool MLA: the main MLA cache, the compressed
+            # indexer K cache and the compressor tail state cache are
+            # independent AttentionLayerBase subclasses discovered through
+            # this marker.  Their specs are consumed verbatim by the GLM-5
+            # cache layout planner (patch_kv_cache_utils).
+            spec = attn_module.get_kv_cache_spec(vllm_config)
+            if not _is_glm5_indexer_kpool_cache_spec(spec):
+                raise TypeError(
+                    "A cache-role attention layer must return "
+                    "a GLM-5 MLAAttentionSpec or compressor-state spec."
+                )
+            kv_cache_spec[layer_name] = spec
+            continue
+        if isinstance(attn_module, MambaBase):
+            # Mamba/KDA layers (e.g. GLM-5 linear attention) own a MambaSpec
+            # that the hybrid cache planner packs into strided subgroups.
+            if spec := attn_module.get_kv_cache_spec(vllm_config):
+                kv_cache_spec[layer_name] = spec
+            continue
 
     return kv_cache_spec
 
@@ -254,11 +297,36 @@ def _align_memory(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
     return tensor[int(offset) :]
 
 
+def _allocate_int8_cache_tensor(
+    numel: int,
+    alignment: int,
+    vllm_config: VllmConfig,
+    device: torch.device,
+) -> torch.Tensor:
+    """Allocate an int8 raw cache tensor.
+
+    When KV transfer is enabled, the returned tensor's data_ptr is aligned
+    to `alignment`. This keeps the original Mooncake/ADXL alignment behavior.
+    """
+    if numel <= 0:
+        raise ValueError(f"Invalid cache tensor size: {numel}")
+
+    if vllm_config.kv_transfer_config is None:
+        return torch.zeros(numel, dtype=torch.int8, device=device)
+
+    raw_tensor = torch.zeros(
+        numel + alignment,
+        dtype=torch.int8,
+        device=device,
+    )
+    return _align_memory(raw_tensor, alignment)[:numel]
+
+
 def _allocate_kv_cache(
     kv_cache_config: KVCacheConfig,
     shared_layers: dict[str, str],
     device: torch.device,
-) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+) -> dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
     """
     Initialize the KV cache buffer with the correct size. The buffer needs to be
     reshaped to the desired shape before being used by the models.
@@ -270,16 +338,55 @@ def _allocate_kv_cache(
         kv_cache_config: The KV cache config
         device: The device
     Returns:
-        dict[str, tuple[torch.Tensor, torch.Tensor]]: A map between layer names
-            to their corresponding memory buffer for K cache and V cache
+        dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]: A map
+            between layer names to their corresponding memory buffer.  GLM-5
+            layers map to a single raw tensor; other layers map to a
+            (K cache, V cache) pair.
     """
     vllm_config = get_current_vllm_config()
 
     # init kv cache tensors
-    kv_cache_raw_tensors: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    kv_cache_raw_tensors: dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]] = {}
     # prefill disaggregation need the addr of cache tensor be aligned with 2M
     alignment = 2 * 1024 * 1024
     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
+
+    # GLM-5 Indexer KPool MLA plans one raw tensor per cache spec (main MLA,
+    # compressed indexer K, compressor state, KDA).  The planner already shares
+    # each physical tensor between the layers of one slot, so the K/V split
+    # used by other MLA models must be bypassed here.
+    is_glm5_cache_plan = any(
+        _is_glm5_indexer_kpool_cache_spec(spec)
+        for spec in layer_kv_cache_spec.values()
+    )
+    if is_glm5_cache_plan:
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            if len(kv_cache_tensor.shared_by) == 0:
+                continue
+            tensor = _allocate_int8_cache_tensor(
+                kv_cache_tensor.size,
+                alignment,
+                vllm_config,
+                device,
+            )
+            for layer_name in kv_cache_tensor.shared_by:
+                kv_cache_raw_tensors[layer_name] = tensor
+
+        expected_layers = {
+            layer_name
+            for group in kv_cache_config.kv_cache_groups
+            for layer_name in group.layer_names
+            if layer_name not in shared_layers
+        }
+        allocated_layers = set(kv_cache_raw_tensors)
+        if expected_layers != allocated_layers:
+            raise AssertionError(
+                "GLM-5 KV cache tensors are not correctly initialized: "
+                f"missing={sorted(expected_layers - allocated_layers)}, "
+                f"unexpected={sorted(allocated_layers - expected_layers)}."
+            )
+        return kv_cache_raw_tensors
+
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         if len(kv_cache_tensor.shared_by) == 0:
             continue
@@ -428,20 +535,172 @@ def _reshape_kv_cache(
     return kv_caches
 
 
+def _reshape_padded_cache_tensor(
+    raw_tensor: torch.Tensor,
+    cache_shape: tuple[int, ...],
+    dtype: torch.dtype,
+    page_size_bytes: int,
+    page_offset_bytes: int = 0,
+) -> torch.Tensor:
+    """Create a cache view whose block stride includes page padding."""
+    dtype_size = get_dtype_size(dtype)
+    if page_size_bytes % dtype_size or page_offset_bytes % dtype_size:
+        raise ValueError(
+            "Physical page stride and payload offset must be aligned to "
+            f"{dtype}: page={page_size_bytes}, offset={page_offset_bytes}."
+        )
+    page_stride = page_size_bytes // dtype_size
+    inner_numel = 1
+    for dim in cache_shape[1:]:
+        inner_numel *= dim
+    page_offset = page_offset_bytes // dtype_size
+    if page_offset + inner_numel > page_stride:
+        raise ValueError(
+            "Cache payload does not fit in its physical page: "
+            f"shape={cache_shape}, page_size_bytes={page_size_bytes}, "
+            f"page_offset_bytes={page_offset_bytes}."
+        )
+    typed_tensor = raw_tensor.view(dtype)
+    required_numel = (
+        page_offset
+        + (cache_shape[0] - 1) * page_stride
+        + inner_numel
+    )
+    if required_numel > typed_tensor.numel():
+        raise ValueError(
+            "Raw cache tensor is too small for the padded view: "
+            f"required={required_numel}, available={typed_tensor.numel()}."
+        )
+    inner_strides = torch.empty(cache_shape[1:]).stride()
+    return torch.as_strided(
+        typed_tensor,
+        size=cache_shape,
+        stride=(page_stride, *inner_strides),
+        storage_offset=typed_tensor.storage_offset() + page_offset,
+    )
+
+
+def _reshape_glm5_cache(
+    group: AttentionGroup,
+    layer_name: str,
+    kv_cache_spec: KVCacheSpec,
+    raw_tensor: torch.Tensor,
+    kernel_block_size: int,
+    cache_dtype: str,
+    num_blocks_expected: int | None,
+) -> torch.Tensor:
+    """Reshape one GLM-5 Indexer KPool cache tensor.
+
+    GLM-5 owns three independent physical caches per MLA layer:
+    1. The main MLA cache (``MLAAttentionSpec``, ``compress_ratio == 1``)
+       packs [KV, RoPE] into one page and is split into C128 SFA kernel
+       blocks for the scheduler block table.
+    2. The compressed indexer K cache (``MLAAttentionSpec``,
+       ``compress_ratio > 1``) stores one slot per ``compress_ratio`` tokens
+       and uses ``storage_block_size`` as its physical block size.
+    3. The compressor tail state cache (``AscendIndexerKPoolStateSpec``) is a
+       sliding-window page of ``[K, gate]`` vectors.
+    """
+    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+    if num_blocks_expected is not None:
+        assert num_blocks >= num_blocks_expected, (
+            f"GLM-5 cache {layer_name} has {num_blocks} blocks, expected at "
+            f"least {num_blocks_expected}."
+        )
+
+    if (
+        isinstance(kv_cache_spec, MLAAttentionSpec)
+        and kv_cache_spec.compress_ratio == 1
+    ):
+        # Main MLA: the complete large physical page must be defined before
+        # virtual block splitting (see model_runner_v1._reshape_kv_cache_tensors).
+        if kv_cache_spec.page_size_bytes != kv_cache_spec.real_page_size_bytes:
+            raise ValueError(
+                "GLM-5 main MLA must define the complete "
+                "large physical page before virtual block "
+                "splitting: real_page_size_bytes="
+                f"{kv_cache_spec.real_page_size_bytes}, "
+                "page_size_bytes="
+                f"{kv_cache_spec.page_size_bytes}."
+            )
+        blocks_per_scheduler_block = kv_cache_spec.block_size // kernel_block_size
+        cache_shape = group.backend.get_kv_cache_shape(
+            num_blocks * blocks_per_scheduler_block,
+            kernel_block_size,
+            kv_cache_spec.num_kv_heads,
+            kv_cache_spec.head_size,
+            cache_dtype,
+        )
+        return raw_tensor.view(kv_cache_spec.dtype).view(cache_shape)
+
+    # Compressed indexer K cache or compressor tail state cache.
+    cache_shape = group.backend.get_kv_cache_shape(
+        num_blocks,
+        kv_cache_spec.storage_block_size,
+        kv_cache_spec.num_kv_heads,
+        kv_cache_spec.head_size,
+        cache_dtype,
+    )
+    return _reshape_padded_cache_tensor(
+        raw_tensor,
+        cache_shape,
+        kv_cache_spec.dtype,
+        kv_cache_spec.page_size_bytes,
+        0,
+    )
+
+
+def _reshape_mamba_cache(
+    kv_cache_spec: MambaSpec,
+    raw_tensor: torch.Tensor,
+    num_blocks_expected: int | None,
+) -> list[torch.Tensor]:
+    """Reshape a Mamba/KDA state cache into per-state strided views.
+
+    Each state tensor is laid out consecutively inside a physical page whose
+    stride may include padding (GLM-5 packs MLA and KDA states into the same
+    large page class).
+    """
+    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+    if num_blocks_expected is not None:
+        assert num_blocks >= num_blocks_expected, (
+            f"Mamba cache has {num_blocks} blocks, expected at least "
+            f"{num_blocks_expected}."
+        )
+    state_tensors: list[torch.Tensor] = []
+    storage_offset_bytes = 0
+    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+        dtype_size = get_dtype_size(dtype)
+        num_element_per_page = kv_cache_spec.page_size_bytes // dtype_size
+        target_shape = (num_blocks, *shape)
+        stride = torch.empty(target_shape).stride()
+        target_stride = (num_element_per_page, *stride[1:])
+        assert storage_offset_bytes % dtype_size == 0
+        tensor = torch.as_strided(
+            raw_tensor.view(dtype),
+            size=target_shape,
+            stride=target_stride,
+            storage_offset=storage_offset_bytes // dtype_size,
+        )
+        state_tensors.append(tensor)
+        storage_offset_bytes += stride[0] * dtype_size
+    return state_tensors
+
+
 def _reshape_kv_cache_v2(
     attn_groups: Sequence[AttentionGroup],
-    kv_cache_raw_tensors: dict[str, tuple[torch.Tensor, torch.Tensor]],
+    kv_cache_raw_tensors: dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]],
     cache_dtype: str,
     kernel_block_sizes: list[int],
     shared_kv_cache_layers: dict[str, str],
     kv_cache_config: "KVCacheConfig | None" = None,
-) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+) -> dict[str, Any]:
     vllm_config = get_current_vllm_config()
     is_kv_consumer = (
         vllm_config.kv_transfer_config.is_kv_consumer if vllm_config.kv_transfer_config is not None else False
     )
 
-    kv_caches: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    kv_caches: dict[str, Any] = {}
     for group in attn_groups:
         if group.kv_cache_group_id >= len(kernel_block_sizes):
             continue
@@ -456,47 +715,74 @@ def _reshape_kv_cache_v2(
             if layer_name in shared_kv_cache_layers:
                 continue
 
-            assert isinstance(kv_cache_spec, AttentionSpec)
+            raw_tensor = kv_cache_raw_tensors[layer_name]
+            if isinstance(raw_tensor, tuple):
+                # Non-GLM-5 path: the raw tensor was split into a K/V pair.
+                raw_k_tensor, raw_v_tensor = raw_tensor
+                assert raw_k_tensor is not None
+                assert raw_v_tensor is not None
+                sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
+                assert sum_page_size_bytes % kv_cache_spec.page_size_bytes == 0
+                num_blocks = sum_page_size_bytes // kv_cache_spec.page_size_bytes
 
-            raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[layer_name]
-            assert raw_k_tensor is not None
-            assert raw_v_tensor is not None
-            sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
-            assert sum_page_size_bytes % kv_cache_spec.page_size_bytes == 0
-            num_blocks = sum_page_size_bytes // kv_cache_spec.page_size_bytes
+                num_blocks_per_kv_block = kv_cache_spec.block_size // kernel_block_size
+                kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
-            num_blocks_per_kv_block = kv_cache_spec.block_size // kernel_block_size
-            kernel_num_blocks = num_blocks * num_blocks_per_kv_block
-
-            kv_cache_shape = group.backend.get_kv_cache_shape(
-                kernel_num_blocks,
-                kernel_block_size,
-                kv_cache_spec.num_kv_heads,
-                kv_cache_spec.head_size,
-                cache_dtype,
-            )
-
-            if not isinstance(kv_cache_spec, (AscendMLAAttentionSpec, MLAAttentionSpec)):
-                k_shape = kv_cache_shape[1:]
-                if hasattr(kv_cache_spec, "head_size_v"):
-                    v_shape = (*kv_cache_shape[1:-1], kv_cache_spec.head_size_v)
-                else:
-                    v_shape = k_shape
-            else:
-                mla_num_blocks, mla_block_size, num_kv_heads, _ = kv_cache_shape
-                k_dim, v_dim = _get_attention_kv_cache_dims(layer_name, kv_cache_spec)
-                k_shape = (mla_num_blocks, mla_block_size, num_kv_heads, k_dim)
-                v_shape = (mla_num_blocks, mla_block_size, num_kv_heads, v_dim)
-
-            k_cache_dtype = v_cache_dtype = kv_cache_spec.dtype
-            if is_kv_consumer and enable_fa_quant(vllm_config):
-                k_cache_dtype, v_cache_dtype = vllm_config.quant_config.get_kv_quant_dtype(
-                    layer_name, kv_cache_spec.dtype, vllm_config.model_config
+                kv_cache_shape = group.backend.get_kv_cache_shape(
+                    kernel_num_blocks,
+                    kernel_block_size,
+                    kv_cache_spec.num_kv_heads,
+                    kv_cache_spec.head_size,
+                    cache_dtype,
                 )
 
-            k_cache = raw_k_tensor.view(k_cache_dtype).view(k_shape)
-            v_cache = raw_v_tensor.view(v_cache_dtype).view(v_shape)
-            kv_caches[layer_name] = (k_cache, v_cache)
+                if not isinstance(kv_cache_spec, (AscendMLAAttentionSpec, MLAAttentionSpec)):
+                    k_shape = kv_cache_shape[1:]
+                    if hasattr(kv_cache_spec, "head_size_v"):
+                        v_shape = (*kv_cache_shape[1:-1], kv_cache_spec.head_size_v)
+                    else:
+                        v_shape = k_shape
+                else:
+                    mla_num_blocks, mla_block_size, num_kv_heads, _ = kv_cache_shape
+                    k_dim, v_dim = _get_attention_kv_cache_dims(layer_name, kv_cache_spec)
+                    k_shape = (mla_num_blocks, mla_block_size, num_kv_heads, k_dim)
+                    v_shape = (mla_num_blocks, mla_block_size, num_kv_heads, v_dim)
+
+                k_cache_dtype = v_cache_dtype = kv_cache_spec.dtype
+                if is_kv_consumer and enable_fa_quant(vllm_config):
+                    k_cache_dtype, v_cache_dtype = vllm_config.quant_config.get_kv_quant_dtype(
+                        layer_name, kv_cache_spec.dtype, vllm_config.model_config
+                    )
+
+                k_cache = raw_k_tensor.view(k_cache_dtype).view(k_shape)
+                v_cache = raw_v_tensor.view(v_cache_dtype).view(v_shape)
+                kv_caches[layer_name] = (k_cache, v_cache)
+                continue
+
+            # GLM-5 path: one raw tensor per cache spec.
+            num_blocks_expected = (
+                kv_cache_config.num_blocks if kv_cache_config is not None else None
+            )
+            if _is_glm5_indexer_kpool_cache_spec(kv_cache_spec):
+                kv_caches[layer_name] = _reshape_glm5_cache(
+                    group,
+                    layer_name,
+                    kv_cache_spec,
+                    raw_tensor,
+                    kernel_block_size,
+                    cache_dtype,
+                    num_blocks_expected,
+                )
+            elif isinstance(kv_cache_spec, MambaSpec):
+                kv_caches[layer_name] = _reshape_mamba_cache(
+                    kv_cache_spec,
+                    raw_tensor,
+                    num_blocks_expected,
+                )
+            else:
+                raise ValueError(
+                    f"Unknown KV cache spec type: {type(kv_cache_spec)}"
+                )
 
     for layer_name, target_layer_name in shared_kv_cache_layers.items():
         kv_caches[layer_name] = kv_caches[target_layer_name]
