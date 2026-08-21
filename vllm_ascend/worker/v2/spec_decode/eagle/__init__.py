@@ -25,10 +25,15 @@ def init_speculator(
     device: torch.device,
 ):
     """Override GPU init_speculator for Ascend NPUs.
-    Use AscendEagleSpeculator when eagle is used.
+    Use AscendEagleSpeculator when eagle is used and AscendMTPSpeculator
+    when mtp is used.
     """
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
+    if speculative_config.method == "mtp":
+        from vllm_ascend.worker.v2.spec_decode.mtp.speculator import AscendMTPSpeculator
+
+        return AscendMTPSpeculator(vllm_config, device)
     if speculative_config.use_eagle():
         from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 
