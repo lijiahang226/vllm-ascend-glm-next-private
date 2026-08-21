@@ -88,16 +88,28 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             slot_mapping=None,
         ):
             forward_context = get_forward_context()
-            update_full_graph_params(
-                # FIXME(Ronald1995): support hybrid attn backend
-                self.model_runner.attn_groups[0][0].backend,
-                self.model_runner.update_stream,
-                forward_context,
-                num_tokens,
-                self.vllm_config,
-                self.model_runner.speculative_config,
-                positions.shape[0],
-            )
+            # Hybrid models (e.g. GLM-5 Indexer KPool MLA + KDA/Mamba) own one
+            # attention backend per kv cache group.  Every backend whose impl
+            # participates in graph-param updates must be refreshed; cache-only
+            # backends (no get_impl_cls) and impls without update_graph_params
+            # are skipped.
+            for attn_groups in self.model_runner.attn_groups:
+                for attn_group in attn_groups:
+                    attn_backend = attn_group.backend
+                    if not hasattr(attn_backend, "get_impl_cls"):
+                        continue
+                    impl_cls = attn_backend.get_impl_cls()
+                    if not hasattr(impl_cls, "update_graph_params"):
+                        continue
+                    update_full_graph_params(
+                        attn_backend,
+                        self.model_runner.update_stream,
+                        forward_context,
+                        num_tokens,
+                        self.vllm_config,
+                        self.model_runner.speculative_config,
+                        positions.shape[0],
+                    )
         return ret
 
     def capture(
