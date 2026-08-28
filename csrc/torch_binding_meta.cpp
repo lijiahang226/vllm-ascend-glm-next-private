@@ -1017,18 +1017,17 @@ std::tuple<at::Tensor, at::Tensor> pool_key_indexer_meta(
     const at::Tensor &query, const at::Tensor &pool_key, const at::Tensor &weights, const at::Tensor &pool_tail_k,
     const c10::optional<at::Tensor> &actual_seq_q, const c10::optional<at::Tensor> &actual_seq_k,
     const c10::optional<at::Tensor> &block_table, const c10::optional<at::Tensor> &q_descale,
-    const c10::optional<at::Tensor> &k_descale, int64_t topk, int64_t pool_size, const char *layout_q,
-    const char *layout_k, int64_t mask_mode, int64_t quant_mode, bool return_value, int64_t key_stride0)
+    const c10::optional<at::Tensor> &k_descale, int64_t topk, int64_t pool_size, std::string layout_q,
+    std::string layout_k, int64_t mask_mode, int64_t quant_mode, bool return_value, int64_t key_stride0)
 {
     constexpr int64_t DIM_0 = 0;
     constexpr int64_t DIM_1 = 1;
-    std::string layout_q_str(layout_q);
     int64_t out_last_dim = topk + pool_size - 1;
     int64_t values_last_dim = topk / pool_size;
 
     at::Tensor sparse_indices;
     at::Tensor sparse_values;
-    if (layout_q_str == "BSND") {
+    if (layout_q == "BSND") {
         sparse_indices = at::empty({query.size(DIM_0), query.size(DIM_1), out_last_dim},
                                    query.options().dtype(at::kInt));
         sparse_values = at::empty({query.size(DIM_0), query.size(DIM_1), values_last_dim},
