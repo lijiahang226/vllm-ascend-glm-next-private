@@ -20,7 +20,6 @@
 #include "register/tilingdata_base.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling/tiling_api.h"
-#include "op_host/tiling_util.h"
 
 namespace optiling {
 enum class PkiDataLayout : uint32_t {
