@@ -1227,7 +1227,7 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         )
         start_pos = positions[:num_tokens][cu_seqlens[:-1].clamp_max(num_tokens - 1)].to(torch.int32)
 
-        pooled_key = torch_npu.key_pool(
+        pooled_key = torch.ops._C_ascend.key_pool(
             hidden_states[:num_tokens],
             wk,
             gate_weight,
@@ -1235,10 +1235,16 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             state_cache,
             state_metadata.block_table,
             start_pos,
-            norm_weight=norm_weight,
-            norm_bias=norm_bias,
-            cu_seqlens=cu_seqlens,
-            cmp_ratio=index_kpool,
+            norm_weight,
+            norm_bias,
+            None,  # cos
+            None,  # sin
+            cu_seqlens,
+            None,  # seqused
+            index_kpool,  # cmp_ratio
+            1e-6,  # norm_eps
+            1,  # rotary_mode
+            0,  # state_cache_stride_dim0
         )
 
         selected = (
@@ -1286,20 +1292,24 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         else:
             indexer_cache_for_op = indexer_cache
 
-        indices, _ = torch_npu.pool_key_indexer(
+        indices, _ = torch.ops._C_ascend.pool_key_indexer(
             q_values[:num_tokens],
             indexer_cache_for_op,
             weights[:num_tokens].to(q_values.dtype),
-            (attn_metadata.seq_lens - indexer_metadata.seq_lens * index_kpool).to(torch.int32),
-            actual_seq_q=cum_query_lens,
-            actual_seq_k=indexer_metadata.seq_lens,
-            block_table=indexer_metadata.block_table,
-            layout_q="TND",
-            layout_k="PA_BBND",
-            topk=self.topk_tokens,
-            pool_size=index_kpool,
-            mask_mode=3,
-            return_value=False,
+            (attn_metadata.seq_lens - indexer_metadata.seq_lens * index_kpool).to(torch.int64),
+            cum_query_lens.to(torch.int64),
+            indexer_metadata.seq_lens.to(torch.int64),
+            indexer_metadata.block_table,
+            None,  # q_descale
+            None,  # k_descale
+            self.topk_tokens,
+            index_kpool,
+            "TND",  # layout_q
+            "PA_BBND",  # layout_k
+            3,  # mask_mode
+            -1,  # quant_mode
+            False,  # return_value
+            -1,  # key_stride0
         )
         return indices.unsqueeze(1)
 

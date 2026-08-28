@@ -1040,6 +1040,85 @@ std::tuple<at::Tensor> compressor(const at::Tensor &x, const at::Tensor &wkv, co
     return std::tuple<at::Tensor>(cmp_kv);
 }
 
+std::tuple<at::Tensor> key_pool(const at::Tensor &hidden_states, const at::Tensor &wk,
+                                 const at::Tensor &gate_weight, const at::Tensor &ape, at::Tensor &state_cache,
+                                 const at::Tensor &cache_block_table, const at::Tensor &start_pos,
+                                 const c10::optional<at::Tensor> &norm_weight,
+                                 const c10::optional<at::Tensor> &norm_bias, const c10::optional<at::Tensor> &cos,
+                                 const c10::optional<at::Tensor> &sin, const c10::optional<at::Tensor> &cu_seqlens,
+                                 const c10::optional<at::Tensor> &seqused, int64_t cmp_ratio, double norm_eps,
+                                 int64_t rotary_mode, int64_t state_cache_stride_dim0)
+{
+    // pooled_key is a fixed-capacity [B, Sr, D] tensor (see key_pool_infershape):
+    //   B  = cache_block_table rows (batch)
+    //   Sr = ceil(block_table_cols * state_cache_block_size / cmp_ratio)
+    //   D  = wk rows (head dim)
+    constexpr int64_t DIM_0 = 0;
+    constexpr int64_t DIM_1 = 1;
+    TORCH_CHECK(cmp_ratio > 0, "cmp_ratio should be greater than 0");
+    int64_t batch = cache_block_table.size(DIM_0);
+    int64_t pool_capacity =
+        (cache_block_table.size(DIM_1) * state_cache.size(DIM_1) + cmp_ratio - 1) / cmp_ratio;
+    int64_t head_dim = wk.size(DIM_0);
+    at::Tensor pooled_key =
+        at::empty({batch, pool_capacity, head_dim}, hidden_states.options().dtype(hidden_states.dtype()));
+
+    EXEC_NPU_CMD(aclnnKeyPool, hidden_states, wk, gate_weight, ape, state_cache, cache_block_table, start_pos,
+                 norm_weight, norm_bias, cos, sin, cu_seqlens, seqused, cmp_ratio, norm_eps, rotary_mode,
+                 state_cache_stride_dim0, pooled_key);
+
+    return std::tuple<at::Tensor>(pooled_key);
+}
+
+std::tuple<at::Tensor, at::Tensor> pool_key_indexer(
+    const at::Tensor &query, const at::Tensor &pool_key, const at::Tensor &weights,
+    const at::Tensor &pool_tail_k, const c10::optional<at::Tensor> &actual_seq_q,
+    const c10::optional<at::Tensor> &actual_seq_k, const c10::optional<at::Tensor> &block_table,
+    const c10::optional<at::Tensor> &q_descale, const c10::optional<at::Tensor> &k_descale, int64_t topk,
+    int64_t pool_size, const char *layout_q, const char *layout_k, int64_t mask_mode, int64_t quant_mode,
+    bool return_value, int64_t key_stride0)
+{
+    // Output shapes follow pool_key_indexer_infershape:
+    //   sparse_indices: TND [T1, topk+pool_size-1] / BSND [B, S1, topk+pool_size-1]
+    //   sparse_values:  return_value ? [T1, topk//pool_size] / [B, S1, topk//pool_size] : [0]
+    constexpr int64_t DIM_0 = 0;
+    constexpr int64_t DIM_1 = 1;
+    constexpr int64_t DIM_2 = 2;
+    TORCH_CHECK(topk > 0 && pool_size > 0 && topk % pool_size == 0, "topk must be divisible by pool_size");
+    std::string layout_q_str(layout_q);
+    std::string layout_k_str(layout_k);
+    int64_t out_last_dim = topk + pool_size - 1;
+    int64_t values_last_dim = topk / pool_size;
+
+    at::Tensor sparse_indices;
+    at::Tensor sparse_values;
+    if (layout_q_str == "BSND") {
+        TORCH_CHECK(query.dim() == 4, "layout_q=BSND requires a 4-D query");
+        sparse_indices = at::empty({query.size(DIM_0), query.size(DIM_1), out_last_dim},
+                                   query.options().dtype(at::kInt));
+        if (return_value) {
+            sparse_values = at::empty({query.size(DIM_0), query.size(DIM_1), values_last_dim},
+                                      query.options().dtype(at::kFloat));
+        } else {
+            sparse_values = at::empty({0}, query.options().dtype(at::kFloat));
+        }
+    } else {
+        TORCH_CHECK(query.dim() == 3, "layout_q=TND requires a 3-D query");
+        sparse_indices = at::empty({query.size(DIM_0), out_last_dim}, query.options().dtype(at::kInt));
+        if (return_value) {
+            sparse_values = at::empty({query.size(DIM_0), values_last_dim}, query.options().dtype(at::kFloat));
+        } else {
+            sparse_values = at::empty({0}, query.options().dtype(at::kFloat));
+        }
+    }
+
+    EXEC_NPU_CMD(aclnnPoolKeyIndexer, query, pool_key, weights, pool_tail_k, actual_seq_q, actual_seq_k, block_table,
+                 q_descale, k_descale, topk, pool_size, layout_q, layout_k, mask_mode, quant_mode, return_value,
+                 key_stride0, sparse_indices, sparse_values);
+
+    return std::tuple<at::Tensor, at::Tensor>(sparse_indices, sparse_values);
+}
+
 void check_compressor_metadata_common(
     const at::Tensor &rope_cos, const at::Tensor &rope_sin, const at::Tensor &cu_seqlens,
     const at::Tensor &start_pos, const at::Tensor &kv_block_table, int64_t kv_block_size,
@@ -3016,6 +3095,28 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         ") -> Tensor"
         );
     ops.impl("compressor", torch::kPrivateUse1, &vllm_ascend::compressor);
+
+    ops.def(
+        "key_pool("
+            "Tensor hidden_states, Tensor wk, Tensor gate_weight, "
+            "Tensor ape, Tensor(a!) state_cache, Tensor cache_block_table, "
+            "Tensor start_pos, Tensor? norm_weight, Tensor? norm_bias, "
+            "Tensor? cos, Tensor? sin, Tensor? cu_seqlens, Tensor? seqused, "
+            "int cmp_ratio, float norm_eps, int rotary_mode, int state_cache_stride_dim0"
+        ") -> Tensor"
+        );
+    ops.impl("key_pool", torch::kPrivateUse1, &vllm_ascend::key_pool);
+
+    ops.def(
+        "pool_key_indexer("
+            "Tensor query, Tensor pool_key, Tensor weights, "
+            "Tensor pool_tail_k, Tensor? actual_seq_q, Tensor? actual_seq_k, "
+            "Tensor? block_table, Tensor? q_descale, Tensor? k_descale, "
+            "int topk, int pool_size, str layout_q, str layout_k, "
+            "int mask_mode, int quant_mode, bool return_value, int key_stride0"
+        ") -> (Tensor, Tensor)"
+        );
+    ops.impl("pool_key_indexer", torch::kPrivateUse1, &vllm_ascend::pool_key_indexer);
 
     ops.def(
         "compressor_metadata("

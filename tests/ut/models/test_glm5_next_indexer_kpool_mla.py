@@ -1358,8 +1358,8 @@ def test_glm5_indexer_paged_write_preserves_physical_page_stride():
 
 
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
-@patch("torch_npu.pool_key_indexer", create=True)
-@patch("torch_npu.key_pool", create=True)
+@patch("torch.ops._C_ascend.pool_key_indexer", create=True)
+@patch("torch.ops._C_ascend.key_pool", create=True)
 def test_glm5_indexer_eager_mtp_ignores_padded_input_rows(
     mock_key_pool,
     mock_pool_key_indexer,
@@ -1438,7 +1438,7 @@ def test_glm5_indexer_eager_mtp_ignores_padded_input_rows(
 
 
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
-@patch("torch_npu.pool_key_indexer", create=True)
+@patch("torch.ops._C_ascend.pool_key_indexer", create=True)
 @patch("torch_npu.npu_scatter_nd_update_", create=True)
 def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
     mock_scatter,
@@ -1522,15 +1522,15 @@ def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
     torch.testing.assert_close(result, expected)
     assert indexer_cache[0, 0, 0, 0] > 0
     assert mock_pool_key_indexer.call_count == 1
-    assert mock_pool_key_indexer.call_args.kwargs["topk"] == 4
-    assert mock_pool_key_indexer.call_args.kwargs["pool_size"] == 4
-    assert mock_pool_key_indexer.call_args.kwargs["mask_mode"] == 3
+    assert mock_pool_key_indexer.call_args.args[9] == 4  # topk
+    assert mock_pool_key_indexer.call_args.args[10] == 4  # pool_size
+    assert mock_pool_key_indexer.call_args.args[13] == 3  # mask_mode
     mock_scatter.assert_not_called()
 
 
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
-@patch("torch_npu.pool_key_indexer", create=True)
-@patch("torch_npu.key_pool", create=True)
+@patch("torch.ops._C_ascend.pool_key_indexer", create=True)
+@patch("torch.ops._C_ascend.key_pool", create=True)
 def test_glm5_indexer_pool_key_indexer_receives_split_cache_for_oversized_block(
     mock_key_pool,
     mock_pool_key_indexer,
@@ -1604,7 +1604,7 @@ def test_glm5_indexer_pool_key_indexer_receives_split_cache_for_oversized_block(
 
     torch.testing.assert_close(result, torch.tensor([[[0]]], dtype=torch.int32))
     assert mock_pool_key_indexer.call_args.args[1].shape == (2, 560, 1, 2)
-    assert mock_pool_key_indexer.call_args.kwargs["block_table"].tolist() == [[0, 1]]
+    assert mock_pool_key_indexer.call_args.args[6].tolist() == [[0, 1]]  # block_table
 
 
 def test_indexer_kpool_mla_indexer_small_ops_use_bfloat16_cache_contract():

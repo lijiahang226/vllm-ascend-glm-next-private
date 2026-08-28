@@ -992,6 +992,57 @@ compressor_meta(const at::Tensor &x, const at::Tensor &wkv, const at::Tensor &wg
     return output;
 }
 
+std::tuple<at::Tensor> key_pool_meta(const at::Tensor &hidden_states, const at::Tensor &wk,
+                                      const at::Tensor &gate_weight, const at::Tensor &ape, at::Tensor &state_cache,
+                                      const at::Tensor &cache_block_table, const at::Tensor &start_pos,
+                                      const c10::optional<at::Tensor> &norm_weight,
+                                      const c10::optional<at::Tensor> &norm_bias, const c10::optional<at::Tensor> &cos,
+                                      const c10::optional<at::Tensor> &sin,
+                                      const c10::optional<at::Tensor> &cu_seqlens,
+                                      const c10::optional<at::Tensor> &seqused, int64_t cmp_ratio, double norm_eps,
+                                      int64_t rotary_mode, int64_t state_cache_stride_dim0)
+{
+    constexpr int64_t DIM_0 = 0;
+    constexpr int64_t DIM_1 = 1;
+    int64_t batch = cache_block_table.size(DIM_0);
+    int64_t pool_capacity =
+        (cache_block_table.size(DIM_1) * state_cache.size(DIM_1) + cmp_ratio - 1) / cmp_ratio;
+    int64_t head_dim = wk.size(DIM_0);
+    at::Tensor pooled_key =
+        at::empty({batch, pool_capacity, head_dim}, hidden_states.options().dtype(hidden_states.dtype()));
+    return std::tuple<at::Tensor>(pooled_key);
+}
+
+std::tuple<at::Tensor, at::Tensor> pool_key_indexer_meta(
+    const at::Tensor &query, const at::Tensor &pool_key, const at::Tensor &weights, const at::Tensor &pool_tail_k,
+    const c10::optional<at::Tensor> &actual_seq_q, const c10::optional<at::Tensor> &actual_seq_k,
+    const c10::optional<at::Tensor> &block_table, const c10::optional<at::Tensor> &q_descale,
+    const c10::optional<at::Tensor> &k_descale, int64_t topk, int64_t pool_size, const char *layout_q,
+    const char *layout_k, int64_t mask_mode, int64_t quant_mode, bool return_value, int64_t key_stride0)
+{
+    constexpr int64_t DIM_0 = 0;
+    constexpr int64_t DIM_1 = 1;
+    std::string layout_q_str(layout_q);
+    int64_t out_last_dim = topk + pool_size - 1;
+    int64_t values_last_dim = topk / pool_size;
+
+    at::Tensor sparse_indices;
+    at::Tensor sparse_values;
+    if (layout_q_str == "BSND") {
+        sparse_indices = at::empty({query.size(DIM_0), query.size(DIM_1), out_last_dim},
+                                   query.options().dtype(at::kInt));
+        sparse_values = at::empty({query.size(DIM_0), query.size(DIM_1), values_last_dim},
+                                  query.options().dtype(at::kFloat));
+    } else {
+        sparse_indices = at::empty({query.size(DIM_0), out_last_dim}, query.options().dtype(at::kInt));
+        sparse_values = at::empty({query.size(DIM_0), values_last_dim}, query.options().dtype(at::kFloat));
+    }
+    if (!return_value) {
+        sparse_values = at::empty({0}, query.options().dtype(at::kFloat));
+    }
+    return std::tuple<at::Tensor, at::Tensor>(sparse_indices, sparse_values);
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> compressor_metadata_meta(
     const at::Tensor &rope_cos, const at::Tensor &rope_sin, const at::Tensor &cu_seqlens,
     const at::Tensor &start_pos, const at::Tensor &kv_block_table, int64_t kv_block_size,
@@ -2193,6 +2244,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("moe_gating_top_k_hash", &vllm_ascend::meta::moe_gating_top_k_hash_meta);
     ops.impl("compressor", &vllm_ascend::meta::compressor_meta);
     ops.impl("compressor_metadata", &vllm_ascend::meta::compressor_metadata_meta);
+    ops.impl("key_pool", &vllm_ascend::meta::key_pool_meta);
+    ops.impl("pool_key_indexer", &vllm_ascend::meta::pool_key_indexer_meta);
     ops.impl("npu_vllm_quant_lightning_indexer", &vllm_ascend::meta::npu_vllm_quant_lightning_indexer_meta);
     ops.impl("npu_vllm_quant_lightning_indexer_metadata", &vllm_ascend::meta::npu_vllm_quant_lightning_indexer_metadata_meta);
     ops.impl("npu_sparse_attn_sharedkv", &vllm_ascend::meta::npu_sparse_attn_sharedkv_meta);

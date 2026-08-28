@@ -140,6 +140,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "kda_layout_swap12"
         "store_kv_block"
         "store_kv_block_metadata"
+        "key_pool"
+        "pool_key_indexer"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -238,6 +240,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "kda_layout_swap12"
         "store_kv_block"
         "store_kv_block_metadata"
+        "key_pool"
+        "pool_key_indexer"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
