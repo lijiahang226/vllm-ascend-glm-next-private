@@ -1605,8 +1605,10 @@ def test_glm5_indexer_pool_key_indexer_receives_split_cache_for_oversized_block(
     )
 
     torch.testing.assert_close(result, torch.tensor([[[0]]], dtype=torch.int32))
-    assert mock_pool_key_indexer.call_args.args[1].shape == (2, 560, 1, 2)
-    assert mock_pool_key_indexer.call_args.kwargs["block_table"].tolist() == [[0, 1]]
+    assert mock_pool_key_indexer.call_args.args[1].shape == (1, 1, 2)
+    assert mock_pool_key_indexer.call_args.kwargs["layout_k"] == "TND"
+    assert mock_pool_key_indexer.call_args.kwargs["actual_seq_k"].tolist() == [1]
+    assert "block_table" not in mock_pool_key_indexer.call_args.kwargs
 
 
 def test_indexer_kpool_mla_indexer_small_ops_use_bfloat16_cache_contract():

@@ -407,6 +407,10 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             self.topk_tokens,
             self.state_cache.compress_ratio,
         )
+        # TND 布局下 pool_key_indexer 的 key 是连续张量。图模式形状固定，
+        # 预分配最大 pool 数（max_model_len // compress_ratio）的持久 buffer，
+        # 首次 forward 时按实际 device 惰性创建。
+        self._indexer_key_tnd_buffer: torch.Tensor | None = None
 
     @staticmethod
     def _bound_cache(layer) -> torch.Tensor | tuple[torch.Tensor, ...]:
@@ -706,7 +710,13 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             cu_seq_lens[1:],
             right=True,
         )
-        logical_indices = output_rows - cu_seq_lens[request_ids]
+        # 图模式 TND gather 使用固定最大形状的 dst_k，超出有效 pool 数的行
+        # 会被 bucketize 映射到越界的 request_id；clamp 后这些行收集垃圾
+        # 数据，但不会被 actual_seq_k 引用。
+        safe_request_ids = request_ids.clamp(
+            max=block_table.shape[0] - 1,
+        )
+        logical_indices = output_rows - cu_seq_lens[safe_request_ids]
         cache_block_size = paged_k.shape[1]
         logical_pages = torch.div(
             logical_indices,
@@ -714,9 +724,13 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             rounding_mode="floor",
         )
         page_offsets = torch.remainder(logical_indices, cache_block_size)
+        safe_logical_pages = logical_pages.clamp(
+            min=0,
+            max=block_table.shape[1] - 1,
+        )
         physical_blocks = block_table[
-            request_ids,
-            logical_pages,
+            safe_request_ids,
+            safe_logical_pages,
         ].to(torch.int64)
         safe_physical_blocks = physical_blocks.clamp(
             min=0,
@@ -1274,6 +1288,12 @@ class AscendSparseAttnIndexerKpool(nn.Module):
                 indexer_cache.shape[1],
             )
 
+        # CANN pool_key_indexer 的 PA_BBND 布局要求 blockSize 16 对齐且
+        # <=1024，而 GLM-5 的 storage block（logical_block/compress_ratio）
+        # 可能超限且无法拆分（如 1120 的因子不含 64/128 的倍数）。改用 TND
+        # 布局：把分页 indexer cache 按 block_table 收集为连续 key，TND 无
+        # block 维度约束。图模式用固定形状持久 buffer（多余行不被
+        # actual_seq_k 引用），eager 按实际 pool 数分配。
         indexer_block_size, indexer_blocks_per_logical = select_indexer_block_size(
             indexer_cache.shape[1]
         )
@@ -1285,17 +1305,49 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             )
         else:
             indexer_cache_for_op = indexer_cache
+        seq_lens = indexer_metadata.seq_lens
+        if is_full_graph:
+            if self._indexer_key_tnd_buffer is None:
+                self._indexer_key_tnd_buffer = torch.empty(
+                    (
+                        self.max_model_len // self.state_cache.compress_ratio,
+                        indexer_cache.shape[-1],
+                    ),
+                    dtype=torch.bfloat16,
+                    device=indexer_cache.device,
+                )
+            indexer_key_tnd = self._indexer_key_tnd_buffer
+        else:
+            # pool_key_indexer 不支持空 key：无完整 pool 时也保留 1 行垃圾
+            # 数据，由 actual_seq_k=0 标记无有效 pool。
+            total_pools = max(int(indexer_metadata.seq_lens_cpu.sum()), 1)
+            indexer_key_tnd = torch.empty(
+                (total_pools, indexer_cache.shape[-1]),
+                dtype=torch.bfloat16,
+                device=indexer_cache.device,
+            )
+        cu_seq_lens = torch.cat(
+            [
+                torch.zeros(1, dtype=seq_lens.dtype, device=seq_lens.device),
+                seq_lens.cumsum(0),
+            ]
+        )
+        AscendSparseAttnIndexerKpool.cp_gather_indexer_k_cache(
+            indexer_cache_for_op,
+            indexer_key_tnd,
+            indexer_metadata.block_table,
+            cu_seq_lens,
+        )
 
         indices, _ = torch_npu.pool_key_indexer(
             q_values[:num_tokens],
-            indexer_cache_for_op,
+            indexer_key_tnd.unsqueeze(1),
             weights[:num_tokens].to(q_values.dtype),
-            (attn_metadata.seq_lens - indexer_metadata.seq_lens * index_kpool).to(torch.int32),
+            (attn_metadata.seq_lens - seq_lens * index_kpool).to(torch.int32),
             actual_seq_q=cum_query_lens,
-            actual_seq_k=indexer_metadata.seq_lens,
-            block_table=indexer_metadata.block_table,
+            actual_seq_k=seq_lens.cumsum(0),
             layout_q="TND",
-            layout_k="PA_BBND",
+            layout_k="TND",
             topk=self.topk_tokens,
             pool_size=index_kpool,
             mask_mode=3,
