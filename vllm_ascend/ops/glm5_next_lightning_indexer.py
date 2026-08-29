@@ -433,13 +433,23 @@ def _triton_chunked_pool_topk(
         dtype=torch.int64,
         device=query.device,
     )
+    token_ids = torch.arange(
+        query.shape[0],
+        dtype=cum_query_lens.dtype,
+        device=query.device,
+    )
+    request_ids = torch.bucketize(
+        token_ids,
+        cum_query_lens,
+        right=True,
+    ).clamp_max(indexer_seq_lens.shape[0] - 1)
     for chunk_start in range(0, max_pool_seq_len, TRITON_MAX_POOL_SEQ_LEN):
         chunk_len = min(TRITON_MAX_POOL_SEQ_LEN, max_pool_seq_len - chunk_start)
         chunk_pool_ids, chunk_scores = glm5_next_lightning_indexer_triton_chunk(
             query,
             indexer_cache,
             weights,
-            cum_query_lens,
+            request_ids,
             indexer_seq_lens,
             indexer_block_table,
             positions,

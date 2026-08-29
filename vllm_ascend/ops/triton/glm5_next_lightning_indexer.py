@@ -26,7 +26,7 @@ def _glm5_next_lightning_indexer_kernel(
     query_ptr,
     indexer_cache_ptr,
     weights_ptr,
-    cum_query_lens_ptr,
+    request_ids_ptr,
     indexer_seq_lens_ptr,
     indexer_block_table_ptr,
     positions_ptr,
@@ -43,7 +43,6 @@ def _glm5_next_lightning_indexer_kernel(
     block_table_stride_req: tl.constexpr,
     block_table_stride_page: tl.constexpr,
     pool_block_size: tl.constexpr,
-    NUM_REQS: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     INDEX_KPOOL: tl.constexpr,
@@ -58,13 +57,10 @@ def _glm5_next_lightning_indexer_kernel(
     chunk_len = chunk_len.to(tl.int32)
     num_blocks = num_blocks.to(tl.int32)
 
-    req_id = 0
-    for req in tl.range(NUM_REQS):
-        query_end = tl.load(cum_query_lens_ptr + req).to(tl.int32)
-        req_id += tl.where(token_idx >= query_end, 1, 0)
-    # ACLGraph/FULL batches pad rows beyond the last request; keep the request
-    # index in bounds so their loads stay safe and they simply see zero pools.
-    req_id = tl.minimum(req_id, NUM_REQS - 1)
+    # Precomputed with torch.bucketize on the host: identical to scanning
+    # cum_query_lens, but keeps NUM_REQS out of the constexpr specialization
+    # space so changing batch sizes never re-triggers Triton compilation.
+    req_id = tl.load(request_ids_ptr + token_idx).to(tl.int32)
 
     pos = tl.load(positions_ptr + token_idx).to(tl.int32)
     request_pool_len = tl.load(indexer_seq_lens_ptr + req_id).to(tl.int32)
@@ -124,7 +120,7 @@ def glm5_next_lightning_indexer_triton_chunk(
     query: torch.Tensor,
     indexer_cache: torch.Tensor,
     weights: torch.Tensor,
-    cum_query_lens: torch.Tensor,
+    request_ids: torch.Tensor,
     indexer_seq_lens: torch.Tensor,
     indexer_block_table: torch.Tensor,
     positions: torch.Tensor,
@@ -140,6 +136,11 @@ def glm5_next_lightning_indexer_triton_chunk(
     ``pool_ids`` contains chunk-relative pool indices with -1 for invalid
     slots and ``scores`` the matching fp32 scores (-inf for invalid slots).
     Both tensors have shape ``[T, POOL_TOPK]``.
+
+    ``request_ids`` is the precomputed per-token request index
+    (``torch.bucketize(cum_query_lens, right=True)`` with the same clamping
+    the kernel used to apply); keeping it out of the kernel removes the
+    dynamic ``NUM_REQS`` constexpr so batch-size changes never recompile.
     """
     pool_topk = index_topk // index_kpool
     pool_id_out = torch.empty(
@@ -155,14 +156,15 @@ def glm5_next_lightning_indexer_triton_chunk(
     if query.shape[0] == 0:
         return pool_id_out, score_out
 
-    block_pool = _next_power_of_2(
-        max(1, min(max_pool_seq_len, TRITON_MAX_POOL_SEQ_LEN))
-    )
+    # Fixed BLOCK_POOL: the chunk masks/valid-pool logic already bounds every
+    # access, so one specialization serves every sequence length and never
+    # recompiles as the compressed history grows.
+    block_pool = _next_power_of_2(max(1, TRITON_MAX_POOL_SEQ_LEN))
     _glm5_next_lightning_indexer_kernel[(query.shape[0],)](
         query,
         indexer_cache,
         weights,
-        cum_query_lens,
+        request_ids,
         indexer_seq_lens,
         indexer_block_table,
         positions,
@@ -179,7 +181,6 @@ def glm5_next_lightning_indexer_triton_chunk(
         indexer_block_table.stride(0),
         indexer_block_table.stride(1),
         indexer_cache.shape[1],
-        cum_query_lens.shape[0],
         query.shape[1],
         query.shape[2],
         index_kpool,
