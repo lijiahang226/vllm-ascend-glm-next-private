@@ -110,6 +110,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Max compressed pools scanned per Triton kernel launch in the GLM-5 Next
+    # lightning indexer. The CANN Triton backend can hang (compile timeout /
+    # device stall) on oversized BLOCK_POOL specializations; lower it (512/256)
+    # when the indexer hangs on NPU.
+    "VLLM_ASCEND_GLM5_NEXT_INDEXER_TRITON_CHUNK": lambda: int(
+        os.getenv("VLLM_ASCEND_GLM5_NEXT_INDEXER_TRITON_CHUNK", "1024")
+    ),
+    # "0": force the GLM-5 Next lightning indexer to the PyTorch fallback even
+    # when Triton is available (escape hatch while triaging NPU hangs).
+    "VLLM_ASCEND_ENABLE_GLM5_NEXT_TRITON_INDEXER": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_GLM5_NEXT_TRITON_INDEXER", "1"))
+    ),
 }
 
 # end-env-vars-definition

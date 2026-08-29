@@ -15,9 +15,10 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import tl, triton
 
+from vllm_ascend import envs
 from vllm_ascend.ops.triton.triton_utils import get_element
 
-TRITON_MAX_POOL_SEQ_LEN = 2048
+TRITON_MAX_POOL_SEQ_LEN = envs.VLLM_ASCEND_GLM5_NEXT_INDEXER_TRITON_CHUNK
 
 
 @triton.jit
@@ -59,6 +60,9 @@ def _glm5_next_lightning_indexer_kernel(
     for req in tl.range(NUM_REQS):
         query_end = tl.load(cum_query_lens_ptr + req).to(tl.int32)
         req_id += tl.where(token_idx >= query_end, 1, 0)
+    # ACLGraph/FULL batches pad rows beyond the last request; keep the request
+    # index in bounds so their loads stay safe and they simply see zero pools.
+    req_id = tl.minimum(req_id, NUM_REQS - 1)
 
     pos = tl.load(positions_ptr + token_idx).to(tl.int32)
     request_pool_len = tl.load(indexer_seq_lens_ptr + req_id).to(tl.int32)
@@ -83,7 +87,7 @@ def _glm5_next_lightning_indexer_kernel(
         indexer_block_table_ptr + req_id * block_table_stride_req + logical_pages * block_table_stride_page,
         mask=pool_offsets < chunk_len,
         other=0,
-    ).to(tl.int64)
+    )
     physical_blocks = tl.maximum(physical_blocks, 0)
 
     scores = tl.zeros((BLOCK_POOL,), dtype=tl.float32)

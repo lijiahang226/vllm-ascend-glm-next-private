@@ -19,13 +19,15 @@ import torch
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm_ascend import envs
+
 if HAS_TRITON:
     from vllm_ascend.ops.triton.glm5_next_lightning_indexer import (
         TRITON_MAX_POOL_SEQ_LEN,
         glm5_next_lightning_indexer_triton_chunk,
     )
 else:
-    TRITON_MAX_POOL_SEQ_LEN = 2048
+    TRITON_MAX_POOL_SEQ_LEN = 1024
     glm5_next_lightning_indexer_triton_chunk = None
 
 INDEXER_KPOOL_QUERY_CHUNK_SIZE = 16
@@ -583,6 +585,8 @@ def _can_use_triton(
     index_topk: int,
     index_kpool: int,
 ) -> bool:
+    if not envs.VLLM_ASCEND_ENABLE_GLM5_NEXT_TRITON_INDEXER:
+        return False
     if not HAS_TRITON or glm5_next_lightning_indexer_triton_chunk is None:
         return False
     if query.device.type != "npu":
