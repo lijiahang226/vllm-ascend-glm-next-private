@@ -2173,6 +2173,7 @@ def test_indexer_kpool_mla_merge_chunk_topk_keeps_global_best_across_chunks():
 def test_indexer_kpool_mla_can_use_triton_not_bounded_by_pool_seq_len(monkeypatch):
     import vllm_ascend.ops.glm5_next_lightning_indexer as indexer_module
 
+    monkeypatch.setenv("VLLM_ASCEND_ENABLE_GLM5_NEXT_TRITON_INDEXER", "1")
     monkeypatch.setattr(indexer_module, "HAS_TRITON", True)
     monkeypatch.setattr(indexer_module, "glm5_next_lightning_indexer_triton_chunk", object())
     npu_query = SimpleNamespace(
@@ -2190,3 +2191,57 @@ def test_indexer_kpool_mla_can_use_triton_not_bounded_by_pool_seq_len(monkeypatc
     )
     assert _can_use_triton(bad_dim_query, index_topk=8, index_kpool=2) is False
     assert _can_use_triton(npu_query, index_topk=512, index_kpool=2) is False
+
+
+def test_indexer_kpool_mla_triton_failure_falls_back_to_pytorch(monkeypatch):
+    import vllm_ascend.ops.glm5_next_lightning_indexer as indexer_module
+
+    monkeypatch.setattr(indexer_module, "_triton_compile_failed", False)
+    monkeypatch.setattr(indexer_module, "_can_use_triton", lambda *args, **kwargs: True)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated Triton compile failure")
+
+    monkeypatch.setattr(indexer_module, "glm5_next_lightning_indexer_triton_chunk", boom)
+
+    query = torch.randn((2, 1, 4), dtype=torch.bfloat16)
+    indexer_cache = torch.randn((2, 8, 1, 4), dtype=torch.bfloat16)
+    weights = torch.randn((2, 1), dtype=torch.bfloat16)
+    cum_query_lens = torch.tensor([1, 2], dtype=torch.int32)
+    indexer_seq_lens = torch.tensor([8, 8], dtype=torch.int32)
+    indexer_block_table = torch.zeros((2, 1), dtype=torch.int32)
+    positions = torch.tensor([7, 7], dtype=torch.int64)
+
+    kwargs = {
+        "index_topk": 4,
+        "index_kpool": 2,
+        "max_pool_seq_len": 8,
+    }
+    result = indexer_module.glm5_next_lightning_indexer(
+        query,
+        indexer_cache,
+        weights,
+        cum_query_lens,
+        indexer_seq_lens,
+        indexer_block_table,
+        positions,
+        **kwargs,
+    )
+
+    assert indexer_module._triton_compile_failed is True
+    assert result.shape == (2, 1, 5)
+    assert result.dtype == torch.int32
+
+    # A second call must skip Triton entirely (it stays broken for the process).
+    result_again = indexer_module.glm5_next_lightning_indexer(
+        query,
+        indexer_cache,
+        weights,
+        cum_query_lens,
+        indexer_seq_lens,
+        indexer_block_table,
+        positions,
+        **kwargs,
+    )
+    assert indexer_module._triton_compile_failed is True
+    torch.testing.assert_close(result_again, result)

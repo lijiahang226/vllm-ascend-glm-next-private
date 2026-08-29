@@ -51,10 +51,12 @@ def _glm5_next_lightning_indexer_kernel(
     BLOCK_POOL: tl.constexpr,
     chunk_start,
     chunk_len,
+    num_blocks,
 ):
     token_idx = tl.program_id(0)
     chunk_start = chunk_start.to(tl.int32)
     chunk_len = chunk_len.to(tl.int32)
+    num_blocks = num_blocks.to(tl.int32)
 
     req_id = 0
     for req in tl.range(NUM_REQS):
@@ -89,6 +91,7 @@ def _glm5_next_lightning_indexer_kernel(
         other=0,
     )
     physical_blocks = tl.maximum(physical_blocks, 0)
+    physical_blocks = tl.minimum(physical_blocks, num_blocks - 1)
 
     scores = tl.zeros((BLOCK_POOL,), dtype=tl.float32)
     for dim_idx in tl.range(HEAD_DIM):
@@ -184,5 +187,6 @@ def glm5_next_lightning_indexer_triton_chunk(
         block_pool,
         chunk_start,
         chunk_len,
+        indexer_cache.shape[0],
     )
     return pool_id_out, score_out

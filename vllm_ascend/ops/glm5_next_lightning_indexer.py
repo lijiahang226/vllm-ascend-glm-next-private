@@ -15,11 +15,15 @@ Triton/NPU constraints are not met.
 
 from __future__ import annotations
 
+import logging
+
 import torch
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend import envs
+
+logger = logging.getLogger(__name__)
 
 if HAS_TRITON:
     from vllm_ascend.ops.triton.glm5_next_lightning_indexer import (
@@ -34,6 +38,11 @@ INDEXER_KPOOL_QUERY_CHUNK_SIZE = 16
 INDEXER_KPOOL_KEY_CHUNK_SIZE = 2048
 TRITON_MAX_POOL_TOPK = 128
 TRITON_HEAD_DIM = 128
+
+# Set once when a Triton compile/launch raises: the fast path is permanently
+# disabled for this process so subsequent calls skip straight to the PyTorch
+# fallback instead of re-raising (or re-compiling) every step.
+_triton_compile_failed = False
 
 
 def _align_key_chunk_size(cache_block_size: int) -> int:
@@ -267,7 +276,14 @@ def _pool_topk(
         dtype=cum_query_lens.dtype,
         device=query.device,
     )
-    request_ids = torch.bucketize(token_ids, cum_query_lens, right=True)
+    # ACLGraph/FULL batches pad rows beyond the last request; keep the request
+    # index in bounds so padded rows read a valid (zero-pool) request instead
+    # of indexing out of range.
+    request_ids = torch.bucketize(
+        token_ids,
+        cum_query_lens,
+        right=True,
+    ).clamp_max(indexer_seq_lens.shape[0] - 1)
     request_pool_lens = indexer_seq_lens[request_ids].to(torch.int64)
     causal_pool_lens = torch.div(
         positions.to(torch.int64) + 1,
@@ -540,19 +556,43 @@ def glm5_next_lightning_indexer(
         index_kpool,
         max_pool_seq_len,
     )
-    if _can_use_triton(query, index_topk, index_kpool):
-        pool_ids = _triton_chunked_pool_topk(
-            query,
-            indexer_cache,
-            weights,
-            cum_query_lens,
-            indexer_seq_lens,
-            indexer_block_table,
-            positions,
-            index_topk,
-            index_kpool,
-            max_pool_seq_len,
-        )
+    global _triton_compile_failed
+    if _can_use_triton(query, index_topk, index_kpool) and not _triton_compile_failed:
+        try:
+            pool_ids = _triton_chunked_pool_topk(
+                query,
+                indexer_cache,
+                weights,
+                cum_query_lens,
+                indexer_seq_lens,
+                indexer_block_table,
+                positions,
+                index_topk,
+                index_kpool,
+                max_pool_seq_len,
+            )
+        except Exception as exc:
+            # A Triton compile/launch failure must not take the model down:
+            # degrade to the PyTorch fallback for the rest of the process.
+            _triton_compile_failed = True
+            logger.warning(
+                "GLM-5 Next Triton indexer failed (%s); falling back to the "
+                "PyTorch path for the rest of this process.",
+                exc,
+            )
+            pool_topk = index_topk // index_kpool
+            pool_ids = _pool_topk(
+                query,
+                indexer_cache,
+                weights,
+                cum_query_lens,
+                indexer_seq_lens,
+                indexer_block_table,
+                positions,
+                pool_topk,
+                index_kpool,
+                max_pool_seq_len,
+            )
     else:
         pool_topk = index_topk // index_kpool
         pool_ids = _pool_topk(
