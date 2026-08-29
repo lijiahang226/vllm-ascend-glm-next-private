@@ -416,9 +416,10 @@ class AscendIndexerKPoolStateBackend(AttentionBackend):
         del cache_type
         if num_kv_heads != 1:
             raise ValueError(f"Indexer KPool state cache requires one KV head, got {num_kv_heads}.")
-        # Reserve a dummy block 0 because CANN key_pool uses 0 as the invalid
-        # sentinel; vLLM's 0-based physical blocks are shifted to 1..N.
-        return (num_blocks + 1, block_size, head_size)
+        # The dummy block 0 is reserved at the cache-allocation level (see
+        # _get_kv_cache_config_deepseek_v4 GLM5 small-slot sizing), so the
+        # reshaped view uses the full raw block count.
+        return (num_blocks, block_size, head_size)
 
 
 class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):

@@ -686,9 +686,12 @@ def _get_kv_cache_config_deepseek_v4(
                 )
             )
         for slot_idx in range(glm5_layout.small_slot_count):
+            # Reserve one extra block for the compressor state cache: CANN
+            # key_pool uses block 0 as the invalid sentinel, so the state cache
+            # needs a dummy block while vLLM block IDs remain 0-based.
             kv_cache_tensors.append(
                 KVCacheTensor(
-                    size=glm5_layout.small_page_size * num_blocks,
+                    size=glm5_layout.small_page_size * (num_blocks + 1),
                     shared_by=[
                         glm5_layout.indexer_names[slot_idx],
                         glm5_layout.state_names[slot_idx],

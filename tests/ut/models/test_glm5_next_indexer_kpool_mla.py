@@ -269,7 +269,7 @@ def test_indexer_kpool_mla_collects_metadata_by_exact_cache_layer_name():
 def test_indexer_kpool_state_uses_independent_backend_for_four_token_pages():
     assert AscendGlm5NextCompressorStateCache.get_attn_backend(None) is AscendIndexerKPoolStateBackend
     assert select_common_block_size(4, [AscendIndexerKPoolStateBackend]) == 4
-    assert AscendIndexerKPoolStateBackend.get_kv_cache_shape(8, 4, 1, 256) == (9, 4, 256)
+    assert AscendIndexerKPoolStateBackend.get_kv_cache_shape(8, 4, 1, 256) == (8, 4, 256)
 
 
 def test_indexer_kpool_state_metadata_shifts_block_table_and_slot_mapping_for_cann():
