@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Lightweight loader for the CANN key_pool / pool_key_indexer wheel wrappers.
+"""Lightweight loader for the CANN key_pool wheel wrapper.
 
 The ``cann_ops_transformer`` wheel root eagerly imports unrelated operators
-(and may JIT-build them), so the two target wrapper modules are loaded
-directly and registered on ``torch_npu``:
+(and may JIT-build them), so the target wrapper module is loaded directly and
+registered on ``torch_npu``:
 
     torch_npu.key_pool(...)
-    torch_npu.pool_key_indexer(...)
+
+``pool_key_indexer`` is kept out of the runtime path: GLM-5 indexer selection
+now uses ``glm5_next_lightning_indexer`` (Triton fast path with a PyTorch
+fallback) because the CANN op's split 560x2 ``PA_BBND`` block layout was
+suspected of causing repetition/accuracy issues.
 
 The matching hardware-specific ``.run`` package must be installed before the
-ops are actually invoked.
+op is actually invoked.
 """
 
 from __future__ import annotations
@@ -24,8 +28,8 @@ from pathlib import Path
 import torch_npu
 
 
-def load_key_pool_and_indexer_from_wheel() -> tuple[object, object]:
-    """Load both target wrappers without importing unrelated wheel modules."""
+def load_key_pool_from_wheel() -> object:
+    """Load the CANN key_pool wrapper without importing unrelated wheel modules."""
     package_spec = importlib.util.find_spec("cann_ops_transformer")
     if package_spec is None or package_spec.origin is None:
         raise ImportError("cann_ops_transformer wheel is not installed")
@@ -52,19 +56,24 @@ def load_key_pool_and_indexer_from_wheel() -> tuple[object, object]:
         package.ops = ops
 
     key_pool_module = importlib.import_module("cann_ops_transformer.ops.key_pool")
-    indexer_module = importlib.import_module(
-        "cann_ops_transformer.ops.pool_key_indexer"
-    )
 
     torch_npu.key_pool = key_pool_module.key_pool
-    torch_npu.pool_key_indexer = indexer_module.pool_key_indexer
-    return torch_npu.key_pool, torch_npu.pool_key_indexer
+    return torch_npu.key_pool
+
+
+def load_key_pool_and_indexer_from_wheel() -> tuple[object, None]:
+    """Backward-compatible wrapper: only ``key_pool`` is loaded now.
+
+    ``pool_key_indexer`` was reverted to the Triton
+    ``glm5_next_lightning_indexer`` path and is intentionally not registered.
+    """
+    return load_key_pool_from_wheel(), None
 
 
 def register_cann_kpool_ops() -> bool:
-    """Register ``torch_npu.key_pool`` / ``torch_npu.pool_key_indexer``.
+    """Register ``torch_npu.key_pool``.
 
-    Returns True when the wheel is installed and both ops were registered;
+    Returns True when the wheel is installed and the op was registered;
     returns False (no-op) when the wheel is missing so vLLM can still import.
     """
     try:
