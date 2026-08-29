@@ -345,9 +345,38 @@ def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
     assert replay_metadata.block_table.tolist() == [[3]]
 
 
-def test_indexer_kpool_metadata_splits_oversized_storage_block_for_cann():
+def test_indexer_kpool_metadata_rejects_oversized_storage_block_for_cann():
     spec = MLAAttentionSpec(
         block_size=4480,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        compress_ratio=4,
+        model_version="glm5_next",
+    )
+    # TP=1: storage block = 4480/4 = 1120 > CANN PA_BBND limit (1024).
+    # The builder must reject it with a hint to increase TP instead of
+    # splitting the block on the framework side.
+    with pytest.raises(ValueError, match="Increase tensor parallel size"):
+        AscendIndexerKPoolMetadataBuilder(
+            spec,
+            ["model.layers.0.self_attn.indexer.k_cache"],
+            SimpleNamespace(
+                scheduler_config=SimpleNamespace(
+                    max_num_batched_tokens=16,
+                    max_num_seqs=4,
+                ),
+                model_config=SimpleNamespace(max_model_len=8960),
+            ),
+            torch.device("cpu"),
+        )
+
+
+def test_indexer_kpool_metadata_builds_unsplit_block_table_within_cann_limit():
+    # TP>=2: storage block = 2304/4 = 576 <= 1024, PA_BBND works directly
+    # with the unsplit cache and the logical-width block table.
+    spec = MLAAttentionSpec(
+        block_size=2304,
         num_kv_heads=1,
         head_size=128,
         dtype=torch.bfloat16,
@@ -366,9 +395,7 @@ def test_indexer_kpool_metadata_splits_oversized_storage_block_for_cann():
         ),
         torch.device("cpu"),
     )
-    assert builder.storage_block_size == 1120
-    assert builder.indexer_block_size == 560
-    assert builder.indexer_blocks_per_logical_block == 2
+    assert builder.storage_block_size == 576
 
     common_metadata = SimpleNamespace(
         num_reqs=1,
@@ -378,13 +405,13 @@ def test_indexer_kpool_metadata_splits_oversized_storage_block_for_cann():
         seq_lens=torch.tensor([4], dtype=torch.int32),
         _seq_lens_cpu=torch.tensor([4], dtype=torch.int32),
         seq_lens_cpu=None,
-        block_table_tensor=torch.arange(35, dtype=torch.int32).reshape(1, 35),
+        block_table_tensor=torch.arange(18, dtype=torch.int32).reshape(1, 18),
     )
 
     metadata = builder.build(0, common_metadata)
 
-    assert metadata.block_size == 560
-    assert metadata.block_table.tolist() == [[0, 1]]
+    assert metadata.block_size == 576
+    assert metadata.block_table.tolist() == [[0]]
     assert metadata.slot_mapping.tolist() == [-1, -1, -1, 0]
     assert metadata.seq_lens.tolist() == [1]
 
@@ -1531,7 +1558,7 @@ def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
 @patch("torch.ops._C_ascend.pool_key_indexer", create=True)
 @patch("torch.ops._C_ascend.key_pool", create=True)
-def test_glm5_indexer_pool_key_indexer_receives_split_cache_for_oversized_block(
+def test_glm5_indexer_pool_key_indexer_receives_unsplit_cache_for_oversized_block(
     mock_key_pool,
     mock_pool_key_indexer,
     mock_get_forward_context,
@@ -1560,7 +1587,7 @@ def test_glm5_indexer_pool_key_indexer_receives_split_cache_for_oversized_block(
     )
     indexer_metadata = SimpleNamespace(
         slot_mapping=torch.tensor([0], dtype=torch.int64),
-        block_table=torch.tensor([[0, 1]], dtype=torch.int32),
+        block_table=torch.tensor([[0]], dtype=torch.int32),
         seq_lens=torch.tensor([1], dtype=torch.int32),
         seq_lens_cpu=torch.tensor([1], dtype=torch.int32),
     )
@@ -1603,8 +1630,8 @@ def test_glm5_indexer_pool_key_indexer_receives_split_cache_for_oversized_block(
     )
 
     torch.testing.assert_close(result, torch.tensor([[[0]]], dtype=torch.int32))
-    assert mock_pool_key_indexer.call_args.args[1].shape == (2, 560, 1, 2)
-    assert mock_pool_key_indexer.call_args.args[6].tolist() == [[0, 1]]  # block_table
+    assert mock_pool_key_indexer.call_args.args[1].shape == (1, 1120, 1, 2)
+    assert mock_pool_key_indexer.call_args.args[6].tolist() == [[0]]  # block_table
 
 
 def test_indexer_kpool_mla_indexer_small_ops_use_bfloat16_cache_contract():
