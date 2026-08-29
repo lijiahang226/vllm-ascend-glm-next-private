@@ -48,6 +48,11 @@ from vllm_ascend.models.glm5_next import (
     AscendGlm5NextIndexerKPoolCache,
     AscendSparseAttnIndexerKpool,
 )
+from vllm_ascend.ops.glm5_next_lightning_indexer import (
+    _can_use_triton,
+    _merge_chunk_topk,
+    glm5_next_lightning_indexer,
+)
 from vllm_ascend.ops.indexer_kpool_mla import (
     AscendIndexerKPoolMLAAttention,
     IndexerKPoolMLACacheLayer,
@@ -345,7 +350,7 @@ def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
     assert replay_metadata.block_table.tolist() == [[3]]
 
 
-def test_indexer_kpool_metadata_splits_oversized_storage_block_for_cann():
+def test_indexer_kpool_metadata_keeps_oversized_storage_block_for_triton():
     spec = MLAAttentionSpec(
         block_size=4480,
         num_kv_heads=1,
@@ -367,8 +372,6 @@ def test_indexer_kpool_metadata_splits_oversized_storage_block_for_cann():
         torch.device("cpu"),
     )
     assert builder.storage_block_size == 1120
-    assert builder.indexer_block_size == 560
-    assert builder.indexer_blocks_per_logical_block == 2
 
     common_metadata = SimpleNamespace(
         num_reqs=1,
@@ -383,8 +386,8 @@ def test_indexer_kpool_metadata_splits_oversized_storage_block_for_cann():
 
     metadata = builder.build(0, common_metadata)
 
-    assert metadata.block_size == 560
-    assert metadata.block_table.tolist() == [[0, 1]]
+    assert metadata.block_size == 1120
+    assert metadata.block_table.tolist() == [[0]]
     assert metadata.slot_mapping.tolist() == [-1, -1, -1, 0]
     assert metadata.seq_lens.tolist() == [1]
 
@@ -1358,21 +1361,18 @@ def test_glm5_indexer_paged_write_preserves_physical_page_stride():
 
 
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
-@patch("torch_npu.pool_key_indexer", create=True)
-@patch("torch_npu.key_pool", create=True)
+@patch("torch.ops.vllm.glm5_next_lightning_indexer", create=True)
+@patch("torch.ops.vllm.glm5_next_kpool_compress_and_write_cache", create=True)
 def test_glm5_indexer_eager_mtp_ignores_padded_input_rows(
-    mock_key_pool,
-    mock_pool_key_indexer,
+    mock_compress,
+    mock_lightning_indexer,
     mock_get_forward_context,
 ):
     expected = torch.tensor([[[0, 1, 2, 3]]], dtype=torch.int32)
-    mock_pool_key_indexer.return_value = (
-        torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
-        torch.empty(0),
-    )
-    mock_key_pool.return_value = torch.zeros((1, 4, 2), dtype=torch.bfloat16)
+    mock_lightning_indexer.return_value = expected
+    mock_compress.return_value = None
 
-    state_cache = torch.zeros((1, 4, 4), dtype=torch.float32)
+    state_cache = torch.zeros((1, 4, 4), dtype=torch.bfloat16)
     indexer_cache = torch.zeros((1, 32, 1, 2), dtype=torch.bfloat16)
     state_layer = SimpleNamespace(
         prefix="layer.indexer.state",
@@ -1425,24 +1425,27 @@ def test_glm5_indexer_eager_mtp_ignores_padded_input_rows(
         torch.empty((7, 1), dtype=torch.bfloat16),
         torch.zeros((7, 1, 2), dtype=torch.bfloat16),
         torch.ones((7, 1), dtype=torch.bfloat16),
-        wk=torch.ones((2, 1), dtype=torch.bfloat16),
-        gate_weight=torch.ones((2, 1), dtype=torch.bfloat16),
+        torch.ones((7, 1), dtype=torch.bfloat16),
+        gate_score=torch.ones((7, 1), dtype=torch.bfloat16),
         compress_ape=torch.zeros((4, 2), dtype=torch.float32),
         index_kpool=4,
         positions=torch.arange(7, dtype=torch.int64),
     )
 
     torch.testing.assert_close(result, expected)
-    assert mock_key_pool.call_args.args[0].shape[0] == 1
-    assert mock_pool_key_indexer.call_args.args[0].shape[0] == 1
+    assert mock_compress.call_args.args[0].shape[0] == 1
+    assert mock_compress.call_args.args[4].tolist() == [0]
+    assert mock_lightning_indexer.call_args.args[0].shape[0] == 1
 
 
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
-@patch("torch_npu.pool_key_indexer", create=True)
+@patch("torch.ops.vllm.glm5_next_lightning_indexer", create=True)
+@patch("torch.ops.vllm.glm5_next_kpool_compress_and_write_cache", create=True)
 @patch("torch_npu.npu_scatter_nd_update_", create=True)
 def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
     mock_scatter,
-    mock_pool_key_indexer,
+    mock_compress,
+    mock_lightning_indexer,
     mock_get_forward_context,
 ):
     expected = torch.tensor(
@@ -1452,9 +1455,10 @@ def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
         ],
         dtype=torch.int32,
     )
-    mock_pool_key_indexer.return_value = (expected.squeeze(1), torch.empty(0))
+    mock_lightning_indexer.return_value = expected
+    mock_compress.return_value = None
 
-    state_cache = torch.zeros((1, 4, 4), dtype=torch.float32)
+    state_cache = torch.zeros((1, 4, 4), dtype=torch.bfloat16)
     indexer_cache = torch.zeros((1, 32, 1, 2), dtype=torch.bfloat16)
     state_layer = SimpleNamespace(
         prefix="layer.indexer.state",
@@ -1512,37 +1516,34 @@ def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
             torch.ones((2, 1), dtype=torch.bfloat16),
             torch.zeros((2, 1, 2), dtype=torch.bfloat16),
             torch.ones((2, 1), dtype=torch.bfloat16),
-            wk=torch.ones((2, 1), dtype=torch.bfloat16),
-            gate_weight=torch.ones((2, 1), dtype=torch.bfloat16),
+            torch.ones((2, 1), dtype=torch.bfloat16),
+            gate_score=torch.ones((2, 1), dtype=torch.bfloat16),
             compress_ape=torch.zeros((4, 2), dtype=torch.float32),
             index_kpool=4,
             positions=torch.tensor([3, 0], dtype=torch.int64),
         )
 
     torch.testing.assert_close(result, expected)
-    assert indexer_cache[0, 0, 0, 0] > 0
-    assert mock_pool_key_indexer.call_count == 1
-    assert mock_pool_key_indexer.call_args.kwargs["topk"] == 4
-    assert mock_pool_key_indexer.call_args.kwargs["pool_size"] == 4
-    assert mock_pool_key_indexer.call_args.kwargs["mask_mode"] == 3
+    assert mock_compress.call_count == 1
+    assert mock_lightning_indexer.call_count == 1
+    assert mock_lightning_indexer.call_args.kwargs["index_topk"] == 4
+    assert mock_lightning_indexer.call_args.kwargs["index_kpool"] == 4
+    assert mock_lightning_indexer.call_args.kwargs["max_pool_seq_len"] == 32
     mock_scatter.assert_not_called()
 
 
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
-@patch("torch_npu.pool_key_indexer", create=True)
-@patch("torch_npu.key_pool", create=True)
-def test_glm5_indexer_pool_key_indexer_receives_split_cache_for_oversized_block(
-    mock_key_pool,
-    mock_pool_key_indexer,
+@patch("torch.ops.vllm.glm5_next_lightning_indexer", create=True)
+@patch("torch.ops.vllm.glm5_next_kpool_compress_and_write_cache", create=True)
+def test_glm5_indexer_lightning_indexer_receives_unsplit_cache_for_oversized_block(
+    mock_compress,
+    mock_lightning_indexer,
     mock_get_forward_context,
 ):
-    mock_pool_key_indexer.return_value = (
-        torch.tensor([[0]], dtype=torch.int32),
-        torch.empty(0),
-    )
-    mock_key_pool.return_value = torch.zeros((1, 4, 2), dtype=torch.bfloat16)
+    mock_lightning_indexer.return_value = torch.tensor([[[0]]], dtype=torch.int32)
+    mock_compress.return_value = None
 
-    state_cache = torch.zeros((1, 4, 4), dtype=torch.float32)
+    state_cache = torch.zeros((1, 4, 4), dtype=torch.bfloat16)
     indexer_cache = torch.zeros((1, 1120, 1, 2), dtype=torch.bfloat16)
     state_layer = SimpleNamespace(
         prefix="layer.indexer.state",
@@ -1560,7 +1561,7 @@ def test_glm5_indexer_pool_key_indexer_receives_split_cache_for_oversized_block(
     )
     indexer_metadata = SimpleNamespace(
         slot_mapping=torch.tensor([0], dtype=torch.int64),
-        block_table=torch.tensor([[0, 1]], dtype=torch.int32),
+        block_table=torch.tensor([[0]], dtype=torch.int32),
         seq_lens=torch.tensor([1], dtype=torch.int32),
         seq_lens_cpu=torch.tensor([1], dtype=torch.int32),
     )
@@ -1595,16 +1596,17 @@ def test_glm5_indexer_pool_key_indexer_receives_split_cache_for_oversized_block(
         torch.ones((1, 1), dtype=torch.bfloat16),
         torch.zeros((1, 1, 2), dtype=torch.bfloat16),
         torch.ones((1, 1), dtype=torch.bfloat16),
-        wk=torch.ones((2, 1), dtype=torch.bfloat16),
-        gate_weight=torch.ones((2, 1), dtype=torch.bfloat16),
+        torch.ones((1, 1), dtype=torch.bfloat16),
+        gate_score=torch.ones((1, 1), dtype=torch.bfloat16),
         compress_ape=torch.zeros((4, 2), dtype=torch.float32),
         index_kpool=4,
         positions=torch.tensor([0], dtype=torch.int64),
     )
 
     torch.testing.assert_close(result, torch.tensor([[[0]]], dtype=torch.int32))
-    assert mock_pool_key_indexer.call_args.args[1].shape == (2, 560, 1, 2)
-    assert mock_pool_key_indexer.call_args.kwargs["block_table"].tolist() == [[0, 1]]
+    assert mock_lightning_indexer.call_args.args[1].shape == (1, 1120, 1, 2)
+    assert mock_lightning_indexer.call_args.args[5].tolist() == [[0]]
+    assert mock_lightning_indexer.call_args.kwargs["max_pool_seq_len"] == 1
 
 
 def test_indexer_kpool_mla_indexer_small_ops_use_bfloat16_cache_contract():
@@ -1639,11 +1641,9 @@ def test_glm5_indexer_class_keeps_upstream_forward_contracts():
         "self",
         "hidden_states",
         "q_quant",
+        "k",
         "weights",
-        "wk",
-        "gate_weight",
-        "norm_weight",
-        "norm_bias",
+        "gate_score",
         "compress_ape",
         "index_kpool",
         "positions",
@@ -2002,3 +2002,191 @@ def test_indexer_kpool_mla_sparse_attention_pytorch_maps_each_request_block_tabl
         [1.0, 0.0],
         [3.0, 0.0],
     ]
+
+
+def _reference_indexer_output(
+    indexer_cache,
+    indexer_block_table,
+    query,
+    weights,
+    cum_query_lens,
+    indexer_seq_lens,
+    positions,
+    index_topk,
+    index_kpool,
+) -> torch.Tensor:
+    """Independent per-token golden for the lightning indexer.
+
+    Loops over rows and evaluates only the pools visible to each query, so it
+    shares no code with the op implementation (which chunk-scans and merges).
+    """
+    num_tokens, num_heads, head_dim = query.shape
+    pool_topk = index_topk // index_kpool
+    output = torch.full(
+        (num_tokens, 1, index_topk + index_kpool - 1),
+        -1,
+        dtype=torch.int32,
+    )
+    token_ids = torch.arange(num_tokens)
+    request_ids = torch.bucketize(
+        token_ids,
+        cum_query_lens,
+        right=True,
+    )
+    visible_pool_lens = torch.minimum(
+        positions // index_kpool + 1,
+        indexer_seq_lens[request_ids],
+    )
+    weighted_query = (query * weights.to(query.dtype).unsqueeze(-1)).sum(dim=1)
+    block_size = indexer_cache.shape[1]
+    for token_idx in range(num_tokens):
+        pool_len = int(visible_pool_lens[token_idx])
+        if pool_len == 0:
+            continue
+        pool_ids = torch.arange(pool_len)
+        pages = torch.div(pool_ids, block_size, rounding_mode="floor")
+        offsets = torch.remainder(pool_ids, block_size)
+        blocks = indexer_block_table[request_ids[token_idx], pages]
+        keys = indexer_cache[blocks.clamp(min=0), offsets, 0, :].float()
+        logits = (weighted_query[token_idx].float() * keys).sum(dim=1)
+        selected = torch.sort(logits, descending=True).indices[:pool_topk]
+        for rank, pool_id in enumerate(selected):
+            for offset in range(index_kpool):
+                output[
+                    token_idx,
+                    0,
+                    rank * index_kpool + offset,
+                ] = pool_id.item() * index_kpool + offset
+        tail_start = (positions[token_idx] // index_kpool + 1) * index_kpool
+        tail_count = positions[token_idx] + 1 - tail_start
+        for tail_idx in range(index_kpool - 1):
+            if tail_idx < tail_count:
+                output[token_idx, 0, index_topk + tail_idx] = tail_start + tail_idx
+    return output
+
+
+def _sorted_history_row(row: torch.Tensor, history_width: int) -> list[int]:
+    return sorted(value for value in row[:history_width].tolist() if value >= 0)
+
+
+def test_glm5_next_lightning_indexer_fallback_matches_reference_beyond_2048():
+    index_topk = 8
+    index_kpool = 2
+    max_pool_seq_len = 2050  # > TRITON_MAX_POOL_SEQ_LEN (2048)
+    head_dim = 4
+    cache_block_size = 96
+    num_pages = (max_pool_seq_len + cache_block_size - 1) // cache_block_size
+
+    rng = torch.Generator().manual_seed(42)
+    indexer_cache = torch.randn(
+        (num_pages, cache_block_size, 1, head_dim),
+        dtype=torch.bfloat16,
+        generator=rng,
+    )
+    indexer_block_table = torch.arange(num_pages, dtype=torch.int32).unsqueeze(0)
+    query = torch.randn((2, 1, head_dim), dtype=torch.bfloat16, generator=rng)
+    weights = torch.randn((2, 1), dtype=torch.bfloat16, generator=rng)
+    cum_query_lens = torch.tensor([1, 2], dtype=torch.int32)
+    indexer_seq_lens = torch.tensor([max_pool_seq_len, 64], dtype=torch.int32)
+    positions = torch.tensor([max_pool_seq_len * index_kpool - 2, 63], dtype=torch.int64)
+
+    expected = _reference_indexer_output(
+        indexer_cache,
+        indexer_block_table,
+        query,
+        weights,
+        cum_query_lens,
+        indexer_seq_lens,
+        positions,
+        index_topk,
+        index_kpool,
+    )
+
+    result = glm5_next_lightning_indexer(
+        query,
+        indexer_cache,
+        weights,
+        cum_query_lens,
+        indexer_seq_lens,
+        indexer_block_table,
+        positions,
+        index_topk=index_topk,
+        index_kpool=index_kpool,
+        max_pool_seq_len=max_pool_seq_len,
+    )
+
+    assert result.dtype == torch.int32
+    assert result.shape == (2, 1, index_topk + index_kpool - 1)
+    for row_idx in range(2):
+        # Top-k slots are order-insensitive; tails are positional.
+        assert _sorted_history_row(result[row_idx, 0], index_topk) == _sorted_history_row(
+            expected[row_idx, 0],
+            index_topk,
+        )
+        torch.testing.assert_close(
+            result[row_idx, 0, index_topk:],
+            expected[row_idx, 0, index_topk:],
+        )
+
+
+def test_indexer_kpool_mla_merge_chunk_topk_keeps_global_best_across_chunks():
+    pool_topk = 3
+    score_mask_value = torch.finfo(torch.float32).min
+    best_values = torch.full((1, pool_topk), score_mask_value, dtype=torch.float32)
+    best_indices = torch.full((1, pool_topk), -1, dtype=torch.int64)
+
+    chunk_1_values = torch.tensor([[0.5, 0.4, 0.3]], dtype=torch.float32)
+    chunk_1_indices = torch.tensor([[5, 3, 9]], dtype=torch.int64)
+    best_values, best_indices = _merge_chunk_topk(
+        best_values,
+        best_indices,
+        chunk_1_values,
+        chunk_1_indices,
+        pool_topk,
+    )
+    assert set(best_indices[0].tolist()) == {5, 3, 9}
+
+    chunk_2_values = torch.tensor([[0.9, 0.8, 0.6]], dtype=torch.float32)
+    chunk_2_indices = torch.tensor([[101, 102, 103]], dtype=torch.int64)
+    best_values, best_indices = _merge_chunk_topk(
+        best_values,
+        best_indices,
+        chunk_2_values,
+        chunk_2_indices,
+        pool_topk,
+    )
+    assert set(best_indices[0].tolist()) == {101, 102, 103}
+
+    chunk_3_values = torch.tensor([[0.85, 0.1, score_mask_value]], dtype=torch.float32)
+    chunk_3_indices = torch.tensor([[200, 201, -1]], dtype=torch.int64)
+    best_values, best_indices = _merge_chunk_topk(
+        best_values,
+        best_indices,
+        chunk_3_values,
+        chunk_3_indices,
+        pool_topk,
+    )
+    assert set(best_indices[0].tolist()) == {101, 200, 102}
+    assert torch.all(best_values[0] != score_mask_value)
+
+
+def test_indexer_kpool_mla_can_use_triton_not_bounded_by_pool_seq_len(monkeypatch):
+    import vllm_ascend.ops.glm5_next_lightning_indexer as indexer_module
+
+    monkeypatch.setattr(indexer_module, "HAS_TRITON", True)
+    monkeypatch.setattr(indexer_module, "glm5_next_lightning_indexer_triton_chunk", object())
+    npu_query = SimpleNamespace(
+        device=SimpleNamespace(type="npu"),
+        shape=(8, 1, 128),
+    )
+    # The 2048 TRITON_MAX_POOL_SEQ_LEN gate is gone: any history length that
+    # satisfies the remaining static constraints uses the Triton path.
+    assert _can_use_triton(npu_query, index_topk=8, index_kpool=2) is True
+    assert _can_use_triton(npu_query, index_topk=64, index_kpool=4) is True
+    # head-dim and pool-topk limits still gate the fast path.
+    bad_dim_query = SimpleNamespace(
+        device=SimpleNamespace(type="npu"),
+        shape=(8, 1, 64),
+    )
+    assert _can_use_triton(bad_dim_query, index_topk=8, index_kpool=2) is False
+    assert _can_use_triton(npu_query, index_topk=512, index_kpool=2) is False
