@@ -310,9 +310,9 @@ def test_indexer_kpool_state_metadata_shifts_block_table_and_slot_mapping_for_ca
 
     metadata = builder.build(0, common_metadata)
 
-    # CANN key_pool 用 0 表示无效块，vLLM 的 0-based 物理块统一 +1。
+    # CANN key_pool uses 0 as the invalid sentinel; shift vLLM block IDs by +1.
     assert metadata.block_table.tolist() == [[1], [3]]
-    # 物理块 b -> b+1 后，flat slot 整体平移一个 block_size。
+    # After block b -> b+1, flat slots are shifted by one block_size.
     assert metadata.slot_mapping.tolist() == [4, 7, -1, 2 * 4 + 1 + 4]
 
     first_block_table_ptr = metadata.block_table.data_ptr()
@@ -333,7 +333,9 @@ def test_indexer_kpool_state_metadata_shifts_block_table_and_slot_mapping_for_ca
     assert replay_metadata.slot_mapping.tolist() == [5, -1, 3 * 4 + 2 + 4, -1]
 
 
-def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
+@patch("vllm_ascend.attention.indexer_kpool_mla_v1.get_forward_context")
+def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder(mock_get_forward_context):
+    mock_get_forward_context.return_value = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.NONE)
     spec = MLAAttentionSpec(
         block_size=384,
         num_kv_heads=1,
@@ -357,9 +359,11 @@ def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
     common_metadata = SimpleNamespace(
         num_reqs=1,
         num_input_tokens=4,
+        num_actual_tokens=4,
         positions=torch.tensor([380, 381, 382, 383]),
         slot_mapping=torch.tensor([7 * 384 + offset for offset in range(380, 384)]),
         seq_lens=torch.tensor([384], dtype=torch.int32),
+        cum_query_lens=torch.tensor([4], dtype=torch.int32),
         _seq_lens_cpu=torch.tensor([384], dtype=torch.int32),
         seq_lens_cpu=None,
         block_table_tensor=torch.tensor(
@@ -384,11 +388,16 @@ def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
     assert metadata.slot_mapping.tolist() == [-1, -1, -1, 7 * 96 + 95]
     assert metadata.seq_lens.tolist() == [96]
     assert metadata.seq_lens_cpu.tolist() == [96]
+    assert metadata.num_tokens == 4
+    assert metadata.cu_seqlens.tolist() == [0, 4]
+    assert metadata.start_pos.tolist() == [380]
 
     first_slot_mapping_ptr = metadata.slot_mapping.data_ptr()
     first_seq_lens_ptr = metadata.seq_lens.data_ptr()
     first_block_table_ptr = metadata.block_table.data_ptr()
     common_metadata.positions = torch.tensor([4, 5, 6, 7])
+    common_metadata.num_actual_tokens = 4
+    common_metadata.cum_query_lens = torch.tensor([4], dtype=torch.int32)
     common_metadata.slot_mapping = torch.tensor(
         [3 * 384 + offset for offset in range(4, 8)]
     )
@@ -404,6 +413,9 @@ def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
     assert replay_metadata.slot_mapping.tolist() == [-1, -1, -1, 3 * 96 + 1]
     assert replay_metadata.seq_lens.tolist() == [2]
     assert replay_metadata.block_table.tolist() == [[3]]
+    assert replay_metadata.num_tokens == 4
+    assert replay_metadata.cu_seqlens.tolist() == [0, 4]
+    assert replay_metadata.start_pos.tolist() == [4]
 
 
 def test_indexer_kpool_metadata_rejects_oversized_storage_block_for_cann():
@@ -1481,6 +1493,9 @@ def test_glm5_indexer_eager_mtp_ignores_padded_input_rows(
         block_table=torch.tensor([[0]], dtype=torch.int32),
         seq_lens=torch.tensor([1], dtype=torch.int32),
         seq_lens_cpu=torch.tensor([1], dtype=torch.int32),
+        num_tokens=1,
+        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
+        start_pos=torch.tensor([0], dtype=torch.int32),
     )
     attn_metadata = SimpleNamespace(
         num_actual_tokens=1,
@@ -1565,6 +1580,9 @@ def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
         seq_lens_cpu=SimpleNamespace(
             max=lambda: pytest.fail("full decode must not read CPU max sequence length")
         ),
+        num_tokens=2,
+        cu_seqlens=torch.tensor([0, 1, 2], dtype=torch.int32),
+        start_pos=torch.tensor([3, 0], dtype=torch.int32),
     )
     attn_metadata = SimpleNamespace(
         cum_query_lens=torch.tensor([1, 2], dtype=torch.int32),
@@ -1651,6 +1669,9 @@ def test_glm5_indexer_pool_key_indexer_receives_unsplit_cache_for_oversized_bloc
         block_table=torch.tensor([[0]], dtype=torch.int32),
         seq_lens=torch.tensor([1], dtype=torch.int32),
         seq_lens_cpu=torch.tensor([1], dtype=torch.int32),
+        num_tokens=1,
+        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
+        start_pos=torch.tensor([0], dtype=torch.int32),
     )
     attn_metadata = SimpleNamespace(
         num_actual_tokens=1,

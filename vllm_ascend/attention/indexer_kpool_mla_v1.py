@@ -61,6 +61,9 @@ class AscendIndexerKPoolMetadata:
     positions: torch.Tensor
     block_size: int
     compress_ratio: int
+    num_tokens: int = 0
+    cu_seqlens: torch.Tensor | None = None
+    start_pos: torch.Tensor | None = None
     cache_role: str = "indexer"
 
 
@@ -149,6 +152,16 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=device,
         )
+        self._cu_seqlens_buffer = torch.empty(
+            scheduler_config.max_num_seqs + 1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._start_pos_buffer = torch.empty(
+            scheduler_config.max_num_seqs,
+            dtype=torch.int32,
+            device=device,
+        )
 
     def build(
         self,
@@ -216,6 +229,21 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             rounding_mode="floor",
             out=block_table,
         )
+        # Move the per-step attention-metadata preprocessing into the builder
+        # so the runtime forward path only consumes precomputed tensors.
+        is_full_graph = get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+        num_tokens = positions.shape[0] if is_full_graph else min(
+            common_attn_metadata.num_actual_tokens, positions.shape[0]
+        )
+        cu_seqlens = self._cu_seqlens_buffer[: num_reqs + 1]
+        cu_seqlens[0] = 0
+        cu_seqlens[1:] = common_attn_metadata.cum_query_lens[:num_reqs].to(torch.int32)
+        start_pos = self._start_pos_buffer[:num_reqs]
+        start_pos.copy_(
+            positions[:num_tokens][
+                cu_seqlens[:-1].clamp_max(num_tokens - 1)
+            ].to(torch.int32)
+        )
         return AscendIndexerKPoolMetadata(
             block_table=block_table,
             slot_mapping=slot_mapping,
@@ -224,6 +252,9 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             positions=positions,
             block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+            num_tokens=num_tokens,
+            cu_seqlens=cu_seqlens,
+            start_pos=start_pos,
         )
 
 
@@ -332,9 +363,8 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
                 f"{self._block_table_buffer.shape[1]}."
             )
         block_table = self._block_table_buffer[:num_reqs, :src_block_table.shape[1]]
-        # CANN key_pool 使用 0 作为“无效/无需更新”哨兵，且不接受 -1；
-        # vLLM 的 block table 是 0-based 且用 -1 填充。这里统一平移：
-        # 有效物理块 b -> b+1，无效槽位 -> 0，保持原有逻辑不变。
+        # CANN key_pool uses 0 as the invalid/no-update sentinel and rejects -1.
+        # Shift vLLM's 0-based block table: valid block b -> b+1, invalid -> 0.
         block_table.copy_(
             torch.where(
                 src_block_table >= 0,
@@ -386,8 +416,8 @@ class AscendIndexerKPoolStateBackend(AttentionBackend):
         del cache_type
         if num_kv_heads != 1:
             raise ValueError(f"Indexer KPool state cache requires one KV head, got {num_kv_heads}.")
-        # CANN key_pool 用 0 作为无效块哨兵，因此 state cache 需要预留一个
-        # dummy block（block 0），vLLM 的 0-based 物理块统一映射到 1..N。
+        # Reserve a dummy block 0 because CANN key_pool uses 0 as the invalid
+        # sentinel; vLLM's 0-based physical blocks are shifted to 1..N.
         return (num_blocks + 1, block_size, head_size)
 
 

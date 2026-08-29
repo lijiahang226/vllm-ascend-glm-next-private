@@ -1216,15 +1216,12 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             raise TypeError("GLM-5 indexer cache must be one bfloat16 K tensor.")
 
         is_full_graph = context.cudagraph_runtime_mode == CUDAGraphMode.FULL
-        num_tokens = positions.shape[0] if is_full_graph else min(attn_metadata.num_actual_tokens, positions.shape[0])
-        cum_query_lens = attn_metadata.cum_query_lens
-        cu_seqlens = torch.cat(
-            [
-                torch.zeros(1, dtype=cum_query_lens.dtype, device=cum_query_lens.device),
-                cum_query_lens,
-            ]
-        )
-        start_pos = positions[:num_tokens][cu_seqlens[:-1].clamp_max(num_tokens - 1)].to(torch.int32)
+        # These derived values are precomputed in AscendIndexerKPoolMetadataBuilder.build.
+        num_tokens = indexer_metadata.num_tokens
+        cu_seqlens = indexer_metadata.cu_seqlens
+        start_pos = indexer_metadata.start_pos
+        if cu_seqlens is None or start_pos is None:
+            raise RuntimeError("GLM-5 indexer metadata is missing precomputed cu_seqlens/start_pos.")
 
         pooled_key = torch_npu.key_pool(
             hidden_states[:num_tokens],
@@ -1278,7 +1275,7 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             indexer_cache,
             weights[:num_tokens].to(q_values.dtype),
             (attn_metadata.seq_lens - indexer_metadata.seq_lens * index_kpool).to(torch.int32),
-            actual_seq_q=cum_query_lens,
+            actual_seq_q=cu_seqlens[1:],
             actual_seq_k=indexer_metadata.seq_lens,
             block_table=indexer_metadata.block_table,
             layout_q="TND",
