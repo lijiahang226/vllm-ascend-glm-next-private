@@ -695,12 +695,24 @@ class AscendGlm5NextForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         skip_prefixes = ["rot.weight"]
 
+        # GLM-5 Next checkpoints nest the language model under
+        # ``model.language_model.*`` while the vLLM wrapper owns it as
+        # ``language_model.model.*`` (and the vision tower as ``visual.*``).
+        # Rewrite the prefixes before the shared sub-string mapper runs.
+        def _map_checkpoint_prefix(weight):
+            name, loaded_weight = weight[:2]
+            if name.startswith("model.language_model."):
+                name = name.replace("model.language_model.", "language_model.model.", 1)
+            elif name.startswith("model.visual."):
+                name = name.replace("model.visual.", "visual.", 1)
+            return (name, loaded_weight, *weight[2:])
+
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=skip_prefixes,
         )
 
         return loader.load_weights(
-            weights,
+            (_map_checkpoint_prefix(w) for w in weights),
             mapper=self.hf_to_vllm_mapper,
         )
