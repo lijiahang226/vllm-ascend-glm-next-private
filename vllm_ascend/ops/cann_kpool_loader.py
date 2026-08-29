@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Lightweight loader for the CANN key_pool / pool_key_indexer wheel wrappers.
+"""Lightweight loader for the CANN pool_key_indexer wheel wrapper.
 
 The ``cann_ops_transformer`` wheel root eagerly imports unrelated operators
-(and may JIT-build them), so the two target wrapper modules are loaded
-directly and registered on ``torch_npu``:
+(and may JIT-build them), so the target wrapper module is loaded directly and
+registered on ``torch_npu``:
 
-    torch_npu.key_pool(...)
     torch_npu.pool_key_indexer(...)
 
 The matching hardware-specific ``.run`` package must be installed before the
-ops are actually invoked.
+op is actually invoked.
 """
 
 from __future__ import annotations
@@ -24,8 +23,8 @@ from pathlib import Path
 import torch_npu
 
 
-def load_key_pool_and_indexer_from_wheel() -> tuple[object, object]:
-    """Load both target wrappers without importing unrelated wheel modules."""
+def load_pool_key_indexer_from_wheel() -> object:
+    """Load the pool_key_indexer wrapper without importing unrelated wheel modules."""
     package_spec = importlib.util.find_spec("cann_ops_transformer")
     if package_spec is None or package_spec.origin is None:
         raise ImportError("cann_ops_transformer wheel is not installed")
@@ -51,24 +50,22 @@ def load_key_pool_and_indexer_from_wheel() -> tuple[object, object]:
         sys.modules["cann_ops_transformer.ops"] = ops
         package.ops = ops
 
-    key_pool_module = importlib.import_module("cann_ops_transformer.ops.key_pool")
     indexer_module = importlib.import_module(
         "cann_ops_transformer.ops.pool_key_indexer"
     )
 
-    torch_npu.key_pool = key_pool_module.key_pool
     torch_npu.pool_key_indexer = indexer_module.pool_key_indexer
-    return torch_npu.key_pool, torch_npu.pool_key_indexer
+    return torch_npu.pool_key_indexer
 
 
 def register_cann_kpool_ops() -> bool:
-    """Register ``torch_npu.key_pool`` / ``torch_npu.pool_key_indexer``.
+    """Register ``torch_npu.pool_key_indexer``.
 
-    Returns True when the wheel is installed and both ops were registered;
+    Returns True when the wheel is installed and the op was registered;
     returns False (no-op) when the wheel is missing so vLLM can still import.
     """
     try:
-        load_key_pool_and_indexer_from_wheel()
+        load_pool_key_indexer_from_wheel()
     except ImportError:
         return False
     return True
