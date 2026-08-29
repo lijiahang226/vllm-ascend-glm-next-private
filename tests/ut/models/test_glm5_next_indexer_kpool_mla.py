@@ -269,7 +269,68 @@ def test_indexer_kpool_mla_collects_metadata_by_exact_cache_layer_name():
 def test_indexer_kpool_state_uses_independent_backend_for_four_token_pages():
     assert AscendGlm5NextCompressorStateCache.get_attn_backend(None) is AscendIndexerKPoolStateBackend
     assert select_common_block_size(4, [AscendIndexerKPoolStateBackend]) == 4
-    assert AscendIndexerKPoolStateBackend.get_kv_cache_shape(8, 4, 1, 256) == (8, 4, 256)
+    assert AscendIndexerKPoolStateBackend.get_kv_cache_shape(8, 4, 1, 256) == (9, 4, 256)
+
+
+def test_indexer_kpool_state_metadata_shifts_block_table_and_slot_mapping_for_cann():
+    spec = AscendIndexerKPoolStateSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float32,
+        sliding_window=4,
+        cache_dtype_str=None,
+        model_version="glm5_next",
+        cache_role="indexer_state",
+    )
+    builder = AscendIndexerKPoolStateMetadataBuilder(
+        spec,
+        ["model.layers.0.self_attn.indexer.compressor.state_cache"],
+        SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=8,
+                max_num_seqs=2,
+            ),
+            model_config=SimpleNamespace(max_model_len=16),
+        ),
+        torch.device("cpu"),
+    )
+    common_metadata = SimpleNamespace(
+        num_reqs=2,
+        num_input_tokens=4,
+        block_table_tensor=torch.tensor(
+            [[0], [2]],
+            dtype=torch.int32,
+        ),
+        slot_mapping=torch.tensor(
+            [0, 3, -1, 2 * 4 + 1],
+            dtype=torch.int64,
+        ),
+    )
+
+    metadata = builder.build(0, common_metadata)
+
+    # CANN key_pool 用 0 表示无效块，vLLM 的 0-based 物理块统一 +1。
+    assert metadata.block_table.tolist() == [[1], [3]]
+    # 物理块 b -> b+1 后，flat slot 整体平移一个 block_size。
+    assert metadata.slot_mapping.tolist() == [4, 7, -1, 2 * 4 + 1 + 4]
+
+    first_block_table_ptr = metadata.block_table.data_ptr()
+    first_slot_mapping_ptr = metadata.slot_mapping.data_ptr()
+    common_metadata.block_table_tensor = torch.tensor(
+        [[1], [0]],
+        dtype=torch.int32,
+    )
+    common_metadata.slot_mapping = torch.tensor(
+        [1, -1, 3 * 4 + 2, -1],
+        dtype=torch.int64,
+    )
+    replay_metadata = builder.build(0, common_metadata)
+
+    assert replay_metadata.block_table.data_ptr() == first_block_table_ptr
+    assert replay_metadata.slot_mapping.data_ptr() == first_slot_mapping_ptr
+    assert replay_metadata.block_table.tolist() == [[2], [1]]
+    assert replay_metadata.slot_mapping.tolist() == [5, -1, 3 * 4 + 2 + 4, -1]
 
 
 def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():

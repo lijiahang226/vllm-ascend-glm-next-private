@@ -298,6 +298,22 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.block_size = kv_cache_spec.block_size
         self.cache_role = kv_cache_spec.cache_role
+        scheduler_config = vllm_config.scheduler_config
+        self._slot_mapping_buffer = torch.empty(
+            scheduler_config.max_num_batched_tokens,
+            dtype=torch.int64,
+            device=device,
+        )
+        max_logical_blocks = cdiv(
+            kv_cache_spec.sliding_window,
+            self.block_size,
+        )
+        self._block_table_buffer = torch.empty(
+            scheduler_config.max_num_seqs,
+            max_logical_blocks,
+            dtype=torch.int32,
+            device=device,
+        )
 
     def build(
         self,
@@ -308,9 +324,36 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
         del common_prefix_len, fast_build
         num_reqs = common_attn_metadata.num_reqs
         num_input_tokens = common_attn_metadata.num_input_tokens
+        src_block_table = common_attn_metadata.block_table_tensor[:num_reqs]
+        if src_block_table.shape[1] > self._block_table_buffer.shape[1]:
+            raise ValueError(
+                "GLM-5 compressor state block table exceeds its persistent buffer: "
+                f"required={src_block_table.shape[1]}, capacity="
+                f"{self._block_table_buffer.shape[1]}."
+            )
+        block_table = self._block_table_buffer[:num_reqs, :src_block_table.shape[1]]
+        # CANN key_pool 使用 0 作为“无效/无需更新”哨兵，且不接受 -1；
+        # vLLM 的 block table 是 0-based 且用 -1 填充。这里统一平移：
+        # 有效物理块 b -> b+1，无效槽位 -> 0，保持原有逻辑不变。
+        block_table.copy_(
+            torch.where(
+                src_block_table >= 0,
+                src_block_table + 1,
+                torch.zeros_like(src_block_table),
+            )
+        )
+        src_slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
+        slot_mapping = self._slot_mapping_buffer[:num_input_tokens]
+        slot_mapping.copy_(
+            torch.where(
+                src_slot_mapping >= 0,
+                src_slot_mapping + self.block_size,
+                torch.full_like(src_slot_mapping, -1),
+            )
+        )
         return AscendIndexerKPoolStateMetadata(
-            block_table=common_attn_metadata.block_table_tensor[:num_reqs],
-            slot_mapping=common_attn_metadata.slot_mapping[:num_input_tokens],
+            block_table=block_table,
+            slot_mapping=slot_mapping,
             block_size=self.block_size,
             cache_role=self.cache_role,
         )
@@ -343,7 +386,9 @@ class AscendIndexerKPoolStateBackend(AttentionBackend):
         del cache_type
         if num_kv_heads != 1:
             raise ValueError(f"Indexer KPool state cache requires one KV head, got {num_kv_heads}.")
-        return (num_blocks, block_size, head_size)
+        # CANN key_pool 用 0 作为无效块哨兵，因此 state cache 需要预留一个
+        # dummy block（block 0），vLLM 的 0-based 物理块统一映射到 1..N。
+        return (num_blocks + 1, block_size, head_size)
 
 
 class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
