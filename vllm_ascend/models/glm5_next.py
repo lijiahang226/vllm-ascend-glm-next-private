@@ -85,7 +85,6 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.attention.indexer_kpool_mla_v1 import select_indexer_block_size
 from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolStateSpec
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.indexer_kpool_mla import (
@@ -1274,21 +1273,9 @@ class AscendSparseAttnIndexerKpool(nn.Module):
                 indexer_cache.shape[1],
             )
 
-        indexer_block_size, indexer_blocks_per_logical = select_indexer_block_size(
-            indexer_cache.shape[1]
-        )
-        if indexer_blocks_per_logical > 1:
-            indexer_cache_for_op = indexer_cache.reshape(
-                indexer_cache.shape[0] * indexer_blocks_per_logical,
-                indexer_block_size,
-                *indexer_cache.shape[2:],
-            )
-        else:
-            indexer_cache_for_op = indexer_cache
-
         indices, _ = torch_npu.pool_key_indexer(
             q_values[:num_tokens],
-            indexer_cache_for_op,
+            indexer_cache,
             weights[:num_tokens].to(q_values.dtype),
             (attn_metadata.seq_lens - indexer_metadata.seq_lens * index_kpool).to(torch.int32),
             actual_seq_q=cum_query_lens,
