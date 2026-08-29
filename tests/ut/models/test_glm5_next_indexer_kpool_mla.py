@@ -345,7 +345,7 @@ def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
     assert replay_metadata.block_table.tolist() == [[3]]
 
 
-def test_indexer_kpool_metadata_splits_oversized_storage_block_for_cann():
+def test_indexer_kpool_metadata_keeps_oversized_storage_block_for_triton():
     spec = MLAAttentionSpec(
         block_size=4480,
         num_kv_heads=1,
@@ -367,8 +367,6 @@ def test_indexer_kpool_metadata_splits_oversized_storage_block_for_cann():
         torch.device("cpu"),
     )
     assert builder.storage_block_size == 1120
-    assert builder.indexer_block_size == 560
-    assert builder.indexer_blocks_per_logical_block == 2
 
     common_metadata = SimpleNamespace(
         num_reqs=1,
@@ -383,8 +381,8 @@ def test_indexer_kpool_metadata_splits_oversized_storage_block_for_cann():
 
     metadata = builder.build(0, common_metadata)
 
-    assert metadata.block_size == 560
-    assert metadata.block_table.tolist() == [[0, 1]]
+    assert metadata.block_size == 1120
+    assert metadata.block_table.tolist() == [[0]]
     assert metadata.slot_mapping.tolist() == [-1, -1, -1, 0]
     assert metadata.seq_lens.tolist() == [1]
 
