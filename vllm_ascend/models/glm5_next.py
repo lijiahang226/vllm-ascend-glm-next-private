@@ -481,12 +481,7 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             update_zero,
             row_zero,
         )
-        indices = torch.stack([block_ids, block_offsets], dim=-1)
-        torch_npu.npu_scatter_nd_update_(
-            cache,
-            indices,
-            safe_values,
-        )
+        cache[block_ids, block_offsets] = safe_values
         cache[0, 0].copy_(expected_zero)
 
     def _gather_compressor_state(
