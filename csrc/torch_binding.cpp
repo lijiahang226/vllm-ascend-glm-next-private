@@ -1088,6 +1088,18 @@ std::tuple<at::Tensor, at::Tensor> pool_key_indexer(
     int64_t out_last_dim = topk + pool_size - 1;
     int64_t values_last_dim = topk / pool_size;
 
+    // Guard against absurd output shapes before allocating: a bad
+    // actual_seq/block_table combination can otherwise surface as a
+    // std::bad_alloc deep inside at::empty.
+    TORCH_CHECK(query.size(DIM_0) > 0 && query.size(DIM_0) < (1LL << 30),
+                "pool_key_indexer query T1 out of range: ", query.size(DIM_0));
+    TORCH_CHECK(out_last_dim > 0 && out_last_dim <= 16384,
+                "pool_key_indexer output width out of range: topk=", topk,
+                " pool_size=", pool_size, " -> ", out_last_dim);
+    TORCH_CHECK(pool_key.dim() == 4 && pool_key.size(1) > 0 && pool_key.size(1) <= 1024,
+                "pool_key_indexer PA_BBND pool_key must be 4D with blockSize in (0, 1024], got ",
+                pool_key.sizes());
+
     at::Tensor sparse_indices;
     at::Tensor sparse_values;
     if (layout_q == "BSND") {
