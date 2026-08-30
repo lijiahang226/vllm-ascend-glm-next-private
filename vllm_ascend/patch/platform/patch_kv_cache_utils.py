@@ -686,6 +686,10 @@ def _get_kv_cache_config_deepseek_v4(
                 )
             )
         for slot_idx in range(glm5_layout.small_slot_count):
+            # Triton reference semantics: the small-slot (indexer K + compressor
+            # state) cache is sized exactly like the main cache -- one physical
+            # page per scheduler block, no dummy block, vLLM block IDs used
+            # as-is.
             kv_cache_tensors.append(
                 KVCacheTensor(
                     size=glm5_layout.small_page_size * num_blocks,

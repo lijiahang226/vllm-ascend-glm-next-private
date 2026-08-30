@@ -9,8 +9,6 @@ from dataclasses import dataclass
 import torch
 import torch_npu
 from vllm.config import VllmConfig
-from vllm.config.compilation import CUDAGraphMode
-from vllm.forward_context import get_forward_context
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -61,7 +59,19 @@ class AscendIndexerKPoolMetadata:
     positions: torch.Tensor
     block_size: int
     compress_ratio: int
+    num_tokens: int = 0
+    cu_seqlens: torch.Tensor | None = None
+    start_pos: torch.Tensor | None = None
     cache_role: str = "indexer"
+    # ValueDepend host values for aclnnPoolKeyIndexer, precomputed in the
+    # builder (outside graph capture) into persistent CPU buffers so the
+    # forward path references them with no host-device sync (ACLGraph capture
+    # rejects sync). Semantics match the Triton reference: pool_tail_k =
+    # seq_len % pool_size (B), actual_seq_q = cumulative query prefix (B),
+    # actual_seq_k = seq_len // pool_size (B).
+    pool_tail_k_cpu: torch.Tensor | None = None
+    actual_seq_q_cpu: torch.Tensor | None = None
+    actual_seq_k_cpu: torch.Tensor | None = None
 
 
 class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
@@ -149,6 +159,28 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=device,
         )
+        self._cu_seqlens_buffer = torch.empty(
+            scheduler_config.max_num_seqs + 1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._start_pos_buffer = torch.empty(
+            scheduler_config.max_num_seqs,
+            dtype=torch.int32,
+            device=device,
+        )
+        # Persistent CPU buffers for the aclnnPoolKeyIndexer ValueDepend host
+        # values (pool_tail_k / actual_seq_q / actual_seq_k). Refreshed in
+        # build() -- outside graph capture -- so the forward path references
+        # them without any host-device sync, which ACLGraph capture rejects.
+        # Semantics match the Triton reference (indexer_kpool_topk_pytorch):
+        # actual_seq_q = cumulative query prefix (B entries), actual_seq_k =
+        # key pool count per batch (B), pool_tail_k = residual key tokens of
+        # the newest pool (B).
+        max_seqs = scheduler_config.max_num_seqs
+        self._pool_tail_k_cpu = torch.empty(max_seqs, dtype=torch.int64, device="cpu")
+        self._actual_seq_q_cpu = torch.empty(max_seqs, dtype=torch.int64, device="cpu")
+        self._actual_seq_k_cpu = torch.empty(max_seqs, dtype=torch.int64, device="cpu")
 
     def build(
         self,
@@ -216,6 +248,66 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             rounding_mode="floor",
             out=block_table,
         )
+        # Move the per-step attention-metadata preprocessing into the builder
+        # so the runtime forward path only consumes precomputed tensors. The
+        # builder must not depend on get_forward_context(): installed vLLM
+        # versions build metadata in _prepare_inputs, outside
+        # set_forward_context. Only the actual token rows are needed below
+        # (start_pos extraction indexes the real prefix range and clamps); the
+        # padded rows are irrelevant here, so num_tokens is always the actual
+        # token count for both eager and graph execution.
+        num_tokens = common_attn_metadata.num_actual_tokens
+        cu_seqlens = self._cu_seqlens_buffer[: num_reqs + 1]
+        cu_seqlens[0] = 0
+        # Upstream CommonAttentionMetadata renamed cum_query_lens to
+        # query_start_loc ([B+1] prefix sums, first element 0); the installed
+        # vLLM versions differ, use the new field.
+        cu_seqlens[1:] = common_attn_metadata.query_start_loc[
+            1 : num_reqs + 1
+        ].to(torch.int32)
+        start_pos = self._start_pos_buffer[:num_reqs]
+        start_pos.copy_(
+            positions[:num_tokens][
+                cu_seqlens[:-1].clamp_max(num_tokens - 1)
+            ].to(torch.int32)
+        )
+        # ValueDepend host values for aclnnPoolKeyIndexer (see __init__).
+        # Computed on CPU from the already-CPU sequence lengths / query prefix
+        # (build runs outside graph capture), refreshed in place so ACLGraph
+        # keeps referencing the same host memory on replay. NOTE: the local
+        # ``seq_lens_cpu`` above is already pool-level (divided by ratio), so
+        # re-derive the raw token-level lengths here.
+        if common_attn_metadata._seq_lens_cpu is not None:
+            raw_seq_lens_cpu = common_attn_metadata._seq_lens_cpu[:num_reqs]
+        elif common_attn_metadata.seq_lens_cpu is not None:
+            raw_seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
+        else:
+            raw_seq_lens_cpu = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
+        raw_seq_lens_cpu = raw_seq_lens_cpu.to(torch.int64)
+        pool_tail_k = self._pool_tail_k_cpu[:num_reqs]
+        pool_tail_k.copy_(
+            raw_seq_lens_cpu
+            - torch.div(raw_seq_lens_cpu, self.compress_ratio, rounding_mode="floor")
+            * self.compress_ratio
+        )
+        actual_seq_k = self._actual_seq_k_cpu[:num_reqs]
+        # CANN semantic (D:\projects\kernel\pool_key_indexer.md): actual_seq_k
+        # is the CUMULATIVE pool-level sequence length (prefix sums), NOT the
+        # per-batch pool count that the Triton reference passes to its own
+        # kernel. The Triton value (per-batch pools) maps here as
+        # cumsum(seq_len // pool_size).
+        actual_seq_k.copy_(
+            torch.cumsum(
+                torch.div(raw_seq_lens_cpu, self.compress_ratio, rounding_mode="floor"),
+                dim=0,
+            )
+        )
+        # Triton reference (indexer_kpool_topk_pytorch) passes cumulative query
+        # prefix with B entries (bucketize over the B prefix sums).
+        actual_seq_q = self._actual_seq_q_cpu[:num_reqs]
+        actual_seq_q.copy_(
+            common_attn_metadata.query_start_loc_cpu[1 : num_reqs + 1].to(torch.int64)
+        )
         return AscendIndexerKPoolMetadata(
             block_table=block_table,
             slot_mapping=slot_mapping,
@@ -224,6 +316,12 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             positions=positions,
             block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+            num_tokens=num_tokens,
+            cu_seqlens=cu_seqlens,
+            start_pos=start_pos,
+            pool_tail_k_cpu=pool_tail_k,
+            actual_seq_q_cpu=actual_seq_q,
+            actual_seq_k_cpu=actual_seq_k,
         )
 
 
@@ -308,6 +406,11 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
         del common_prefix_len, fast_build
         num_reqs = common_attn_metadata.num_reqs
         num_input_tokens = common_attn_metadata.num_input_tokens
+        # Triton reference semantics: vLLM block IDs and slot mappings are
+        # passed through as-is (no dummy block, no +1 shift, no capacity
+        # constraint -- the persistent-buffer form was the CANN-centric
+        # addressing from the dropped commits and cannot match the shared
+        # scheduler table's real width).
         return AscendIndexerKPoolStateMetadata(
             block_table=common_attn_metadata.block_table_tensor[:num_reqs],
             slot_mapping=common_attn_metadata.slot_mapping[:num_input_tokens],
@@ -343,6 +446,9 @@ class AscendIndexerKPoolStateBackend(AttentionBackend):
         del cache_type
         if num_kv_heads != 1:
             raise ValueError(f"Indexer KPool state cache requires one KV head, got {num_kv_heads}.")
+        # The dummy block 0 is reserved at the cache-allocation level (see
+        # _get_kv_cache_config_deepseek_v4 GLM5 small-slot sizing), so the
+        # reshaped view uses the full raw block count.
         return (num_blocks, block_size, head_size)
 
 
@@ -612,55 +718,31 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
         values: torch.Tensor,
         block_size: int,
     ) -> None:
-        if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL:
-            # A GLM-5 logical cache may occupy only the payload prefix of a
-            # larger physical page. Flattening such an as_strided view would
-            # either fail or discard the physical page stride, so address the
-            # page and its token offset independently.
-            values = values.reshape(values.shape[0], *cache.shape[2:])
-            valid = (slots >= 0) & (slots < cache.shape[0] * block_size)
-            safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
-            block_ids = torch.div(
-                safe_slots,
-                block_size,
-                rounding_mode="floor",
-            )
-            block_offsets = torch.remainder(safe_slots, block_size)
-            row_mask = valid.view(-1, *([1] * (values.ndim - 1)))
-            row_zero = cache[0, 0].clone()
-            safe_values = torch.where(row_mask, values, row_zero.unsqueeze(0))
-            row_zero_mask = valid & (slots == 0)
-            update_zero = torch.where(
-                row_zero_mask.view(-1, *([1] * (values.ndim - 1))),
-                values,
-                torch.zeros_like(values),
-            ).sum(dim=0)
-            expected_zero = torch.where(
-                row_zero_mask.any(),
-                update_zero,
-                row_zero,
-            )
-            cache[block_ids, block_offsets] = safe_values
-            cache[0, 0].copy_(expected_zero)
-            return
-        valid_rows = (
-            (slots >= 0) & (slots < cache.shape[0] * block_size)
-        ).nonzero().flatten()
-        if valid_rows.numel() == 0:
-            return
-        valid_slots = slots[valid_rows]
+        # Always use the fixed-shape path; it must not depend on
+        # get_forward_context() (not comparable across graph modes / installed
+        # vLLM versions) and must not use the host-syncing nonzero() variant,
+        # which is rejected inside any cudagraph / ACLGraph capture.
+        # A GLM-5 logical cache may occupy only the payload prefix of a
+        # larger physical page. Flattening such an as_strided view would
+        # either fail or discard the physical page stride, so address the
+        # page and its token offset independently.
+        values = values.reshape(values.shape[0], *cache.shape[2:])
+        valid = (slots >= 0) & (slots < cache.shape[0] * block_size)
+        safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
         block_ids = torch.div(
-            valid_slots,
+            safe_slots,
             block_size,
             rounding_mode="floor",
         )
-        block_offsets = torch.remainder(valid_slots, block_size)
-        indices = torch.stack([block_ids, block_offsets], dim=-1)
-        torch_npu.npu_scatter_nd_update_(
-            cache,
-            indices,
-            values.reshape(values.shape[0], *cache.shape[2:])[valid_rows],
-        )
+        block_offsets = torch.remainder(safe_slots, block_size)
+        row_mask = valid.view(-1, *([1] * (values.ndim - 1)))
+        # Invalid rows rewrite cache[0,0] with its own current value (a
+        # no-op), matching the Triton reference where invalid slots are
+        # simply not written. No dummy row bookkeeping: vLLM block IDs are
+        # used as-is.
+        row_zero = cache[0, 0].clone()
+        safe_values = torch.where(row_mask, values, row_zero.unsqueeze(0))
+        cache[block_ids, block_offsets] = safe_values
 
     def indexer_select_pre_process(
         self,
