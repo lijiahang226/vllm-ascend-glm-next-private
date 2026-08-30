@@ -3224,6 +3224,7 @@ class NPUModelRunner(GPUModelRunner):
                         AscendDSAMetadataBuilder,
                         AscendDSACPMetadataBuilder,
                         AscendSFADCPMetadataBuilder,
+                        GDNAttentionMetadataBuilder,
                     ))):
                 attn_metadata_i = builder.build_for_cudagraph_capture(common_attn_metadata)
             else:
