@@ -287,6 +287,87 @@ std::tuple<at::Tensor, at::Tensor> npu_lightning_indexer_meta(
     return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
 }
 
+at::Tensor npu_key_pool_meta(
+    const at::Tensor &hidden_states, const at::Tensor &wk, const at::Tensor &gate_weight,
+    const at::Tensor &ape, at::Tensor &state_cache,
+    const at::Tensor &cache_block_table, const at::Tensor &start_pos,
+    const c10::optional<at::Tensor> &norm_weight,
+    const c10::optional<at::Tensor> &norm_bias, const c10::optional<at::Tensor> &cos,
+    const c10::optional<at::Tensor> &sin, const c10::optional<at::Tensor> &cu_seqlens,
+    const c10::optional<at::Tensor> &seqused, int64_t cmp_ratio, double norm_eps,
+    int64_t rotary_mode)
+{
+    (void)norm_weight;
+    (void)norm_bias;
+    (void)cos;
+    (void)sin;
+    (void)cu_seqlens;
+    (void)seqused;
+    (void)norm_eps;
+    (void)rotary_mode;
+    TORCH_CHECK(hidden_states.defined(), "hidden_states must be defined");
+    TORCH_CHECK(wk.dim() == 2, "wk dim num[", wk.dim(), "] should be 2");
+    TORCH_CHECK(state_cache.dim() == 3, "state_cache dim num[", state_cache.dim(),
+                "] should be 3");
+    TORCH_CHECK(cache_block_table.dim() == 2, "cache_block_table dim num[",
+                cache_block_table.dim(), "] should be 2");
+    TORCH_CHECK(cmp_ratio > 0, "cmp_ratio should be greater than 0");
+    int64_t pcap = (cache_block_table.size(1) * state_cache.size(1) + cmp_ratio - 1) / cmp_ratio;
+    at::Tensor pooled_key =
+        at::empty({cache_block_table.size(0), pcap, wk.size(0)},
+                  hidden_states.options().dtype(hidden_states.dtype()));
+    return pooled_key;
+}
+
+std::tuple<at::Tensor, at::Tensor> npu_pool_key_indexer_meta(
+    const at::Tensor &query, const at::Tensor &pool_key, const at::Tensor &weights,
+    const at::Tensor &pool_tail_k, const c10::optional<at::Tensor> &actual_seq_q,
+    const c10::optional<at::Tensor> &actual_seq_k,
+    const c10::optional<at::Tensor> &block_table,
+    const c10::optional<at::Tensor> &q_descale,
+    const c10::optional<at::Tensor> &k_descale, c10::string_view layout_q,
+    c10::string_view layout_k, int64_t topk, int64_t pool_size, int64_t mask_mode,
+    int64_t quant_mode, bool return_value, int64_t key_stride0)
+{
+    (void)pool_key;
+    (void)weights;
+    (void)pool_tail_k;
+    (void)actual_seq_q;
+    (void)actual_seq_k;
+    (void)block_table;
+    (void)q_descale;
+    (void)k_descale;
+    (void)layout_k;
+    (void)mask_mode;
+    (void)quant_mode;
+    (void)key_stride0;
+    TORCH_CHECK(query.numel() > 0, "Query is empty.");
+    TORCH_CHECK(topk > 0, "topk should be greater than 0, but now is ", topk);
+    TORCH_CHECK(pool_size > 0, "pool_size should be greater than 0, but now is ", pool_size);
+    TORCH_CHECK(topk % pool_size == 0, "topk(", topk, ") should be divisible by pool_size(",
+                pool_size, ").");
+    const int64_t indices_len = topk + pool_size - 1;
+    const int64_t values_len = topk / pool_size;
+    at::SmallVector<int64_t, 8> indices_shape;
+    at::SmallVector<int64_t, 8> values_shape;
+    if (std::string(layout_q) == "BSND") {
+        indices_shape = {query.size(0), query.size(1), indices_len};
+        values_shape = {query.size(0), query.size(1), values_len};
+    } else {
+        indices_shape = {query.size(0), indices_len};
+        values_shape = {query.size(0), values_len};
+    }
+    at::Tensor sparse_indices_out =
+        at::empty(indices_shape, query.options().dtype(at::kInt));
+    at::Tensor sparse_values_out;
+    if (return_value) {
+        sparse_values_out = at::empty(values_shape, query.options().dtype(at::kFloat));
+    } else {
+        sparse_values_out = at::empty({0}, query.options().dtype(at::kFloat));
+    }
+    return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
     const at::Tensor &sparse_indices, double scale_value,
@@ -2162,6 +2243,10 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("dispatch_gmm_combine_decode", &vllm_ascend::meta::dispatch_gmm_combine_decode_meta);
     // Lightning indexer
     ops.impl("npu_lightning_indexer", &vllm_ascend::meta::npu_lightning_indexer_meta);
+    // KeyPool
+    ops.impl("npu_key_pool", &vllm_ascend::meta::npu_key_pool_meta);
+    // PoolKeyIndexer
+    ops.impl("npu_pool_key_indexer", &vllm_ascend::meta::npu_pool_key_indexer_meta);
     // Sparse flash attention
     ops.impl("npu_sparse_flash_attention", &vllm_ascend::meta::npu_sparse_flash_attention_meta);
     ops.impl("npu_kv_quant_sparse_flash_attention",
