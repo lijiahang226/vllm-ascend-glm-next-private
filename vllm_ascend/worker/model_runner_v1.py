@@ -3195,16 +3195,32 @@ class NPUModelRunner(GPUModelRunner):
             extra_attn_metadata_args = {}
             if use_spec_decode and isinstance(builder, GDNAttentionMetadataBuilder):
                 assert ubid is None, "UBatching not supported with GDN yet"
+                # During capture the dummy run has no spec decode values (-1),
+                # so the GDN build would take the non-spec branch and the
+                # captured graph would miss the spec path entirely; the real
+                # spec frame (same batch descriptor with MTP enabled) would
+                # then replay a wrong-shaped graph. Align with the DSA
+                # placeholder-kwargs paradigm: force the spec branch at capture
+                # time with a fixed placeholder value (>= 0) so the captured
+                # graph contains the spec shape.
+                num_decode_draft_tokens_np = self.num_decode_draft_tokens.np[
+                    :num_reqs_padded
+                ]
+                if for_cudagraph_capture:
+                    num_decode_draft_tokens_np = np.where(
+                        num_decode_draft_tokens_np >= 0,
+                        num_decode_draft_tokens_np,
+                        1,
+                    )
                 extra_attn_metadata_args = dict(
                     num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
                     # Take the CPU side from the dual-buffer .np view (numpy,
                     # refreshed per step on the host) instead of the .cpu
-                    # attribute: metadata is also built inside the capture run
-                    # (build_for_cudagraph_capture), where a device-to-host
-                    # sync is rejected. torch.from_numpy is a zero-copy view
-                    # with no NPU sync.
+                    # attribute: metadata is also built inside the capture run,
+                    # where a device-to-host sync is rejected. torch.from_numpy
+                    # is a zero-copy view with no NPU sync.
                     num_decode_draft_tokens_cpu=torch.from_numpy(
-                        self.num_decode_draft_tokens.np[:num_reqs_padded]
+                        num_decode_draft_tokens_np
                     ),
                 )
 
