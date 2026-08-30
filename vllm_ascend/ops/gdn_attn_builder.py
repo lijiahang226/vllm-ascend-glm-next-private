@@ -236,7 +236,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             self.decode_cudagraph_max_bs,
         )
 
-        self.spec_sequence_masks: torch.Tensor = torch.empty(
+        self.spec_sequence_masks: torch.Tensor = torch.zeros(
             (sequence_index_capacity,), dtype=torch.bool, device=device
         )
 
@@ -259,15 +259,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             device="cpu",
             pin_memory=device.type != "cpu",
         )
-        self.spec_sequence_indices: torch.Tensor = torch.empty(
-            (sequence_index_capacity,),
-            dtype=torch.int64,
-            device=device,
+        self.spec_sequence_indices: torch.Tensor = torch.arange(
+            sequence_index_capacity, dtype=torch.int64, device=device
         )
-        self.non_spec_sequence_indices: torch.Tensor = torch.empty(
-            (sequence_index_capacity,),
-            dtype=torch.int64,
-            device=device,
+        self.non_spec_sequence_indices: torch.Tensor = torch.arange(
+            sequence_index_capacity, dtype=torch.int64, device=device
         )
         self.spec_actual_seq_lengths: torch.Tensor = torch.empty(
             (sequence_index_capacity + 1,),
@@ -305,9 +301,20 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         self,
         spec_sequence_masks_cpu: torch.Tensor,
         num_spec_decodes: int,
+        fast_build: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_reqs = spec_sequence_masks_cpu.numel()
         num_non_spec_decodes = num_reqs - num_spec_decodes
+        if fast_build:
+            # Capture placeholder: the device buffers are pre-filled in
+            # __init__ (masks all False, indices arange) and refreshed in
+            # place by every real (non-capturing) build, so the captured graph
+            # only needs the right shapes here -- no host-to-device copy is
+            # allowed inside the capture session.
+            return (
+                self.spec_sequence_indices[:num_spec_decodes],
+                self.non_spec_sequence_indices[:num_non_spec_decodes],
+            )
 
         spec_indices_cpu = self.spec_sequence_indices_cpu[:num_spec_decodes]
         spec_indices_cpu.copy_(
@@ -533,10 +540,15 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 spec_sequence_masks_cpu = None
             else:
                 spec_sequence_masks = self.spec_sequence_masks[:num_reqs]
-                spec_sequence_masks.copy_(spec_sequence_masks_cpu, non_blocking=True)
+                if not fast_build:
+                    # Real (non-capturing) build: refresh the device mask from
+                    # the host side. During capture this copy is skipped and
+                    # the pre-filled placeholder stays (shapes only).
+                    spec_sequence_masks.copy_(spec_sequence_masks_cpu, non_blocking=True)
                 spec_sequence_indices, non_spec_sequence_indices = self._copy_sequence_indices_to_device(
                     spec_sequence_masks_cpu,
                     num_spec_decodes,
+                    fast_build=fast_build,
                 )
 
         if spec_sequence_masks is None:

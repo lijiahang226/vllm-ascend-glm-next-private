@@ -3222,6 +3222,11 @@ class NPUModelRunner(GPUModelRunner):
                     num_decode_draft_tokens_cpu=torch.from_numpy(
                         num_decode_draft_tokens_np
                     ),
+                    # During capture the GDN build must not perform any
+                    # host-to-device copy (rejected inside the capture
+                    # session); fast_build switches it to pre-filled device
+                    # placeholders.
+                    fast_build=for_cudagraph_capture,
                 )
 
             if isinstance(builder, (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder)):
