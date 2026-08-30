@@ -3194,7 +3194,15 @@ class NPUModelRunner(GPUModelRunner):
                 assert ubid is None, "UBatching not supported with GDN yet"
                 extra_attn_metadata_args = dict(
                     num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
-                    num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[:num_reqs_padded],
+                    # Take the CPU side from the dual-buffer .np view (numpy,
+                    # refreshed per step on the host) instead of the .cpu
+                    # attribute: metadata is also built inside the capture run
+                    # (build_for_cudagraph_capture), where a device-to-host
+                    # sync is rejected. torch.from_numpy is a zero-copy view
+                    # with no NPU sync.
+                    num_decode_draft_tokens_cpu=torch.from_numpy(
+                        self.num_decode_draft_tokens.np[:num_reqs_padded]
+                    ),
                 )
 
             if isinstance(builder, (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder)):
