@@ -12,7 +12,6 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -468,21 +467,13 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         )
         block_offsets = torch.remainder(safe_slots, block_size)
         row_mask = valid.view(-1, *([1] * (values.ndim - 1)))
+        # Invalid rows rewrite cache[0,0] with its own current value (a
+        # no-op), matching the Triton reference that only writes valid slots.
+        # No dummy-row bookkeeping: vLLM block IDs are used as-is, so cache[0,0]
+        # holds real data for physical block 0 and must not be overwritten.
         row_zero = cache[0, 0].clone()
         safe_values = torch.where(row_mask, values, row_zero.unsqueeze(0))
-        row_zero_mask = valid & (slots == 0)
-        update_zero = torch.where(
-            row_zero_mask.view(-1, *([1] * (values.ndim - 1))),
-            values,
-            torch.zeros_like(values),
-        ).sum(dim=0)
-        expected_zero = torch.where(
-            row_zero_mask.any(),
-            update_zero,
-            row_zero,
-        )
         cache[block_ids, block_offsets] = safe_values
-        cache[0, 0].copy_(expected_zero)
 
     def _gather_compressor_state(
         self,
@@ -1105,9 +1096,16 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             write_locs = loc
             write_k = compressed_k
             if write_mask is not None:
-                selected = write_mask.nonzero().flatten()
-                write_locs = write_locs[selected]
-                write_k = write_k[selected]
+                # Mask skipped pools as invalid slots (-1); the fixed-shape
+                # scatter below masks them with the zero-row sentinel. This
+                # avoids nonzero(), a host-syncing op unsafe under graph
+                # capture (this helper is the CPU/reference path, but the
+                # masked form keeps it graph-safe as well).
+                write_locs = torch.where(
+                    write_mask.bool(),
+                    loc,
+                    torch.full_like(loc, -1),
+                )
             AscendSparseAttnIndexerKpool._scatter_paged_cache(
                 indexer_k_cache,
                 write_locs,
@@ -1215,7 +1213,6 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         if not isinstance(indexer_cache, torch.Tensor) or indexer_cache.dtype != torch.bfloat16:
             raise TypeError("GLM-5 indexer cache must be one bfloat16 K tensor.")
 
-        is_full_graph = context.cudagraph_runtime_mode == CUDAGraphMode.FULL
         # These derived values are precomputed in AscendIndexerKPoolMetadataBuilder.build.
         num_tokens = indexer_metadata.num_tokens
         cu_seqlens = indexer_metadata.cu_seqlens
@@ -1237,12 +1234,14 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             cmp_ratio=index_kpool,
         )
 
-        selected = (
-            torch.arange(num_tokens, device=hidden_states.device)
-            if is_full_graph
-            else (indexer_metadata.slot_mapping[:num_tokens] >= 0).nonzero().flatten()
-        )
-        if is_full_graph or selected.numel() > 0:
+        # The selection filter happens implicitly in the fixed-shape scatter:
+        # all rows are gathered here and invalid slots are masked with the
+        # zero-row sentinel, matching the Triton reference that only writes
+        # valid slots. No nonzero() (host-syncing, rejected in any graph
+        # capture) and no is_full_graph forward-context check (the runtime mode
+        # is not comparable across graph modes / installed vLLM versions).
+        selected = torch.arange(num_tokens, device=hidden_states.device)
+        if selected.numel() > 0:
             token_ids = torch.arange(num_tokens, device=hidden_states.device)
             request_ids = torch.bucketize(
                 token_ids,
