@@ -540,8 +540,20 @@ class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
         query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
         metadata.query_start_loc = query_start_loc
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
-        query_lens = query_start_loc[1:] - query_start_loc[:-1]
         hf_config = self.model_config.hf_text_config
+        # max_seqlen_q / max_seqlen_ori_kv are ATTRs (host ints). Derive them
+        # from the already-CPU metadata (query_start_loc_cpu / _seq_lens_cpu),
+        # so the .item() here is a CPU-tensor read with no NPU sync -- the
+        # metadata build also runs inside the capture step in some vLLM-Ascend
+        # graph modes, where a device .item() is rejected.
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
+        query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        if common_attn_metadata._seq_lens_cpu is not None:
+            seq_lens_cpu = common_attn_metadata._seq_lens_cpu[:num_reqs]
+        elif common_attn_metadata.seq_lens_cpu is not None:
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
+        else:
+            seq_lens_cpu = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
         metadata_op = DeviceOperator.get_sparse_attention_metadata_op_indexer_kpool_mla()
         generated_metadata = metadata_op(
             **DeviceOperator.get_sparse_attention_metadata_kwargs_indexer_kpool_mla(query_start_loc.device),
@@ -555,8 +567,8 @@ class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
             seqused_ori_kv=seq_lens,
             seqused_cmp_kv=None,
             cmp_residual_kv=None,
-            max_seqlen_q=query_lens.max().item(),
-            max_seqlen_ori_kv=seq_lens.max().item(),
+            max_seqlen_q=query_lens_cpu.max().item(),
+            max_seqlen_ori_kv=seq_lens_cpu.max().item(),
             max_seqlen_cmp_kv=0,
             batch_size=num_reqs,
             ori_topk=hf_config.index_topk + hf_config.index_kpool - 1,
