@@ -61,6 +61,25 @@ RUN export PIP_EXTRA_INDEX_URL="https://mirrors.huaweicloud.com/ascend/repos/pyp
     python3 -m pip install triton-ascend==3.2.1 --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi && \
     python3 -m pip cache purge
 
+# Install prebuilt CANN custom operators (KeyPool / PoolKeyIndexer for GLM) and the Python wrapper wheel
+RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    export ASCEND_OPP_PATH=${ASCEND_OPP_PATH:-${ASCEND_HOME_PATH}/opp} && \
+    if [ "$(uname -m)" = "aarch64" ]; then OP_PKG_DIR="arm"; else OP_PKG_DIR="x86"; fi && \
+    OP_RUN_PKG=$(ls /vllm-workspace/vllm-ascend/operator/${OP_PKG_DIR}/a5/cann-ops-transformer-custom_linux-*.run) && \
+    bash "${OP_RUN_PKG}" && \
+    ls ${ASCEND_OPP_PATH}/vendors/custom_transformer/op_api/lib && \
+    python3 -m pip install ninja && \
+    python3 -m pip install /vllm-workspace/vllm-ascend/operator/${OP_PKG_DIR}/wheel/cann_ops_transformer-1.0.0-py3-none-any.whl && \
+    ln -sfn "$(readlink -f ${ASCEND_OPP_PATH})/vendors/custom_transformer" /usr/local/Ascend/custom_transformer_ops && \
+    echo "/usr/local/Ascend/custom_transformer_ops/op_api/lib" > /etc/ld.so.conf.d/custom-transformer.conf && \
+    ldconfig && \
+    python3 -c "import importlib.util as _iu; _s = _iu.spec_from_file_location('cann_kpool_loader', '/vllm-workspace/vllm-ascend/vllm_ascend/ops/cann_kpool_loader.py'); _m = _iu.module_from_spec(_s); _s.loader.exec_module(_m); import cann_ops_transformer.ops.pool_key_indexer as _pki; _pki.pool_key_indexer_op_builder.load(verbose=False); print('[custom-ops] pool_key_indexer torch extension prebuilt')" && \
+    python3 -m pip cache purge
+
+# Expose the prebuilt custom operators to CANN and the dynamic linker at runtime
+ENV LD_LIBRARY_PATH=/usr/local/Ascend/custom_transformer_ops/op_api/lib:${LD_LIBRARY_PATH} \
+    ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/custom_transformer_ops
+
 RUN echo "export LD_PRELOAD=/usr/lib64/libjemalloc.so.2:$LD_PRELOAD" >> ~/.bashrc
 RUN echo "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib" >> ~/.bashrc
 
