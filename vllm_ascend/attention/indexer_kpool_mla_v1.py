@@ -500,11 +500,10 @@ class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
             self._sas_sinks = torch.ones(
                 num_heads_q, dtype=torch.float32, device=device
             )
-            self._seqused_q = torch.empty(
-                0,
-                dtype=torch.int32,
-                device=device,
-            )
+            # seqused_q is an optional AICPU input; the reference usage passes
+            # None (an empty tensor reaches the graph as a 0-size input and the
+            # internal formatting/transpose raises an error).
+            self._seqused_q: torch.Tensor | None = None
             if self.speculative_config is not None:
                 self._spec_sas_metadata_buffers = [
                     torch.zeros(
@@ -534,7 +533,7 @@ class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
             if self._spec_sas_metadata_buffers is None:
                 raise RuntimeError("Missing GLM-5 speculative sparse-attention metadata buffers.")
             sas_metadata_buffer = self._spec_sas_metadata_buffers[draft_index - 1]
-        if sas_metadata_buffer is None or self._seqused_q is None:
+        if sas_metadata_buffer is None:
             raise RuntimeError("Missing GLM-5 A5 sparse-attention metadata storage.")
 
         num_reqs = common_attn_metadata.num_reqs
@@ -552,12 +551,12 @@ class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
             cu_seqlens_q=query_start_loc,
             cu_seqlens_ori_kv=None,
             cu_seqlens_cmp_kv=None,
-            seqused_q=self._seqused_q,
+            seqused_q=None,
             seqused_ori_kv=seq_lens,
             seqused_cmp_kv=None,
             cmp_residual_kv=None,
-            max_seqlen_q=query_lens.max(),
-            max_seqlen_ori_kv=seq_lens.max(),
+            max_seqlen_q=query_lens.max().item(),
+            max_seqlen_ori_kv=seq_lens.max().item(),
             max_seqlen_cmp_kv=0,
             batch_size=num_reqs,
             ori_topk=hf_config.index_topk + hf_config.index_kpool - 1,
