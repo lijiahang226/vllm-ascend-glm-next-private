@@ -248,8 +248,10 @@ def _prepare_chunk_indices_device(
     output is padded to a fixed ``[max_chunks, 2]`` shape: the data-length
     variants (repeat_interleave with tensor repeats, arange of a device
     scalar) allocate after a host-visible count and deadlock in
-    graph-capture contexts. Kernels bound the real chunk count through
-    ``chunk_offsets``, so the padded tail rows are never read.
+    graph-capture contexts. Several FLA/KDA kernels launch their grid over
+    ``len(chunk_indices)`` and read every row, so the padded tail rows must
+    be pinned to a valid chunk: we pin them to chunk ``(0, 0)`` — a
+    deterministic in-range recompute — instead of out-of-range pairs.
     """
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     chunk_cnts = torch.div(
@@ -265,14 +267,18 @@ def _prepare_chunk_indices_device(
         torch.ones(max_chunks, device=cu_seqlens.device, dtype=cu_seqlens.dtype),
         0,
     ) - 1
-    # Segment index per chunk row via a fixed-shape comparison (no
-    # searchsorted dependency); rows past the real chunk count clamp to the
-    # last segment and are never read by the kernels.
-    seg_idx = (
-        chunk_ends.unsqueeze(1) > positions.unsqueeze(0)
-    ).sum(0).clamp_max(seq_lens.numel() - 1)
-    internal = positions - seg_starts[seg_idx]
-    return torch.stack([positions, internal], 1)
+    # Segment index of chunk row p = number of chunk_ends <= p, matching the
+    # per-segment arange concat of prepare_chunk_indices (empty segments are
+    # handled naturally: chunk_ends is non-decreasing). NOTE: the kernels
+    # launch grids over len(chunk_indices), so the padded tail rows ARE
+    # executed. Pin them to chunk (0, 0) — a deterministic in-range
+    # recompute — instead of out-of-range segment/offset pairs.
+    seg_idx = (chunk_ends.unsqueeze(1) <= positions.unsqueeze(0)).sum(0)
+    is_pad = positions >= chunk_ends[-1]
+    seg_idx = torch.where(is_pad, torch.zeros_like(seg_idx), seg_idx)
+    internal = positions - seg_starts.index_select(0, seg_idx)
+    internal = torch.where(is_pad, torch.zeros_like(internal), internal)
+    return torch.stack([seg_idx, internal], 1).to(cu_seqlens.dtype)
 
 
 def _build_non_spec_chunked_prefill_metadata(

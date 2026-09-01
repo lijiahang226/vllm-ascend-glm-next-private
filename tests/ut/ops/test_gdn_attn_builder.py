@@ -230,6 +230,22 @@ def _build_attn_metadata(
     return builder, common_attn_metadata, attn_metadata
 
 
+def _assert_padded_chunk_indices(padded: torch.Tensor, golden: torch.Tensor) -> None:
+    """The fixed-capacity device chunk indices must reproduce the golden rows
+    in their valid prefix and pin every padding row to chunk (0, 0)."""
+    real = golden.shape[0]
+    assert padded.ndim == 2 and padded.shape[1] == 2
+    assert padded.shape[0] >= real, f"padded capacity {padded.shape[0]} < real {real}"
+    assert padded.dtype == golden.dtype
+    assert torch.equal(padded[:real], golden), (
+        f"valid prefix mismatch:\n{padded[:real].tolist()}\nvs\n{golden.tolist()}"
+    )
+    if padded.shape[0] > real:
+        assert (padded[real:] == 0).all(), (
+            f"padding rows must be pinned to chunk (0, 0), got {padded[real:].tolist()}"
+        )
+
+
 def _assert_chunk_meta_matches_runtime(builder, chunk_meta, cu_seqlens: torch.Tensor) -> None:
     hf_text_config = getattr(builder.vllm_config.model_config, "hf_text_config", None)
     if hf_text_config is not None and hasattr(hf_text_config, "linear_num_value_heads"):
@@ -246,7 +262,12 @@ def _assert_chunk_meta_matches_runtime(builder, chunk_meta, cu_seqlens: torch.Te
     sequence_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
 
     assert chunk_meta.num_decodes == (sequence_lengths == 1).sum().item()
-    assert torch.equal(
+    # The device-side chunk indices are padded to a fixed capacity: the valid
+    # prefix must match the runtime golden exactly (segment index in column 0,
+    # intra-segment chunk index in column 1) and padding rows must be pinned
+    # to chunk (0, 0) so kernels with grids over len(chunk_indices) redo
+    # known-good in-range work.
+    _assert_padded_chunk_indices(
         chunk_meta.chunk_indices_chunk64,
         runtime_prepare_chunk_indices(cu_seqlens, ascend_gdn_attn_builder._GDN_CHUNK_SIZE),
     )
@@ -268,14 +289,14 @@ def _assert_chunk_meta_matches_runtime(builder, chunk_meta, cu_seqlens: torch.Te
             ascend_gdn_attn_builder._GDN_CHUNK_SIZE,
         ),
     )
-    assert torch.equal(
+    _assert_padded_chunk_indices(
         chunk_meta.chunk_indices_large_block,
         runtime_prepare_chunk_indices(
             cu_seqlens,
             ascend_gdn_attn_builder._GDN_SOLVE_TRIL_LARGE_BLOCK_SIZE,
         ),
     )
-    assert torch.equal(
+    _assert_padded_chunk_indices(
         chunk_meta.block_indices_cumsum,
         runtime_prepare_chunk_indices(
             cu_seqlens,
@@ -298,6 +319,27 @@ def _patch_missing_runtime_cdiv(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_ascend_gdn_attention_uses_ascend_backend():
     assert AscendGatedDeltaNetAttention.get_attn_backend(object()) is AscendGDNAttentionBackend
     assert AscendGDNAttentionBackend.get_builder_cls() is AscendGDNAttentionMetadataBuilder
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [8, 4, 0, 12],  # mixed lengths with an empty segment
+        [64, 64],  # exact chunk multiples
+        [65, 1, 130, 0, 0, 3],  # uneven chunks with adjacent empty segments
+        [1],
+        [0, 64],
+    ],
+)
+def test_prepare_chunk_indices_device_matches_golden(seq_lens, monkeypatch: pytest.MonkeyPatch):
+    _patch_missing_runtime_cdiv(monkeypatch)
+    for chunk_size in (ascend_gdn_attn_builder._GDN_CHUNK_SIZE, 32):
+        cu_seqlens = torch.tensor([0] + torch.tensor(seq_lens).cumsum(0).tolist(), dtype=torch.int32)
+        golden = runtime_prepare_chunk_indices(cu_seqlens, chunk_size)
+        padded = ascend_gdn_attn_builder._prepare_chunk_indices_device(
+            cu_seqlens, chunk_size, golden.shape[0] + 3
+        )
+        _assert_padded_chunk_indices(padded, golden)
 
 
 def test_sequence_index_buffers_cover_spec_decode_when_cudagraph_disabled():

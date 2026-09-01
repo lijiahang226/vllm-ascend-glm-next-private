@@ -856,11 +856,13 @@ at::Tensor npu_key_pool_meta(
     (void)seqused;
     (void)norm_eps;
     (void)rotary_mode;
-    // Matches key_pool_infershape: [B, ceil(cols * block_size / R), D].
+    // Matches key_pool_infershape: [B, ceil(cols * block_size / R), D]; the
+    // output dtype/device follows hidden_states (ConstructKeyPoolOutputTensor
+    // allocates with hidden_states.options()).
     int64_t b = start_pos.size(0);
     int64_t d = wk.size(0);
     int64_t sr = (cache_block_table.size(1) * state_cache.size(1) + cmp_ratio - 1) / cmp_ratio;
-    return at::empty_symint({b, sr, d}, wk.options());
+    return at::empty_symint({b, sr, d}, hidden_states.options());
 }
 
 std::tuple<at::Tensor, at::Tensor> npu_pool_key_indexer_meta(
@@ -889,20 +891,35 @@ std::tuple<at::Tensor, at::Tensor> npu_pool_key_indexer_meta(
     (void)block_table;
     (void)q_descale;
     (void)k_descale;
-    (void)layout_q;
     (void)layout_k;
     (void)mask_mode;
     (void)quant_mode;
-    // Matches pool_key_indexer output: [T1, topk + pool_size - 1] indices
-    // (TND query layout); values are empty unless return_value is set.
-    int64_t t1 = query.size(0);
-    int64_t w = topk + pool_size - 1;
-    auto indices = at::empty_symint({t1, w}, query.options().dtype(at::kInt));
+    // Matches ConstructPoolKeyIndexerOutputTensor in pool_key_indexer_torch_adpt.h:
+    //   BSND: indices [B, S1, topk + pool_size - 1], values [B, S1, topk / pool_size]
+    //   TND:  indices [T1, topk + pool_size - 1],     values [T1, topk / pool_size]
+    // indices are always INT32; values are FLOAT and empty ({0}) unless
+    // return_value is set.
+    int64_t indices_last = topk + pool_size - 1;
+    int64_t values_last = topk / pool_size;
+    bool is_bsnd = (std::string(layout_q) == "BSND");
+    at::Tensor indices;
     at::Tensor values;
-    if (return_value) {
-        values = at::empty_symint({t1, w}, query.options());
+    if (is_bsnd) {
+        indices = at::empty_symint(
+            {query.size(0), query.size(1), indices_last},
+            query.options().dtype(at::kInt));
+        values = return_value
+                     ? at::empty_symint({query.size(0), query.size(1), values_last},
+                                        query.options().dtype(at::kFloat))
+                     : at::empty_symint({0}, query.options().dtype(at::kFloat));
     } else {
-        values = at::empty_symint({0}, query.options().dtype(at::kFloat));
+        int64_t t1 = query.size(0);
+        indices = at::empty_symint({t1, indices_last},
+                                   query.options().dtype(at::kInt));
+        values = return_value
+                     ? at::empty_symint({t1, values_last},
+                                        query.options().dtype(at::kFloat))
+                     : at::empty_symint({0}, query.options().dtype(at::kFloat));
     }
     return std::make_tuple(indices, values);
 }
