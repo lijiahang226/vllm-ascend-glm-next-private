@@ -827,6 +827,86 @@ at::Tensor recurrent_kda_meta(
     return at::empty_symint(value.sym_sizes(), value.options());
 }
 
+at::Tensor npu_key_pool_meta(
+    const at::Tensor& hidden_states,
+    const at::Tensor& wk,
+    const at::Tensor& gate_weight,
+    const at::Tensor& ape,
+    at::Tensor& state_cache,
+    const at::Tensor& cache_block_table,
+    const at::Tensor& start_pos,
+    const c10::optional<at::Tensor>& norm_weight,
+    const c10::optional<at::Tensor>& norm_bias,
+    const c10::optional<at::Tensor>& cos,
+    const c10::optional<at::Tensor>& sin,
+    const c10::optional<at::Tensor>& cu_seqlens,
+    const c10::optional<at::Tensor>& seqused,
+    int64_t cmp_ratio,
+    double norm_eps,
+    int64_t rotary_mode)
+{
+    (void)hidden_states;
+    (void)gate_weight;
+    (void)ape;
+    (void)norm_weight;
+    (void)norm_bias;
+    (void)cos;
+    (void)sin;
+    (void)cu_seqlens;
+    (void)seqused;
+    (void)norm_eps;
+    (void)rotary_mode;
+    // Matches key_pool_infershape: [B, ceil(cols * block_size / R), D].
+    int64_t b = start_pos.size(0);
+    int64_t d = wk.size(0);
+    int64_t sr = (cache_block_table.size(1) * state_cache.size(1) + cmp_ratio - 1) / cmp_ratio;
+    return at::empty_symint({b, sr, d}, wk.options());
+}
+
+std::tuple<at::Tensor, at::Tensor> npu_pool_key_indexer_meta(
+    const at::Tensor& query,
+    const at::Tensor& pool_key,
+    const at::Tensor& weights,
+    const at::Tensor& pool_tail_k,
+    const c10::optional<at::Tensor>& actual_seq_q,
+    const c10::optional<at::Tensor>& actual_seq_k,
+    const c10::optional<at::Tensor>& block_table,
+    const c10::optional<at::Tensor>& q_descale,
+    const c10::optional<at::Tensor>& k_descale,
+    c10::string_view layout_q,
+    c10::string_view layout_k,
+    int64_t topk,
+    int64_t pool_size,
+    int64_t mask_mode,
+    int64_t quant_mode,
+    bool return_value)
+{
+    (void)pool_key;
+    (void)weights;
+    (void)pool_tail_k;
+    (void)actual_seq_q;
+    (void)actual_seq_k;
+    (void)block_table;
+    (void)q_descale;
+    (void)k_descale;
+    (void)layout_q;
+    (void)layout_k;
+    (void)mask_mode;
+    (void)quant_mode;
+    // Matches pool_key_indexer output: [T1, topk + pool_size - 1] indices
+    // (TND query layout); values are empty unless return_value is set.
+    int64_t t1 = query.size(0);
+    int64_t w = topk + pool_size - 1;
+    auto indices = at::empty_symint({t1, w}, query.options().dtype(at::kInt));
+    at::Tensor values;
+    if (return_value) {
+        values = at::empty_symint({t1, w}, query.options());
+    } else {
+        values = at::empty_symint({0}, query.options().dtype(at::kFloat));
+    }
+    return std::make_tuple(indices, values);
+}
+
 std::tuple<at::Tensor, at::Tensor> npu_fused_gdn_gating_meta(
     const at::Tensor& A_log,
     const at::Tensor& a,
@@ -2235,6 +2315,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("store_kv_block", &vllm_ascend::meta::store_kv_block);
     // npu_fused_gdn_gating
     ops.impl("npu_fused_gdn_gating", &vllm_ascend::meta::npu_fused_gdn_gating_meta);
+    ops.impl("npu_key_pool", &vllm_ascend::meta::npu_key_pool_meta);
+    ops.impl("npu_pool_key_indexer", &vllm_ascend::meta::npu_pool_key_indexer_meta);
 }
 }
 #endif
