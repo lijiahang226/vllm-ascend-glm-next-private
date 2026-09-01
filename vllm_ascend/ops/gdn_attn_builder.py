@@ -54,6 +54,17 @@ def _stable_argsort_for_npu(tensor: torch.Tensor) -> torch.Tensor:
     return torch.argsort(tensor, stable=True)
 
 
+class AscendGDNAttentionMetadata(GDNAttentionMetadata):
+    """GDN metadata plus a host-side copy of the non-spec query prefix.
+
+    The Mamba conv1d prefill loop needs per-segment [bos, eos) bounds as
+    host values; slicing the device prefix with .item() syncs per segment
+    and fails inside the dynamo/compilation pipeline (rtNotifyRecord).
+    """
+
+    non_spec_query_start_loc_cpu: torch.Tensor | None = None
+
+
 def _np_to_pinned_tensor(array: np.ndarray) -> torch.Tensor:
     """Pinned CPU tensor from a numpy array (vllm 0.23.0 compatible)."""
     return torch.from_numpy(array).pin_memory()
@@ -988,7 +999,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             )
             non_spec_conv1d_cache_indices = non_spec_state_indices_tensor
 
-        attn_metadata = GDNAttentionMetadata(
+        attn_metadata = AscendGDNAttentionMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,
@@ -1004,6 +1015,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             prefill_has_initial_state=prefill_has_initial_state,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
+            non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
             spec_state_indices_tensor=spec_state_indices_tensor,
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
             spec_sequence_masks=spec_sequence_masks,

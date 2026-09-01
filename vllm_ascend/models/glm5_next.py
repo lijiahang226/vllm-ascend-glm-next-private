@@ -1759,22 +1759,36 @@ class AscendGlm5NextLinearAttention(nn.Module, MambaBase):
             q_out = torch.empty_like(q_t)
             k_out = torch.empty_like(k_t)
             v_out = torch.empty_like(v_t)
-            seq_begin_end_idx = [
-                (int(non_spec_query_start_loc[i].item()), int(non_spec_query_start_loc[i + 1].item()))
-                for i in range(non_spec_query_start_loc.shape[0] - 1)
-            ]
+            # Per-segment [bos, eos) bounds as host values: slicing the device
+            # prefix with .item() syncs per segment and fails inside the
+            # dynamo/compilation pipeline (rtNotifyRecord). The builder ships
+            # a CPU copy of the prefix for this purpose.
+            qsl_cpu = getattr(attn_metadata, "non_spec_query_start_loc_cpu", None)
+            if qsl_cpu is not None:
+                qsl = [int(v) for v in qsl_cpu.reshape(-1).tolist()]
+                seq_begin_end_idx = list(zip(qsl[:-1], qsl[1:]))
+            else:
+                seq_begin_end_idx = [
+                    (int(non_spec_query_start_loc[i].item()), int(non_spec_query_start_loc[i + 1].item()))
+                    for i in range(non_spec_query_start_loc.shape[0] - 1)
+                ]
             for seq_idx, (bos, eos) in enumerate(seq_begin_end_idx):
-                slot = int(non_spec_state_indices_tensor[seq_idx].item())
+                # Device-scalar indexing (no .item()): identical to the decode
+                # branch below.
+                slot = non_spec_state_indices_tensor[seq_idx]
+                has_initial = has_initial_state[seq_idx].reshape(1, 1, 1)
                 for x_t, out_t, w, cs in [
                     (q_t, q_out, q_conv_weights, conv_state_q),
                     (k_t, k_out, k_conv_weights, conv_state_k),
                     (v_t, v_out, v_conv_weights, conv_state_v),
                 ]:
                     seq_x = x_t[:, :, bos:eos]
-                    if bool(has_initial_state[seq_idx].item()):
-                        init = cs[slot, :, :state_len].unsqueeze(0)
-                    else:
-                        init = torch.zeros(1, w.shape[0], state_len, device=seq_x.device, dtype=seq_x.dtype)
+                    init = cs[slot, :, :state_len].unsqueeze(0)
+                    init = torch.where(
+                        has_initial,
+                        init,
+                        torch.zeros_like(init),
+                    )
                     conv_input = torch.cat([init, seq_x], dim=-1).to(w.dtype)
                     w_3d = w.unsqueeze(1)
                     seq_res = torch.nn.functional.conv1d(conv_input, w_3d, None, padding=0, groups=w.shape[0])

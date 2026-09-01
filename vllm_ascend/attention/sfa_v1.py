@@ -1918,7 +1918,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert k_li is not None
                 k_li = self._get_full_kv(k_li, attn_metadata)
 
-        if kv_cache is not None and self.is_kv_producer:
+        if kv_cache is not None and self.is_kv_producer and not torch.compiler.is_compiling():
+            # torch.npu.Event creation/record fails inside the torch.compile
+            # (dynamo/compilation) pipeline with rtNotifyRecord; the event is
+            # only consumed by KV-transfer connectors outside the compiled
+            # graph, so skip it while compiling.
             attn_metadata.reshape_cache_event = torch.npu.Event()
 
         if kv_cache is not None and self.has_indexer:
@@ -1964,7 +1968,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                             k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
 
-        if kv_cache is not None and self.is_kv_producer:
+        if kv_cache is not None and self.is_kv_producer and not torch.compiler.is_compiling():
             attn_metadata.reshape_cache_event.record()
             notify_kv_cache_written(self.layer_name or "")
 
