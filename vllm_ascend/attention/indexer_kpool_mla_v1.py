@@ -252,7 +252,6 @@ class AscendIndexerKPoolStateMetadata:
     # convention (no ValueDepend) and are read from GM at runtime, so graph
     # mode updates them per step as graph inputs without baking into tiling.
     cann_start_pos: torch.Tensor | None = None
-    cann_end_pos: torch.Tensor | None = None
     cann_cu_seqlens: torch.Tensor | None = None
     cann_pool_tail_k: torch.Tensor | None = None
     cann_actual_seq_q: torch.Tensor | None = None
@@ -306,7 +305,6 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
                 max_model_len + self.block_size - 1
             ) // self.block_size
             self._cann_start_pos = torch.empty(max_num_seqs, dtype=torch.int32, device=device)
-            self._cann_end_pos = torch.empty(max_num_seqs, dtype=torch.int32, device=device)
             self._cann_cu_seqlens = torch.empty(
                 max_num_seqs + 1, dtype=torch.int32, device=device
             )
@@ -332,7 +330,6 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
         start_pos = seq_lens - query_lens
         end_pos = seq_lens
         self._cann_start_pos[:num_reqs].copy_(start_pos.to(torch.int32))
-        self._cann_end_pos[:num_reqs].copy_(end_pos.to(torch.int32))
         self._cann_cu_seqlens[: num_reqs + 1].copy_(query_start_loc.to(torch.int32))
         # PoolKeyIndexer sequence lengths are device tensors (no ValueDepend);
         # the kernel reads them from GM at runtime, so build only does
@@ -346,9 +343,9 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
         )
         # Full-width state block table: the sliding-window cache (one physical
         # block per request) is mapped by logical block address, which the CANN
-        # op addresses as pos // block_size.
+        # op addresses as pos // block_size. Rows outside [first_block,
+        # last_block] stay zero (invalid) and the kernel skips them.
         table = self._cann_state_block_table[:num_reqs]
-        table.zero_()
         first_blocks = torch.div(start_pos, self.block_size, rounding_mode="floor")
         last_blocks = torch.div(end_pos - 1, self.block_size, rounding_mode="floor")
         physical = common_attn_metadata.block_table_tensor[:num_reqs, 0]
@@ -357,11 +354,16 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
             block_ids[None, :] <= last_blocks[:, None]
         )
         expanded = physical[:, None].to(torch.int32).expand(num_reqs, self._cann_max_blocks)
-        table.copy_(torch.where(in_range, expanded, table))
+        table.copy_(
+            torch.where(
+                in_range,
+                expanded,
+                torch.zeros_like(expanded),
+            )
+        )
         metadata.cann_state_block_table = table
 
         metadata.cann_start_pos = self._cann_start_pos[:num_reqs]
-        metadata.cann_end_pos = self._cann_end_pos[:num_reqs]
         metadata.cann_cu_seqlens = self._cann_cu_seqlens[: num_reqs + 1]
         metadata.cann_pool_tail_k = self._cann_pool_tail_k[:num_reqs]
         metadata.cann_actual_seq_q = self._cann_actual_seq_q[:num_reqs]
