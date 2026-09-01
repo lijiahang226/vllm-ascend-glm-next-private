@@ -9,8 +9,6 @@ from dataclasses import dataclass
 import torch
 import torch_npu
 from vllm.config import VllmConfig
-from vllm.config.compilation import CUDAGraphMode
-from vllm.forward_context import get_forward_context
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -248,6 +246,18 @@ class AscendIndexerKPoolStateMetadata:
     slot_mapping: torch.Tensor
     block_size: int
     cache_role: str
+    # CANN KeyPool/PoolKeyIndexer dependency parameters (pre-built at build
+    # time, shared by all layers). All are device tensors: PoolKeyIndexer's
+    # pool_tail_k/actual_seq_q/actual_seq_k follow the device-tensor
+    # convention (no ValueDepend) and are read from GM at runtime, so graph
+    # mode updates them per step as graph inputs without baking into tiling.
+    cann_start_pos: torch.Tensor | None = None
+    cann_end_pos: torch.Tensor | None = None
+    cann_cu_seqlens: torch.Tensor | None = None
+    cann_pool_tail_k: torch.Tensor | None = None
+    cann_actual_seq_q: torch.Tensor | None = None
+    cann_actual_seq_k: torch.Tensor | None = None
+    cann_state_block_table: torch.Tensor | None = None
 
 
 class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
@@ -279,6 +289,83 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.block_size = kv_cache_spec.block_size
         self.cache_role = kv_cache_spec.cache_role
+        self.compress_ratio = kv_cache_spec.compress_ratio
+        # CANN dependency parameters use persistent buffers refreshed in place
+        # at build time: the model forward reads them directly without
+        # allocating new tensors or triggering host-device sync. All are
+        # device tensors (PoolKeyIndexer sequence lengths follow the
+        # device-tensor convention); the buffers are graph-stable objects
+        # across capture/replay, refreshed per build, so no host value is
+        # baked into tiling. The custom ops are always built together with
+        # vllm-ascend, so the CANN params are always enabled.
+        self._cann_enabled = True
+        if self._cann_enabled:
+            max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+            max_model_len = vllm_config.model_config.max_model_len
+            self._cann_max_blocks = (
+                max_model_len + self.block_size - 1
+            ) // self.block_size
+            self._cann_start_pos = torch.empty(max_num_seqs, dtype=torch.int32, device=device)
+            self._cann_end_pos = torch.empty(max_num_seqs, dtype=torch.int32, device=device)
+            self._cann_cu_seqlens = torch.empty(
+                max_num_seqs + 1, dtype=torch.int32, device=device
+            )
+            self._cann_pool_tail_k = torch.empty(max_num_seqs, dtype=torch.int64, device=device)
+            self._cann_actual_seq_q = torch.empty(max_num_seqs, dtype=torch.int64, device=device)
+            self._cann_actual_seq_k = torch.empty(max_num_seqs, dtype=torch.int64, device=device)
+            self._cann_state_block_table = torch.zeros(
+                (max_num_seqs, self._cann_max_blocks),
+                dtype=torch.int32,
+                device=device,
+            )
+
+    def _build_cann_params(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_reqs: int,
+        metadata: AscendIndexerKPoolStateMetadata,
+    ) -> None:
+        """Build the CANN KeyPool/PoolKeyIndexer dependency parameters once per step."""
+        seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+        query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        start_pos = seq_lens - query_lens
+        end_pos = seq_lens
+        self._cann_start_pos[:num_reqs].copy_(start_pos.to(torch.int32))
+        self._cann_end_pos[:num_reqs].copy_(end_pos.to(torch.int32))
+        self._cann_cu_seqlens[: num_reqs + 1].copy_(query_start_loc.to(torch.int32))
+        # PoolKeyIndexer sequence lengths are device tensors (no ValueDepend);
+        # the kernel reads them from GM at runtime, so build only does
+        # device-to-device copies with no D2H sync.
+        self._cann_pool_tail_k[:num_reqs].copy_(
+            torch.remainder(end_pos, self.compress_ratio).to(torch.int64)
+        )
+        self._cann_actual_seq_q[:num_reqs].copy_(query_start_loc[1:].to(torch.int64))
+        self._cann_actual_seq_k[:num_reqs].copy_(
+            torch.div(end_pos, self.compress_ratio, rounding_mode="floor").to(torch.int64)
+        )
+        # Full-width state block table: the sliding-window cache (one physical
+        # block per request) is mapped by logical block address, which the CANN
+        # op addresses as pos // block_size.
+        table = self._cann_state_block_table[:num_reqs]
+        table.zero_()
+        first_blocks = torch.div(start_pos, self.block_size, rounding_mode="floor")
+        last_blocks = torch.div(end_pos - 1, self.block_size, rounding_mode="floor")
+        physical = common_attn_metadata.block_table_tensor[:num_reqs, 0]
+        block_ids = torch.arange(self._cann_max_blocks, device=table.device)
+        in_range = (block_ids[None, :] >= first_blocks[:, None]) & (
+            block_ids[None, :] <= last_blocks[:, None]
+        )
+        expanded = physical[:, None].to(torch.int32).expand(num_reqs, self._cann_max_blocks)
+        table.copy_(torch.where(in_range, expanded, table))
+        metadata.cann_state_block_table = table
+
+        metadata.cann_start_pos = self._cann_start_pos[:num_reqs]
+        metadata.cann_end_pos = self._cann_end_pos[:num_reqs]
+        metadata.cann_cu_seqlens = self._cann_cu_seqlens[: num_reqs + 1]
+        metadata.cann_pool_tail_k = self._cann_pool_tail_k[:num_reqs]
+        metadata.cann_actual_seq_q = self._cann_actual_seq_q[:num_reqs]
+        metadata.cann_actual_seq_k = self._cann_actual_seq_k[:num_reqs]
 
     def build(
         self,
@@ -289,12 +376,15 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
         del common_prefix_len, fast_build
         num_reqs = common_attn_metadata.num_reqs
         num_input_tokens = common_attn_metadata.num_input_tokens
-        return AscendIndexerKPoolStateMetadata(
+        metadata = AscendIndexerKPoolStateMetadata(
             block_table=common_attn_metadata.block_table_tensor[:num_reqs],
             slot_mapping=common_attn_metadata.slot_mapping[:num_input_tokens],
             block_size=self.block_size,
             cache_role=self.cache_role,
         )
+        if self._cann_enabled:
+            self._build_cann_params(common_attn_metadata, num_reqs, metadata)
+        return metadata
 
 
 class AscendIndexerKPoolStateBackend(AttentionBackend):
@@ -416,9 +506,20 @@ class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
         query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
         metadata.query_start_loc = query_start_loc
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
-        query_lens = query_start_loc[1:] - query_start_loc[:-1]
         hf_config = self.model_config.hf_text_config
         metadata_op = DeviceOperator.get_sparse_attention_metadata_op_indexer_kpool_mla()
+        # The max_seqlen int params need host values. Compute them from the
+        # host-maintained CPU copies (query_start_loc_cpu / _seq_lens_cpu)
+        # instead of device 0-dim tensors, which would make the dispatcher do
+        # an implicit .item() D2H sync twice per build.
+        if common_attn_metadata._seq_lens_cpu is not None:
+            seq_lens_cpu = common_attn_metadata._seq_lens_cpu[:num_reqs]
+        elif common_attn_metadata.seq_lens_cpu is not None:
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
+        else:
+            seq_lens_cpu = seq_lens.to("cpu")
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
+        query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         generated_metadata = metadata_op(
             **DeviceOperator.get_sparse_attention_metadata_kwargs_indexer_kpool_mla(query_start_loc.device),
             num_heads_q=hf_config.num_attention_heads // self.vllm_config.parallel_config.tensor_parallel_size,
@@ -431,8 +532,8 @@ class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
             seqused_ori_kv=seq_lens,
             seqused_cmp_kv=None,
             cmp_residual_kv=None,
-            max_seqlen_q=query_lens.max(),
-            max_seqlen_ori_kv=seq_lens.max(),
+            max_seqlen_q=int(query_lens_cpu.max()),
+            max_seqlen_ori_kv=int(seq_lens_cpu.max()),
             max_seqlen_cmp_kv=0,
             batch_size=num_reqs,
             ori_topk=hf_config.index_topk + hf_config.index_kpool - 1,
@@ -593,55 +694,42 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
         values: torch.Tensor,
         block_size: int,
     ) -> None:
-        if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL:
-            # A GLM-5 logical cache may occupy only the payload prefix of a
-            # larger physical page. Flattening such an as_strided view would
-            # either fail or discard the physical page stride, so address the
-            # page and its token offset independently.
-            values = values.reshape(values.shape[0], *cache.shape[2:])
-            valid = (slots >= 0) & (slots < cache.shape[0] * block_size)
-            safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
-            block_ids = torch.div(
-                safe_slots,
-                block_size,
-                rounding_mode="floor",
+        # Always use the static-shape sentinel scatter (same as
+        # AscendSparseAttnIndexerKpool._scatter_paged_cache):
+        # nonzero() has a dynamic output shape (cannot be captured in
+        # ACLGraph and triggers a host sync), and npu_scatter_nd_update_
+        # requires a contiguous cache, which breaks when a GLM-5 logical
+        # cache occupies only the payload prefix of a larger physical page.
+        # Address the page and its token offset independently instead.
+        if cache.shape[1] != block_size:
+            raise ValueError(
+                f"Cache block size mismatch: expected {block_size}, got {cache.shape[1]}."
             )
-            block_offsets = torch.remainder(safe_slots, block_size)
-            row_mask = valid.view(-1, *([1] * (values.ndim - 1)))
-            row_zero = cache[0, 0].clone()
-            safe_values = torch.where(row_mask, values, row_zero.unsqueeze(0))
-            row_zero_mask = valid & (slots == 0)
-            update_zero = torch.where(
-                row_zero_mask.view(-1, *([1] * (values.ndim - 1))),
-                values,
-                torch.zeros_like(values),
-            ).sum(dim=0)
-            expected_zero = torch.where(
-                row_zero_mask.any(),
-                update_zero,
-                row_zero,
-            )
-            cache[block_ids, block_offsets] = safe_values
-            cache[0, 0].copy_(expected_zero)
-            return
-        valid_rows = (
-            (slots >= 0) & (slots < cache.shape[0] * block_size)
-        ).nonzero().flatten()
-        if valid_rows.numel() == 0:
-            return
-        valid_slots = slots[valid_rows]
+        values = values.reshape(values.shape[0], *cache.shape[2:])
+        valid = (slots >= 0) & (slots < cache.shape[0] * block_size)
+        safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
         block_ids = torch.div(
-            valid_slots,
+            safe_slots,
             block_size,
             rounding_mode="floor",
         )
-        block_offsets = torch.remainder(valid_slots, block_size)
-        indices = torch.stack([block_ids, block_offsets], dim=-1)
-        torch_npu.npu_scatter_nd_update_(
-            cache,
-            indices,
-            values.reshape(values.shape[0], *cache.shape[2:])[valid_rows],
+        block_offsets = torch.remainder(safe_slots, block_size)
+        row_mask = valid.view(-1, *([1] * (values.ndim - 1)))
+        row_zero = cache[0, 0].clone()
+        safe_values = torch.where(row_mask, values, row_zero.unsqueeze(0))
+        row_zero_mask = valid & (slots == 0)
+        update_zero = torch.where(
+            row_zero_mask.view(-1, *([1] * (values.ndim - 1))),
+            values,
+            torch.zeros_like(values),
+        ).sum(dim=0)
+        expected_zero = torch.where(
+            row_zero_mask.any(),
+            update_zero,
+            row_zero,
         )
+        cache[block_ids, block_offsets] = safe_values
+        cache[0, 0].copy_(expected_zero)
 
     def indexer_select_pre_process(
         self,
@@ -675,7 +763,15 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
 
         # The SFA base stores this tensor before post-processing.  Make that
         # write initialize one complete compressor-state row: [K, empty gate].
-        state_k = k_li.to(torch.bfloat16).view(-1, self.head_dim).unsqueeze(1)
+        # The state cache dtype follows the model's KeyPool path: FP32 when
+        # the CANN KeyPool op is used, BF16 otherwise.
+        state_cache = self._indexer_kpool_mla_caches.get("indexer_state")
+        state_dtype = (
+            state_cache.dtype
+            if isinstance(state_cache, torch.Tensor)
+            else torch.bfloat16
+        )
+        state_k = k_li.to(state_dtype).view(-1, self.head_dim).unsqueeze(1)
         return torch.cat([state_k, torch.zeros_like(state_k)], dim=-1), None
 
     def exec_kv(
