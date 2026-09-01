@@ -14,10 +14,13 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+from typing import Any
 
+import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed import get_pcp_group
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
@@ -27,7 +30,6 @@ from vllm.v1.attention.backends.gdn_attn import (
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     PAD_SLOT_ID,
-    compute_causal_conv1d_metadata,
     mamba_get_block_table_tensor,
     split_decodes_and_prefills,
 )
@@ -50,6 +52,71 @@ def _stable_argsort_for_npu(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.dtype == torch.bool:
         tensor = tensor.to(torch.int32)
     return torch.argsort(tensor, stable=True)
+
+
+def _np_to_pinned_tensor(array: np.ndarray) -> torch.Tensor:
+    """Pinned CPU tensor from a numpy array (vllm 0.23.0 compatible)."""
+    return torch.from_numpy(array).pin_memory()
+
+
+def _compute_causal_conv1d_metadata_ascend(
+    query_start_loc_p_cpu: torch.Tensor, *, device: torch.device
+) -> tuple[dict[int, dict[str, Any]], torch.Tensor, torch.Tensor]:
+    """Ascend-safe causal_conv1d metadata (replaces vLLM's version).
+
+    vLLM copies the pinned host tensors into device slices with
+    ``batch_ptr[0:mlist_len].copy_(mlist, non_blocking=True)``; torch_npu
+    fails that with ``rtMemcpyAsync``. Copy each pinned source as a whole
+    tensor first (the ``copy_snapshot_to_gpu`` pattern, which works on
+    torch_npu) and then do the slice write device-to-device.
+    """
+    assert query_start_loc_p_cpu.device.type == "cpu"
+    seqlens = query_start_loc_p_cpu.diff()
+    nums_dict: dict[int, dict[str, Any]] = {}
+    batch_ptr = None
+    token_chunk_offset_ptr = None
+    for BLOCK_M in [8]:  # cover all BLOCK_M values
+        nums = -(-seqlens // BLOCK_M)
+        nums_dict[BLOCK_M] = {}
+        nums_dict[BLOCK_M]["nums"] = nums
+        nums_dict[BLOCK_M]["tot"] = nums.sum().item()
+        mlist = _np_to_pinned_tensor(np.repeat(np.arange(len(nums)), nums))
+        nums_dict[BLOCK_M]["mlist"] = mlist
+        mlist_len = len(nums_dict[BLOCK_M]["mlist"])
+        nums_dict[BLOCK_M]["mlist_len"] = mlist_len
+        MAX_NUM_PROGRAMS = max(1024, mlist_len) * 2
+        offsetlist = []  # type: ignore
+        for idx, num in enumerate(nums):
+            offsetlist.extend(range(num))
+        offsetlist = torch.tensor(offsetlist, dtype=torch.int32, pin_memory=True)
+        nums_dict[BLOCK_M]["offsetlist"] = offsetlist
+
+        if batch_ptr is None:
+            # Update default value after class definition
+            batch_ptr = torch.full(
+                (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
+            )
+            token_chunk_offset_ptr = torch.full(
+                (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
+            )
+        else:
+            if batch_ptr.nelement() < MAX_NUM_PROGRAMS:
+                batch_ptr.resize_(MAX_NUM_PROGRAMS).fill_(PAD_SLOT_ID)
+                assert token_chunk_offset_ptr is not None
+                token_chunk_offset_ptr.resize_(MAX_NUM_PROGRAMS).fill_(PAD_SLOT_ID)
+
+        assert batch_ptr is not None
+        # Whole-tensor H2D (pinned + non_blocking, works on torch_npu) then
+        # device-to-device slice write (no H2D on the slice target).
+        batch_ptr[0:mlist_len].copy_(mlist.to(device=device, non_blocking=True))
+        assert token_chunk_offset_ptr is not None
+        token_chunk_offset_ptr[0:mlist_len].copy_(
+            offsetlist.to(device=device, non_blocking=True)
+        )
+        nums_dict[BLOCK_M]["batch_ptr"] = batch_ptr
+        nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr
+
+    return nums_dict, batch_ptr, token_chunk_offset_ptr
 
 
 def _treat_single_token_prefills_with_state_as_decodes(
@@ -170,10 +237,49 @@ def _compact_empty_segments(cu_seqlens_host, initial_state, device=None):
     return cu_kern, st_kern, keep
 
 
+def _prepare_chunk_indices_device(
+    cu_seqlens: torch.Tensor,
+    chunk_size: int,
+    max_chunks: int,
+) -> torch.Tensor:
+    """Device-side chunk indices with a fixed capacity (no host sync).
+
+    Equivalent to ``prepare_chunk_indices`` for a device input, but the
+    output is padded to a fixed ``[max_chunks, 2]`` shape: the data-length
+    variants (repeat_interleave with tensor repeats, arange of a device
+    scalar) allocate after a host-visible count and deadlock in
+    graph-capture contexts. Kernels bound the real chunk count through
+    ``chunk_offsets``, so the padded tail rows are never read.
+    """
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    chunk_cnts = torch.div(
+        seq_lens + chunk_size - 1,
+        chunk_size,
+        rounding_mode="floor",
+    )
+    chunk_ends = torch.cumsum(chunk_cnts, 0)
+    seg_starts = torch.cat([chunk_cnts.new_zeros(1), chunk_ends])[:-1]
+    # Fixed-shape position sequence 0..max_chunks-1 (no arange of a device
+    # scalar, no repeat_interleave with tensor repeats).
+    positions = torch.cumsum(
+        torch.ones(max_chunks, device=cu_seqlens.device, dtype=cu_seqlens.dtype),
+        0,
+    ) - 1
+    # Segment index per chunk row via a fixed-shape comparison (no
+    # searchsorted dependency); rows past the real chunk count clamp to the
+    # last segment and are never read by the kernels.
+    seg_idx = (
+        chunk_ends.unsqueeze(1) > positions.unsqueeze(0)
+    ).sum(0).clamp_max(seq_lens.numel() - 1)
+    internal = positions - seg_starts[seg_idx]
+    return torch.stack([positions, internal], 1)
+
+
 def _build_non_spec_chunked_prefill_metadata(
     builder,
     cu_seqlens_cpu: torch.Tensor,
     device: torch.device,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> GDNChunkedPrefillMetadata:
     hf_text_config = getattr(builder.vllm_config.model_config, "hf_text_config", None)
     if hf_text_config is not None and hasattr(hf_text_config, "linear_num_value_heads"):
@@ -185,35 +291,99 @@ def _build_non_spec_chunked_prefill_metadata(
     cumsum_chunks = max(1, _GDN_CUMSUM_WORKING_SET // (gdn_num_heads * _GDN_CHUNK_SIZE))
     cumsum_chunk_size = 1 if cumsum_chunks <= 1 else 1 << (cumsum_chunks - 1).bit_length()
 
-    chunk_indices_chunk64 = prepare_chunk_indices(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
-    chunk_offsets_chunk64 = prepare_chunk_offsets(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
-    update_chunk_offsets_chunk64 = prepare_update_chunk_offsets(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
-    final_chunk_indices_chunk64 = prepare_final_chunk_indices(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
-    chunk_indices_large_block = prepare_chunk_indices(
-        cu_seqlens_cpu,
-        _GDN_SOLVE_TRIL_LARGE_BLOCK_SIZE,
-    )
-    block_indices_cumsum = prepare_chunk_indices(cu_seqlens_cpu, cumsum_chunk_size)
+    if cu_seqlens is not None:
+        # Build the device chunk indices on-device from the GPU cu_seqlens:
+        # copying CPU-resident indices up made every prefill build do H2D
+        # copies (sync or async), which fail in graph-capture contexts.
+        # The device outputs are padded to a config-level fixed capacity
+        # (kernels bound the real count through chunk_offsets).
+        max_num_batched_tokens = builder.vllm_config.scheduler_config.max_num_batched_tokens
+        max_num_seqs = builder.vllm_config.scheduler_config.max_num_seqs
+        seq_lens_dev = cu_seqlens[1:] - cu_seqlens[:-1]
+        chunk_cnts_chunk64 = torch.div(
+            seq_lens_dev + _GDN_CHUNK_SIZE - 1,
+            _GDN_CHUNK_SIZE,
+            rounding_mode="floor",
+        )
+        chunk_indices_chunk64 = _prepare_chunk_indices_device(
+            cu_seqlens,
+            _GDN_CHUNK_SIZE,
+            cdiv(max_num_batched_tokens, _GDN_CHUNK_SIZE) + max_num_seqs,
+        )
+        chunk_offsets_chunk64 = torch.cat(
+            [cu_seqlens.new_zeros(1), chunk_cnts_chunk64]
+        ).cumsum(0)
+        update_chunk_offsets_chunk64 = torch.cat(
+            [cu_seqlens.new_zeros(1), chunk_cnts_chunk64 + 1]
+        ).cumsum(0)
+        final_chunk_indices_chunk64 = torch.cumsum(chunk_cnts_chunk64 + 1, 0) - 1
+        chunk_indices_large_block = _prepare_chunk_indices_device(
+            cu_seqlens,
+            _GDN_SOLVE_TRIL_LARGE_BLOCK_SIZE,
+            cdiv(max_num_batched_tokens, _GDN_SOLVE_TRIL_LARGE_BLOCK_SIZE) + max_num_seqs,
+        )
+        block_indices_cumsum = _prepare_chunk_indices_device(
+            cu_seqlens,
+            cumsum_chunk_size,
+            cdiv(max_num_batched_tokens, cumsum_chunk_size) + max_num_seqs,
+        )
+        # Keep mask for the compacted cu_seqlens. When every segment is
+        # non-empty (the common prefill case), pass None so the KDA prefill
+        # path skips its boolean-mask indexing (state_indices[keep]): a
+        # device boolean index is a dynamic-shape op that fails in
+        # graph-capture contexts (rtNotifyRecord). The CPU check is
+        # sync-free; the rare empty-segment case keeps the device mask.
+        keep_cpu = (cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]) > 0
+        if bool(keep_cpu.all()):
+            keep_meta = None
+        else:
+            keep_meta = seq_lens_dev > 0
+    else:
+        chunk_indices_chunk64 = prepare_chunk_indices(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
+        chunk_offsets_chunk64 = prepare_chunk_offsets(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
+        update_chunk_offsets_chunk64 = prepare_update_chunk_offsets(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
+        final_chunk_indices_chunk64 = prepare_final_chunk_indices(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
+        chunk_indices_large_block = prepare_chunk_indices(
+            cu_seqlens_cpu,
+            _GDN_SOLVE_TRIL_LARGE_BLOCK_SIZE,
+        )
+        block_indices_cumsum = prepare_chunk_indices(cu_seqlens_cpu, cumsum_chunk_size)
+        keep_meta = None
 
     cu_seqlens_host = tuple(cu_seqlens_cpu.to(torch.int64).reshape(-1).tolist())
     num_decodes = sum(1 for seq_start, seq_end in zip(cu_seqlens_host, cu_seqlens_host[1:]) if seq_end - seq_start == 1)
+    # Host copies must come from the CPU tensors: deriving them from the
+    # device tensors would add a D2H sync per build.
+    if cu_seqlens is not None:
+        chunk_indices_chunk64_host = tuple(
+            prepare_chunk_indices(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
+            .to(torch.int64)
+            .reshape(-1)
+            .tolist()
+        )
+    else:
+        chunk_indices_chunk64_host = tuple(
+            chunk_indices_chunk64.to(torch.int64).reshape(-1).tolist()
+        )
     # Pre-compute compact cu_seqlens for AscendC kernels so each layer
     # can reuse them instead of calling _compact_empty_segments again.
-    cu_seqlens_kern, _, keep_meta = _compact_empty_segments(cu_seqlens_host, None, device=device)
-    if keep_meta is None:
+    # device=None keeps the computation on CPU (no H2D); the keep mask for
+    # the device side is computed on-device above.
+    cu_seqlens_kern, _, _ = _compact_empty_segments(cu_seqlens_host, None, device=None)
+    if cu_seqlens_kern is None:
         cu_seqlens_kern = None
     else:
         cu_seqlens_kern = tuple(cu_seqlens_kern)
 
     return GDNChunkedPrefillMetadata(
         cu_seqlens_host=cu_seqlens_host,
-        chunk_indices_chunk64_host=tuple(chunk_indices_chunk64.to(torch.int64).reshape(-1).tolist()),
-        chunk_indices_chunk64=chunk_indices_chunk64.to(device=device, non_blocking=True),
-        chunk_offsets_chunk64=chunk_offsets_chunk64.to(device=device, non_blocking=True),
-        update_chunk_offsets_chunk64=update_chunk_offsets_chunk64.to(device=device, non_blocking=True),
-        final_chunk_indices_chunk64=final_chunk_indices_chunk64.to(device=device, non_blocking=True),
-        chunk_indices_large_block=chunk_indices_large_block.to(device=device, non_blocking=True),
-        block_indices_cumsum=block_indices_cumsum.to(device=device, non_blocking=True),
+        chunk_indices_chunk64_host=chunk_indices_chunk64_host,
+        chunk_indices_chunk64=chunk_indices_chunk64.to(device=device),
+        chunk_offsets_chunk64=chunk_offsets_chunk64.to(device=device),
+        update_chunk_offsets_chunk64=update_chunk_offsets_chunk64.to(device=device),
+        final_chunk_indices_chunk64=final_chunk_indices_chunk64.to(device=device),
+        chunk_indices_large_block=chunk_indices_large_block.to(device=device),
+        block_indices_cumsum=block_indices_cumsum.to(device=device),
         num_decodes=num_decodes,
         cu_seqlens_kern=cu_seqlens_kern,
         keep_meta=keep_meta,
@@ -247,18 +417,6 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             pin_memory=device.type != "cpu",
         )
 
-        self.spec_sequence_indices_cpu: torch.Tensor = torch.empty(
-            (sequence_index_capacity,),
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=device.type != "cpu",
-        )
-        self.non_spec_sequence_indices_cpu: torch.Tensor = torch.empty(
-            (sequence_index_capacity,),
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=device.type != "cpu",
-        )
         self.spec_sequence_indices: torch.Tensor = torch.empty(
             (sequence_index_capacity,),
             dtype=torch.int64,
@@ -303,25 +461,24 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
     def _copy_sequence_indices_to_device(
         self,
-        spec_sequence_masks_cpu: torch.Tensor,
+        spec_sequence_masks: torch.Tensor,
         num_spec_decodes: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_reqs = spec_sequence_masks_cpu.numel()
+        num_reqs = spec_sequence_masks.numel()
         num_non_spec_decodes = num_reqs - num_spec_decodes
 
-        spec_indices_cpu = self.spec_sequence_indices_cpu[:num_spec_decodes]
-        spec_indices_cpu.copy_(
-            torch.nonzero(spec_sequence_masks_cpu, as_tuple=True)[0],
-        )
+        # Fixed-shape device-side compaction: nonzero() has a dynamic output
+        # shape and needs a host-visible count to allocate it, so it syncs
+        # even with a device input and fails in graph-capture contexts.
+        # A stable descending argsort (int32, as torch_npu does not support
+        # bool inputs) puts the spec rows first; the head/tail slices are
+        # fixed-shape and copied into the preallocated buffers.
+        order = torch.argsort(spec_sequence_masks.int(), stable=True, descending=True)
         spec_indices = self.spec_sequence_indices[:num_spec_decodes]
-        spec_indices.copy_(spec_indices_cpu, non_blocking=True)
+        spec_indices.copy_(order[:num_spec_decodes])
 
-        non_spec_indices_cpu = self.non_spec_sequence_indices_cpu[:num_non_spec_decodes]
-        non_spec_indices_cpu.copy_(
-            torch.nonzero(~spec_sequence_masks_cpu, as_tuple=True)[0],
-        )
         non_spec_indices = self.non_spec_sequence_indices[:num_non_spec_decodes]
-        non_spec_indices.copy_(non_spec_indices_cpu, non_blocking=True)
+        non_spec_indices.copy_(order[num_spec_decodes:])
 
         return spec_indices, non_spec_indices
 
@@ -491,6 +648,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         num_accepted_tokens: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
+        num_decode_draft_tokens: torch.Tensor | None = None,
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
         m = _treat_single_token_prefills_with_state_as_decodes(common_attn_metadata)
@@ -533,9 +691,26 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 spec_sequence_masks_cpu = None
             else:
                 spec_sequence_masks = self.spec_sequence_masks[:num_reqs]
-                spec_sequence_masks.copy_(spec_sequence_masks_cpu, non_blocking=True)
+                # Build the device mask from the GPU snapshot directly: the
+                # previous CPU->device copy_ made every spec-decode build do
+                # an H2D copy, which fails in graph-capture contexts.
+                if num_decode_draft_tokens is not None:
+                    torch.ge(
+                        num_decode_draft_tokens[:num_reqs],
+                        0,
+                        out=spec_sequence_masks,
+                    )
+                else:
+                    # Fallback for callers without a GPU snapshot: the CPU
+                    # source is pinned, so non_blocking is legal here (the
+                    # capture-context problem is solved by the on-device
+                    # path above, not by dropping non_blocking).
+                    spec_sequence_masks.copy_(
+                        spec_sequence_masks_cpu,
+                        non_blocking=True,
+                    )
                 spec_sequence_indices, non_spec_sequence_indices = self._copy_sequence_indices_to_device(
-                    spec_sequence_masks_cpu,
+                    spec_sequence_masks,
                     num_spec_decodes,
                 )
 
@@ -691,10 +866,12 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 prefill_state_indices = non_spec_state_indices_tensor
 
             assert prefill_query_start_loc_cpu is not None
+            assert prefill_query_start_loc is not None
             non_spec_chunked_prefill_metadata = _build_non_spec_chunked_prefill_metadata(
                 self,
                 prefill_query_start_loc_cpu,
                 query_start_loc.device,
+                cu_seqlens=prefill_query_start_loc,
             )
             # Preserve upstream GDNAttentionMetadata fields for callers that
             # still use the chunk_gated_delta_rule API directly.
@@ -870,7 +1047,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 non_spec_sequence_indices,
             )
             assert non_spec_query_start_loc_cpu is not None
-        nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
+        nums_dict, batch_ptr, token_chunk_offset_ptr = _compute_causal_conv1d_metadata_ascend(
             non_spec_query_start_loc_cpu,
             device=query_start_loc.device,
         )

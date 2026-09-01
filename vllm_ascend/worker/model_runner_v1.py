@@ -3195,6 +3195,10 @@ class NPUModelRunner(GPUModelRunner):
                 extra_attn_metadata_args = dict(
                     num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
                     num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[:num_reqs_padded],
+                    # GPU snapshot so GDN can build the spec-sequence mask
+                    # on-device instead of an H2D copy (H2D fails in
+                    # graph-capture contexts).
+                    num_decode_draft_tokens=self.num_decode_draft_tokens.gpu[:num_reqs_padded],
                 )
 
             if isinstance(builder, (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder)):
