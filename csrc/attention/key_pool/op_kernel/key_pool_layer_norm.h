@@ -148,9 +148,15 @@ __aicore__ inline void TransformKeyCacheBeforePool(
             const uint64_t logicalPos = startPos + sIdx;
             const uint64_t logicalBlock = logicalPos / constInfo.blockSize;
             const uint64_t blockOffset = logicalPos % constInfo.blockSize;
-            const uint64_t physicalBlock = blockTable.GetValue(blockTableOffset + logicalBlock);
+            if (logicalBlock >= constInfo.maxBlockNumPerBatch) {
+                continue;
+            }
+            const int32_t physicalBlock = blockTable.GetValue(blockTableOffset + logicalBlock);
+            if (physicalBlock < 0) {
+                continue;
+            }
             const uint64_t stateOffset =
-                physicalBlock * constInfo.stateCacheStrideDim0 +
+                static_cast<uint64_t>(physicalBlock) * constInfo.stateCacheStrideDim0 +
                 blockOffset * STATE_INTERLEAVE_FACTOR * hiddenDim;
 
             LocalTensor<float> input = inputQue.template AllocTensor<float>();

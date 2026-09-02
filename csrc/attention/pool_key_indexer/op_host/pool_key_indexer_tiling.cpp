@@ -19,22 +19,6 @@
 using namespace ge;
 namespace optiling {
 
-// Sequence-metadata inputs may be host-visible in standalone host tests, but
-// the production eager/graph path passes ordinary device tensors.
-// GetData() 对 device tensor 同样返回非空指针(device 地址), 在 host 侧解引用会
-// 段错误, 因此取值前必须先确认数据位于 host。仅以下两种来源允许读取值:
-//   - CPU tensor inputs: host pointer, kOnHost/kFollowing.
-// device tensor(GE 图模式 / eager NPU 输入)跳过 host 侧值
-// 校验, 由 kernel 运行期从 GM 读值(GetActualSeqLen), 与既有 GE 图模式口径一致。
-static bool IsHostVisibleValue(const gert::Tensor *tensor)
-{
-    if (tensor == nullptr) {
-        return false;
-    }
-    const auto placement = tensor->GetPlacement();
-    return (placement == gert::kOnHost) || (placement == gert::kFollowing);
-}
-
 static uint32_t AlignUp(uint32_t val, uint32_t align)
 {
     return (align == 0) ? val : (val + align - 1) / align * align;
@@ -110,9 +94,9 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
     }
 
     // ---- 2/3. act_seq / block_table presence rules ----
-    const gert::Tensor *actSeqQ = context_->GetOptionalInputTensor(PKI_ACTUAL_SEQ_Q_INDEX);
-    const gert::Tensor *actSeqK = context_->GetOptionalInputTensor(PKI_ACTUAL_SEQ_K_INDEX);
-    const gert::Tensor *blockTable = context_->GetOptionalInputTensor(PKI_BLOCK_TABLE_INDEX);
+    const gert::StorageShape *actSeqQ = context_->GetOptionalInputShape(PKI_ACTUAL_SEQ_Q_INDEX);
+    const gert::StorageShape *actSeqK = context_->GetOptionalInputShape(PKI_ACTUAL_SEQ_K_INDEX);
+    const gert::StorageShape *blockTable = context_->GetOptionalInputShape(PKI_BLOCK_TABLE_INDEX);
 
     if (info.pageAttention) {
         // PA scenario: actual_seq_k and block_table must be non-null
@@ -194,15 +178,9 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
     info.keyDtype = context_->GetInputDesc(PKI_POOL_KEY_INDEX)->GetDataType();
     info.weightsDtype = context_->GetInputDesc(PKI_WEIGHTS_INDEX)->GetDataType();
 
-    // ---- Required inputs non-null and non-empty ----
-    const gert::Tensor *queryTensor = context_->GetInputTensor(PKI_QUERY_INDEX);
-    OP_CHECK_NULL_WITH_CONTEXT(context_, queryTensor);
-    const gert::Tensor *poolKeyTensor = context_->GetInputTensor(PKI_POOL_KEY_INDEX);
-    OP_CHECK_NULL_WITH_CONTEXT(context_, poolKeyTensor);
-    const gert::Tensor *weightsTensor = context_->GetInputTensor(PKI_WEIGHTS_INDEX);
-    OP_CHECK_NULL_WITH_CONTEXT(context_, weightsTensor);
-    const gert::Tensor *poolTailKTensor = context_->GetInputTensor(PKI_POOL_TAIL_K_INDEX);
-    OP_CHECK_NULL_WITH_CONTEXT(context_, poolTailKTensor);
+    // ---- Required inputs non-empty ----
+    // Tiling consumes descriptors and shapes only. Runtime sequence metadata
+    // remains an ordinary device tensor and is read by the kernel from GM.
     OP_CHECK_IF(queryShape->GetStorageShape().GetShapeSize() == 0,
                 OP_LOGE(context_, "query must not be empty tensor"),
                 return ge::GRAPH_FAILED);
@@ -257,8 +235,8 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
     }
 
     // ---- quantMode-driven dtype + descale validation ----
-    const gert::Tensor *qDescaleTensor = context_->GetOptionalInputTensor(PKI_Q_DESCALE_INDEX);
-    const gert::Tensor *kDescaleTensor = context_->GetOptionalInputTensor(PKI_K_DESCALE_INDEX);
+    const gert::StorageShape *qDescaleTensor = context_->GetOptionalInputShape(PKI_Q_DESCALE_INDEX);
+    const gert::StorageShape *kDescaleTensor = context_->GetOptionalInputShape(PKI_K_DESCALE_INDEX);
 
     // ---- FP8 dequant kernel path not yet implemented: fail fast ----
     // kernel 侧(arch35)当前不消费 q_descale/k_descale(Mmad 直接用 fp8 裸数据计算,
@@ -457,8 +435,6 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
     }
     // block_table for PA
     if (info.pageAttention) {
-        const gert::Tensor *blockTableTensor = context_->GetOptionalInputTensor(PKI_BLOCK_TABLE_INDEX);
-        OP_CHECK_NULL_WITH_CONTEXT(context_, blockTableTensor);
         const gert::StorageShape *btShape = context_->GetOptionalInputShape(PKI_BLOCK_TABLE_INDEX);
         OP_CHECK_NULL_WITH_CONTEXT(context_, btShape);
         OP_CHECK_IF(btShape->GetStorageShape().GetDimNum() != 2,
@@ -521,10 +497,8 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
 
     // actual_seq_q shape (non-null, TND only): (B,) 1D prefix sum
     {
-        const gert::Tensor *actSeqQT = context_->GetOptionalInputTensor(PKI_ACTUAL_SEQ_Q_INDEX);
-        if (actSeqQT != nullptr) {
-            const gert::StorageShape *asqShape = context_->GetOptionalInputShape(PKI_ACTUAL_SEQ_Q_INDEX);
-            OP_CHECK_NULL_WITH_CONTEXT(context_, asqShape);
+        const gert::StorageShape *asqShape = context_->GetOptionalInputShape(PKI_ACTUAL_SEQ_Q_INDEX);
+        if (asqShape != nullptr) {
             OP_CHECK_IF(asqShape->GetStorageShape().GetDimNum() != 1,
                         OP_LOGE(context_, "actual_seq_q must be 1D, got %zu",
                                 asqShape->GetStorageShape().GetDimNum()),
@@ -534,10 +508,8 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
 
     // actual_seq_k shape (non-null, TND/PA): (B,) 1D
     {
-        const gert::Tensor *actSeqKT = context_->GetOptionalInputTensor(PKI_ACTUAL_SEQ_K_INDEX);
-        if (actSeqKT != nullptr) {
-            const gert::StorageShape *askShape = context_->GetOptionalInputShape(PKI_ACTUAL_SEQ_K_INDEX);
-            OP_CHECK_NULL_WITH_CONTEXT(context_, askShape);
+        const gert::StorageShape *askShape = context_->GetOptionalInputShape(PKI_ACTUAL_SEQ_K_INDEX);
+        if (askShape != nullptr) {
             OP_CHECK_IF(askShape->GetStorageShape().GetDimNum() != 1,
                         OP_LOGE(context_, "actual_seq_k must be 1D, got %zu",
                                 askShape->GetStorageShape().GetDimNum()),
@@ -712,93 +684,29 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
         }
     }
 
-    // ---- Value-range validation when input data is host-visible ----
+    // ---- Runtime-metadata shape validation ----
+    // Do not call Tensor::GetData() here. ValueDepend is intentionally not
+    // used because eager and graph replay must both pass stable device tensor
+    // addresses to the kernel. A non-null GetData() result may itself be a GM
+    // address and is not safe to dereference on the host.
 
-    // #5/#6: actual_seq_q prefix-sum (TND): determines B, validates non-decreasing + last==T1
+    // actual_seq_q (TND) determines B from its static element count.
     if (info.layoutQ == PkiDataLayout::TND) {
-        const gert::Tensor *asqTensor = context_->GetOptionalInputTensor(PKI_ACTUAL_SEQ_Q_INDEX);
-        OP_CHECK_NULL_WITH_CONTEXT(context_, asqTensor);
-        // B is derived from the shape (element count), available in both eager and
-        // GE graph mode.
-        int64_t asqCount = asqTensor->GetShapeSize();
+        const gert::StorageShape *asqShape = context_->GetOptionalInputShape(PKI_ACTUAL_SEQ_Q_INDEX);
+        OP_CHECK_NULL_WITH_CONTEXT(context_, asqShape);
+        int64_t asqCount = asqShape->GetStorageShape().GetShapeSize();
         info.bSize = static_cast<uint32_t>(asqCount);
-        const int64_t *asqData = IsHostVisibleValue(asqTensor) ? asqTensor->GetData<int64_t>() : nullptr;
-        if (asqData == nullptr) {
-            // Device tensor(GE 图模式 / eager NPU 输入): tiling 期值不可见。
-            // 跳过 host 侧值校验; kernel 运行期从 GM 读前缀和(GetActualSeqLen)。
-            OP_LOGI(context_, "TND: actual_seq_q data is not host-visible (device tensor), skip value validation");
-        } else {
-            int64_t prev = 0;
-            for (int64_t i = 0; i < asqCount; ++i) {
-                OP_CHECK_IF(asqData[i] < 0,
-                            OP_LOGE(context_, "actual_seq_q[%ld]=%ld must be >= 0", i, asqData[i]),
-                            return ge::GRAPH_FAILED);
-                OP_CHECK_IF(asqData[i] < prev,
-                            OP_LOGE(context_, "actual_seq_q must be non-decreasing, [%ld]=%ld < prev=%ld",
-                                    i, asqData[i], prev),
-                            return ge::GRAPH_FAILED);
-                prev = asqData[i];
-            }
-            if (asqCount > 0) {
-                OP_CHECK_IF(asqData[asqCount - 1] != static_cast<int64_t>(info.s1Size),
-                            OP_LOGE(context_, "actual_seq_q last(%ld) must equal query T1(%u)",
-                                    asqData[asqCount - 1], info.s1Size),
-                            return ge::GRAPH_FAILED);
-            }
-        }
     }
 
-    // #5: actual_seq_k values: TND prefix-sum / PA non-prefix-sum
+    // actual_seq_k: only its B-sized shape is needed by tiling. Prefix sums
+    // and PA lengths are consumed from GM by GetActualSeqLen in the kernel.
     if (info.layoutK == PkiDataLayout::TND || info.pageAttention) {
-        const gert::Tensor *askTensor = context_->GetOptionalInputTensor(PKI_ACTUAL_SEQ_K_INDEX);
-        OP_CHECK_NULL_WITH_CONTEXT(context_, askTensor);
-        const int64_t *askData = IsHostVisibleValue(askTensor) ? askTensor->GetData<int64_t>() : nullptr;
-        int64_t askCount = askTensor->GetShapeSize();
+        const gert::StorageShape *askShape = context_->GetOptionalInputShape(PKI_ACTUAL_SEQ_K_INDEX);
+        OP_CHECK_NULL_WITH_CONTEXT(context_, askShape);
+        int64_t askCount = askShape->GetStorageShape().GetShapeSize();
         OP_CHECK_IF(static_cast<uint32_t>(askCount) != info.bSize,
                     OP_LOGE(context_, "actual_seq_k count(%ld) must equal B(%u)", askCount, info.bSize),
                     return ge::GRAPH_FAILED);
-
-        if (askData == nullptr) {
-            // Device tensor(GE 图模式 / eager NPU 输入): tiling 期值不可见。
-            // 跳过 host 侧值校验; kernel 运行期从 GM 读值(GetActualSeqLen)。
-            // PA maxBlockNumPerSeq 检查同样推迟(block_table 上界由 kernel 寻址保证)。
-            OP_LOGI(context_, "actual_seq_k data is not host-visible (device tensor), skip value validation");
-        } else if (info.layoutK == PkiDataLayout::TND) {
-            int64_t prev = 0;
-            for (int64_t i = 0; i < askCount; ++i) {
-                OP_CHECK_IF(askData[i] < 0,
-                            OP_LOGE(context_, "actual_seq_k[%ld]=%ld must be >= 0", i, askData[i]),
-                            return ge::GRAPH_FAILED);
-                OP_CHECK_IF(askData[i] < prev,
-                            OP_LOGE(context_, "actual_seq_k must be non-decreasing, [%ld]=%ld < prev=%ld",
-                                    i, askData[i], prev),
-                            return ge::GRAPH_FAILED);
-                prev = askData[i];
-            }
-            if (askCount > 0) {
-                OP_CHECK_IF(askData[askCount - 1] != static_cast<int64_t>(keyShape->GetStorageShape().GetDim(0)),
-                            OP_LOGE(context_, "actual_seq_k last(%ld) must equal key T2(%ld)",
-                                    askData[askCount - 1], keyShape->GetStorageShape().GetDim(0)),
-                            return ge::GRAPH_FAILED);
-            }
-        } else {
-            // PA: non-prefix-sum, each value is current batch token count
-            uint32_t maxTokens = 0;
-            for (int64_t i = 0; i < askCount; ++i) {
-                OP_CHECK_IF(askData[i] < 0,
-                            OP_LOGE(context_, "actual_seq_k[%ld]=%ld must be >= 0", i, askData[i]),
-                            return ge::GRAPH_FAILED);
-                if (static_cast<uint32_t>(askData[i]) > maxTokens) {
-                    maxTokens = static_cast<uint32_t>(askData[i]);
-                }
-            }
-            // #3: block_table dim(1) >= maxBlockNumPerSeq
-            uint32_t maxBlockNumPerSeq = CeilDiv(maxTokens, info.blockSize);
-            OP_CHECK_IF(info.maxBlockNumPerBatch < maxBlockNumPerSeq,
-                        OP_LOGE(context_, "block_table dim(1)=%u must be >= maxBlockNumPerSeq=%u",
-                                info.maxBlockNumPerBatch, maxBlockNumPerSeq),
-                        return ge::GRAPH_FAILED);
-        }
     }
 
     // #2: block_table dim(0) == B (PA, after B determined)
@@ -811,24 +719,14 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
                     return ge::GRAPH_FAILED);
     }
 
-    // #4: pool_tail_k values: each must be in [0, pool_size-1]
+    // pool_tail_k: shape only; values are runtime GM data.
     {
-        const gert::Tensor *ptkTensor = context_->GetInputTensor(PKI_POOL_TAIL_K_INDEX);
-        OP_CHECK_NULL_WITH_CONTEXT(context_, ptkTensor);
-        OP_CHECK_IF(static_cast<uint32_t>(ptkTensor->GetShapeSize()) != info.bSize,
+        const gert::StorageShape *ptkShape = context_->GetInputShape(PKI_POOL_TAIL_K_INDEX);
+        OP_CHECK_NULL_WITH_CONTEXT(context_, ptkShape);
+        OP_CHECK_IF(static_cast<uint32_t>(ptkShape->GetStorageShape().GetShapeSize()) != info.bSize,
                     OP_LOGE(context_, "pool_tail_k count(%ld) must equal B(%u)",
-                            ptkTensor->GetShapeSize(), info.bSize),
+                            ptkShape->GetStorageShape().GetShapeSize(), info.bSize),
                     return ge::GRAPH_FAILED);
-        const int64_t *ptkData = IsHostVisibleValue(ptkTensor) ? ptkTensor->GetData<int64_t>() : nullptr;
-        if (ptkData != nullptr) {
-            int64_t ptkCount = ptkTensor->GetShapeSize();
-            for (int64_t i = 0; i < ptkCount; ++i) {
-                OP_CHECK_IF(ptkData[i] < 0 || ptkData[i] >= static_cast<int64_t>(info.poolSize),
-                            OP_LOGE(context_, "pool_tail_k[%ld]=%ld must be in [0, %u)",
-                                    i, ptkData[i], info.poolSize),
-                            return ge::GRAPH_FAILED);
-            }
-        }
     }
 
     // Validate pool_key contiguity: PA allows 0-axis non-contiguous, BSND/TND require fully contiguous

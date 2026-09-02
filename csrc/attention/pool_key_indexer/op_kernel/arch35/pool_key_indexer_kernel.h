@@ -81,7 +81,6 @@ public:
     static constexpr uint32_t S2_BASE_SIZE = 128;
     static constexpr uint32_t HEAD_DIM = 128;
     static constexpr uint32_t K_HEAD_NUM = 1;
-    static constexpr uint32_t GM_ALIGN_BYTES = 512;
 
     static constexpr int64_t LD_PREFETCH_LEN = 2;
 
@@ -387,8 +386,10 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::DealActSeqLenIsZero(uint32_t b
         // poolSize>1 时 indices 输出行宽为 outputLen(见 CalcRunInfo 中 idxOutStride 说明)
         uint32_t idxOutStride = (constInfo.poolSize > 1) ?
             (constInfo.sparseCount * constInfo.poolSize + constInfo.poolSize - 1) : constInfo.sparseCount;
+        int32_t poolTailK = hasPoolTailK_
+                                ? static_cast<int32_t>(poolTailKGm_.GetValue(bIdx))
+                                : 0;
         if (constInfo.outputLayout == PkiLayout::TND) {
-            uint32_t tSize = static_cast<uint32_t>(actualSeqLengthsGmQ.GetValue(constInfo.batchSize - 1));
             uint32_t tBase = bIdx == 0 ? 0 : static_cast<uint32_t>(actualSeqLengthsGmQ.GetValue(bIdx - 1));
             uint32_t s1Count = tempLoopInfo.actS1Size;
 
@@ -397,6 +398,10 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::DealActSeqLenIsZero(uint32_t b
                     (tBase + s1Idx) * constInfo.kHeadNum * idxOutStride + // T轴、s1轴偏移
                     n2Idx * idxOutStride;                                 // N2轴偏移
                 vectorService.CleanInvalidOutput(indiceOutOffset);
+                vectorService.WriteTailOnly(
+                    indiceOutOffset, poolTailK,
+                    static_cast<int32_t>(tempLoopInfo.actS2SizeOrig), s1Idx,
+                    tempLoopInfo.actS1Size);
             }
         } else if (constInfo.outputLayout == PkiLayout::BSND) {
             for (uint32_t s1Idx = s1Start; s1Idx < constInfo.qSeqSize; s1Idx++) {
@@ -405,6 +410,12 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::DealActSeqLenIsZero(uint32_t b
                                            s1Idx * constInfo.kHeadNum * idxOutStride + // B轴、S1轴偏移
                                            n2Idx * idxOutStride;                       // N2轴偏移
                 vectorService.CleanInvalidOutput(indiceOutOffset);
+                if (s1Idx < tempLoopInfo.actS1Size) {
+                    vectorService.WriteTailOnly(
+                        indiceOutOffset, poolTailK,
+                        static_cast<int32_t>(tempLoopInfo.actS2SizeOrig),
+                        s1Idx, tempLoopInfo.actS1Size);
+                }
             }
         }
     }
@@ -619,41 +630,46 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::ProcessInvalid()
 {
     if ASCEND_IS_AIV {
         uint32_t aivCoreNum = GetBlockNum() * 2; // 2 means c:v = 1:2
-        // poolSize>1 时 indices 输出行宽为 outputLen(见 CalcRunInfo 中 idxOutStride 说明)
-        uint32_t idxOutStride = (constInfo.poolSize > 1) ?
-            (constInfo.sparseCount * constInfo.poolSize + constInfo.poolSize - 1) : constInfo.sparseCount;
-        uint64_t totalOutputSize =
-            constInfo.batchSize * constInfo.qSeqSize * constInfo.kHeadNum * idxOutStride;
-        uint64_t singleCoreSize =
-            PkiCommon::Align((totalOutputSize + aivCoreNum - 1) / aivCoreNum, GM_ALIGN_BYTES / sizeof(OUT_T));
-        uint64_t baseSize = tmpBlockIdx * singleCoreSize;
-        if (baseSize < totalOutputSize) {
-            uint64_t dealSize =
-                (baseSize + singleCoreSize <= totalOutputSize) ? singleCoreSize : totalOutputSize - baseSize;
-            GlobalTensor<OUT_T> output = indiceOutGm[baseSize];
-            AscendC::InitGlobalMemory(output, dealSize, constInfo.INVALID_IDX);
-        }
-        if (constInfo.returnValue) {
-            // values 输出行宽恒为 sparseCount(与 indices 的 outputLen 行宽不同),
-            // 不可复用 indices 的 baseSize/dealSize(poolSize>1 时二者总大小不同,
-            // 复用会越出 values 张量边界), 需按自身总大小独立切分清理
-            uint64_t totalValueSize =
-                constInfo.batchSize * constInfo.qSeqSize * constInfo.kHeadNum * constInfo.sparseCount;
-            uint64_t singleCoreValueSize =
-                PkiCommon::Align((totalValueSize + aivCoreNum - 1) / aivCoreNum, GM_ALIGN_BYTES / sizeof(uint32_t));
-            uint64_t valueBase = tmpBlockIdx * singleCoreValueSize;
-            if (valueBase < totalValueSize) {
-                uint64_t valueDealSize =
-                    (valueBase + singleCoreValueSize <= totalValueSize) ? singleCoreValueSize :
-                                                                          totalValueSize - valueBase;
-                event_t eventIDMTE3ToV = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
-                SetFlag<HardEvent::MTE3_V>(eventIDMTE3ToV);
-                WaitFlag<HardEvent::MTE3_V>(eventIDMTE3ToV);
-
-                GlobalTensor<uint32_t> valueOutGmTmp;
-                valueOutGmTmp.SetGlobalBuffer((__gm__ uint32_t *)valueOutGm.GetPhyAddr());
-                GlobalTensor<uint32_t> valueOut = valueOutGmTmp[valueBase];
-                AscendC::InitGlobalMemory(valueOut, valueDealSize, constInfo.INVALID_VAL);
+        uint32_t idxOutStride = (constInfo.poolSize > 1)
+                                    ? constInfo.sparseCount * constInfo.poolSize +
+                                          constInfo.poolSize - 1
+                                    : constInfo.sparseCount;
+        for (uint32_t bIdx = 0; bIdx < constInfo.batchSize; ++bIdx) {
+            uint32_t actS1Size = 0;
+            uint32_t actS2Size = 0;
+            uint32_t actS2SizeOrig = 0;
+            GetS1S2ActualSeqLen(bIdx, actS1Size, actS2Size,
+                               actS2SizeOrig);
+            uint32_t qBase = 0;
+            if constexpr (LAYOUT_T == PkiLayout::TND) {
+                qBase = bIdx == 0
+                            ? 0
+                            : static_cast<uint32_t>(
+                                  actualSeqLengthsGmQ.GetValue(bIdx - 1));
+            } else {
+                qBase = bIdx * constInfo.qSeqSize;
+            }
+            int32_t poolTailK = hasPoolTailK_
+                                    ? static_cast<int32_t>(
+                                          poolTailKGm_.GetValue(bIdx))
+                                    : 0;
+            for (uint32_t s1Idx = 0; s1Idx < actS1Size; ++s1Idx) {
+                for (uint32_t n2Idx = 0; n2Idx < constInfo.kHeadNum;
+                     ++n2Idx) {
+                    uint64_t row =
+                        static_cast<uint64_t>(qBase + s1Idx) *
+                            constInfo.kHeadNum +
+                        n2Idx;
+                    if (row % aivCoreNum != tmpBlockIdx) {
+                        continue;
+                    }
+                    int64_t idxOutBase = row * idxOutStride;
+                    vectorService.CleanInvalidOutput(idxOutBase);
+                    vectorService.WriteTailOnly(
+                        idxOutBase, poolTailK,
+                        static_cast<int32_t>(actS2SizeOrig), s1Idx,
+                        actS1Size);
+                }
             }
         }
     }

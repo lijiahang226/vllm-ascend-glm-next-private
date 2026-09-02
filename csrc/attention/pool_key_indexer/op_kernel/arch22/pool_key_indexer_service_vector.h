@@ -78,6 +78,9 @@ public:
                                                 GlobalTensor<int64_t> vec1ParamGm, GlobalTensor<W_T> weightsGm,
                                                 GlobalTensor<int32_t> indiceOutGm, GlobalTensor<float> valueOutGm);
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
+    __aicore__ inline void WriteTailOnly(int64_t idxOutBase, int32_t poolTailK,
+                                        int32_t lOrig, uint32_t curS1Idx,
+                                        uint32_t curS1Size);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
     __aicore__ inline void InitLDBuffers(TPipe *pipe);
@@ -351,12 +354,15 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ExpandAndAppendIndices(
     // 尾块可见 token 数
     int32_t visibleTailK = 0;
     if (poolTailK > 0) {
+        int32_t maxTailK = PkiCommon::Min(
+            poolTailK, static_cast<int32_t>(poolSize - 1));
         if (constInfo_.maskMode == 0) {
-            visibleTailK = poolTailK;
+            visibleTailK = maxTailK;
         } else {
             int32_t globalPosQ = L_orig - static_cast<int32_t>(curS1Size) + static_cast<int32_t>(curS1Idx);
+            int32_t tailStart = L_orig - poolTailK;
             visibleTailK = PkiCommon::Max(0,
-                                          PkiCommon::Min(poolTailK, globalPosQ - static_cast<int32_t>(topk) + 1));
+                                          PkiCommon::Min(maxTailK, globalPosQ - tailStart + 1));
         }
     }
 
@@ -442,6 +448,38 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ExpandAndAppendIndices(
         DataCopyPad(idxOutGm[idxOutBase + topk], tokenIndices,
                     {1, static_cast<uint16_t>(tailLen * sizeof(int32_t)), 0, 0});
     }
+}
+
+template <typename LIT>
+__aicore__ inline void PoolKeyIndexerServiceVector<LIT>::WriteTailOnly(
+    int64_t idxOutBase, int32_t poolTailK, int32_t lOrig,
+    uint32_t curS1Idx, uint32_t curS1Size)
+{
+    if (poolSize_ <= 1 || poolTailK <= 0) {
+        return;
+    }
+    int32_t globalPosQ = lOrig - static_cast<int32_t>(curS1Size) +
+                         static_cast<int32_t>(curS1Idx);
+    int32_t tailStart = lOrig - poolTailK;
+    int32_t maxTailK = PkiCommon::Min(
+        poolTailK, static_cast<int32_t>(poolSize_ - 1));
+    int32_t visibleTailK = PkiCommon::Max(
+        0, PkiCommon::Min(maxTailK, globalPosQ - tailStart + 1));
+    if (visibleTailK <= 0) {
+        return;
+    }
+
+    uint32_t tailLen = poolSize_ - 1;
+    Duplicate<int32_t>(expandOutLocal_, -1,
+                       PkiCommon::Align(tailLen, (uint32_t)8));
+    VToSSync();
+    for (int32_t t = 0; t < visibleTailK; ++t) {
+        expandOutLocal_.SetValue(static_cast<uint32_t>(t), tailStart + t);
+    }
+    SToMTE3Sync();
+    DataCopyPad(indiceOutGm[idxOutBase + constInfo_.sparseCount * poolSize_],
+                expandOutLocal_,
+                {1, static_cast<uint16_t>(tailLen * sizeof(int32_t)), 0, 0});
 }
 
 template <typename LIT>

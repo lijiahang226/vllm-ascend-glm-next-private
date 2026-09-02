@@ -111,6 +111,86 @@ std::tuple<at::Tensor, at::Tensor> npu_pool_key_indexer(
     std::string query_layout_str = std::string(layout_q);
     std::string key_layout_str = std::string(layout_k);
 
+    TORCH_CHECK(query_layout_str == "BSND" || query_layout_str == "TND",
+                "layout_q must be BSND or TND, got ", query_layout_str);
+    TORCH_CHECK(key_layout_str == "BSND" || key_layout_str == "TND" ||
+                    key_layout_str == "PA_BBND",
+                "layout_k must be BSND, TND or PA_BBND, got ",
+                key_layout_str);
+
+    auto check_same_device = [&query](const at::Tensor& tensor,
+                                      const char* name) {
+        TORCH_CHECK(tensor.device() == query.device(), name,
+                    " must be on the same device as query (", query.device(),
+                    "), got ", tensor.device());
+    };
+    check_same_device(pool_key, "pool_key");
+    check_same_device(weights, "weights");
+    check_same_device(pool_tail_k, "pool_tail_k");
+    TORCH_CHECK(query.scalar_type() == at::kBFloat16 ||
+                    query.scalar_type() == at::kHalf,
+                "query must be BF16 or FP16");
+    TORCH_CHECK(pool_key.scalar_type() == query.scalar_type() &&
+                    weights.scalar_type() == query.scalar_type(),
+                "pool_key and weights dtype must match query");
+    TORCH_CHECK(pool_tail_k.scalar_type() == at::kLong &&
+                    pool_tail_k.dim() == 1,
+                "pool_tail_k must be rank-1 INT64");
+
+    if (actual_seq_q.has_value()) {
+        check_same_device(*actual_seq_q, "actual_seq_q");
+        TORCH_CHECK(actual_seq_q->scalar_type() == at::kLong &&
+                        actual_seq_q->dim() == 1,
+                    "actual_seq_q must be rank-1 INT64");
+    }
+    if (actual_seq_k.has_value()) {
+        check_same_device(*actual_seq_k, "actual_seq_k");
+        TORCH_CHECK(actual_seq_k->scalar_type() == at::kLong &&
+                        actual_seq_k->dim() == 1,
+                    "actual_seq_k must be rank-1 INT64");
+    }
+    if (block_table.has_value()) {
+        check_same_device(*block_table, "block_table");
+        TORCH_CHECK(block_table->scalar_type() == at::kInt &&
+                        block_table->dim() == 2,
+                    "block_table must be rank-2 INT32");
+    }
+    if (q_descale.has_value()) {
+        check_same_device(*q_descale, "q_descale");
+    }
+    if (k_descale.has_value()) {
+        check_same_device(*k_descale, "k_descale");
+    }
+
+    const bool page_attention = key_layout_str == "PA_BBND";
+    if (query_layout_str == "TND") {
+        TORCH_CHECK(actual_seq_q.has_value(),
+                    "actual_seq_q is required for TND query layout");
+    } else {
+        TORCH_CHECK(!actual_seq_q.has_value(),
+                    "actual_seq_q must be None for BSND query layout");
+    }
+    if (key_layout_str == "TND" || page_attention) {
+        TORCH_CHECK(actual_seq_k.has_value(),
+                    "actual_seq_k is required for TND/PA key layout");
+    }
+    TORCH_CHECK(page_attention == block_table.has_value(),
+                "block_table must be provided exactly for PA_BBND layout");
+
+    int64_t batch_size = query_layout_str == "BSND"
+                             ? query.size(0)
+                             : actual_seq_q->numel();
+    TORCH_CHECK(pool_tail_k.numel() == batch_size,
+                "pool_tail_k length must equal batch size");
+    if (actual_seq_k.has_value()) {
+        TORCH_CHECK(actual_seq_k->numel() == batch_size,
+                    "actual_seq_k length must equal batch size");
+    }
+    if (block_table.has_value()) {
+        TORCH_CHECK(block_table->size(0) == batch_size,
+                    "block_table rows must equal batch size");
+    }
+
     std::tuple<at::Tensor, at::Tensor> pool_key_indexer_output =
         ConstructPoolKeyIndexerOutputTensor(query, topk, pool_size,
                                             query_layout_str, return_value);
