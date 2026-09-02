@@ -33,6 +33,7 @@ from vllm_ascend.attention.indexer_kpool_mla_v1 import (
     AscendIndexerKPoolMLAMetadataBuilder,
     AscendIndexerKPoolStateBackend,
     AscendIndexerKPoolStateMetadataBuilder,
+    KEY_POOL_INVALID_BLOCK_ID,
 )
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
 from vllm_ascend.core.kv_cache_interface import (
@@ -890,6 +891,7 @@ def test_glm5_target_allocator_uses_twelve_large_and_eleven_small_tensors():
     assert config.has_mamba_layers
     assert config.needs_kv_cache_zeroing
     assert len(tensors) == 23
+    assert all(tensor.size % num_blocks == 0 for tensor in tensors)
     assert all(tensor.size == layout.main_page_size * 3 for tensor in tensors[:12])
     assert all(tensor.size == layout.small_page_size * 3 for tensor in tensors[12:])
     assert tensors[0].shared_by == [
@@ -924,6 +926,7 @@ def test_glm5_combined_layout_adds_mtp_indexer_state_small_page():
 
     assert num_blocks == 2
     assert len(tensors) == 24
+    assert all(tensor.size % num_blocks == 0 for tensor in tensors)
     assert tensors[11].shared_by == [
         "model.layers.45.self_attn.attn",
         "model.layers.44.mamba",
@@ -932,6 +935,10 @@ def test_glm5_combined_layout_adds_mtp_indexer_state_small_page():
         "model.layers.45.self_attn.indexer.k_cache",
         "model.layers.45.self_attn.indexer.compressor.state_cache",
     ]
+    assert all(
+        tensor.size == layout.small_page_size * num_blocks
+        for tensor in tensors[layout.main_slot_count :]
+    )
 
 
 def test_glm5_target_mtp5_keeps_kda_padded_to_main_page():
@@ -999,6 +1006,7 @@ def test_indexer_kpool_mla_standalone_mtp_allocator_uses_two_page_classes():
 
     assert num_blocks == 3
     assert len(tensors) == 2
+    assert all(tensor.size % num_blocks == 0 for tensor in tensors)
     assert tensors[0].shared_by == ["layer.attn"]
     assert tensors[0].size == main_page_size * num_blocks
     assert tensors[1].shared_by == [
@@ -1846,7 +1854,7 @@ def test_indexer_kpool_forward_dispatches_cann_in_eager(mock_get_forward_context
 
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
 def test_indexer_kpool_forward_dispatches_cann_in_full_graph(mock_get_forward_context):
-    """CANN path is also enabled in full graph (device-tensor sequence lengths)."""
+    """CANN path stays enabled with graph-stable ValueDepend Tensor inputs."""
     mock_get_forward_context.return_value = SimpleNamespace(
         cudagraph_runtime_mode=CUDAGraphMode.FULL,
     )
@@ -1907,7 +1915,7 @@ def test_indexer_kpool_state_builder_builds_cann_params_once():
         seq_lens=torch.tensor([10, 14], dtype=torch.int32),
         query_start_loc=torch.tensor([0, 4, 6], dtype=torch.int32),
         slot_mapping=torch.zeros(6, dtype=torch.int64),
-        block_table_tensor=torch.tensor([[5], [9]], dtype=torch.int32),
+        block_table_tensor=torch.tensor([[0], [9]], dtype=torch.int32),
     )
     metadata_off = builder.build(0, common_metadata)
     assert metadata_off.cann_start_pos is None
@@ -1921,7 +1929,11 @@ def test_indexer_kpool_state_builder_builds_cann_params_once():
     builder._cann_pool_tail_k = torch.empty(4, dtype=torch.int64)
     builder._cann_actual_seq_q = torch.empty(4, dtype=torch.int64)
     builder._cann_actual_seq_k = torch.empty(4, dtype=torch.int64)
-    builder._cann_state_block_table = torch.zeros(4, builder._cann_max_blocks, dtype=torch.int32)
+    builder._cann_state_block_table = torch.full(
+        (4, builder._cann_max_blocks),
+        KEY_POOL_INVALID_BLOCK_ID,
+        dtype=torch.int32,
+    )
 
     metadata = builder.build(0, common_metadata)
 
@@ -1930,17 +1942,22 @@ def test_indexer_kpool_state_builder_builds_cann_params_once():
     assert metadata.cann_cu_seqlens.tolist() == [0, 4, 6]
     # pool_tail_k = end_pos % cmp_ratio = [10 % 4, 14 % 4] = [2, 2]
     assert metadata.cann_pool_tail_k.tolist() == [2, 2]
+    assert metadata.cann_pool_tail_k.dtype == torch.int64
     # actual_seq_q = query_start_loc[1:] (B-element prefix sum, no leading 0)
     assert metadata.cann_actual_seq_q.tolist() == [4, 6]
+    assert metadata.cann_actual_seq_q.dtype == torch.int64
     # actual_seq_k = floor(seq_lens / cmp_ratio) = [2, 3]
     assert metadata.cann_actual_seq_k.tolist() == [2, 3]
-    # New pools cover logical blocks [floor(6/4), floor(9/4)] = [1, 2] -> physical block 5
-    assert metadata.cann_state_block_table[0, 1].item() == 5
-    assert metadata.cann_state_block_table[0, 2].item() == 5
-    assert metadata.cann_state_block_table[0, 0].item() == 0
-    # batch 1: [floor(12/4), floor(13/4)] = [3, 3] -> physical block 9
+    assert metadata.cann_actual_seq_k.dtype == torch.int64
+    # New pools cover logical blocks [floor(6/4), floor(9/4)] = [1, 2].
+    # KeyPool accepts vLLM's native 0-based physical block IDs; -1 is invalid.
+    assert metadata.cann_state_block_table[0, 1].item() == 0
+    assert metadata.cann_state_block_table[0, 2].item() == 0
+    assert metadata.cann_state_block_table[0, 0].item() == KEY_POOL_INVALID_BLOCK_ID
+    assert common_metadata.block_table_tensor[0, 0].item() == 0
+    # batch 1 keeps vLLM physical block 9 without remapping.
     assert metadata.cann_state_block_table[1, 3].item() == 9
-    assert metadata.cann_state_block_table[1, 0].item() == 0
+    assert metadata.cann_state_block_table[1, 0].item() == KEY_POOL_INVALID_BLOCK_ID
     # Persistent buffers are reused: same object, refreshed in place.
     assert metadata.cann_state_block_table is builder._cann_state_block_table[:2]
     assert metadata.cann_pool_tail_k is builder._cann_pool_tail_k[:2]

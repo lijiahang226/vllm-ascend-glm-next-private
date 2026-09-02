@@ -633,15 +633,15 @@ __aicore__ inline void KeyPoolBlockVectorFullLoad<COMP>::WriteToCacheState(const
     while (copyFinishRowCnt < seqCnt) {
         uint64_t blockIdOffset = curSeqIdx / constInfo_.blockSize;
         uint64_t remainRowCnt = curSeqIdx % constInfo_.blockSize;
-        uint64_t idInBlockTable = blockTableGm.GetValue(blockTablebaseOffset + blockIdOffset);
+        int32_t idInBlockTable = blockTableGm.GetValue(blockTablebaseOffset + blockIdOffset);
         uint32_t copyRowCount = constInfo_.blockSize - remainRowCnt;
         if (copyFinishRowCnt + copyRowCount > seqCnt) {
             copyRowCount = seqCnt - copyFinishRowCnt;
         }
         // copyRowCount *= coff_;
-        if (idInBlockTable != 0) { // 32
+        if (idInBlockTable >= 0) {
             uint64_t stateOffset =
-                idInBlockTable * constInfo_.stateCacheStrideDim0 +
+                static_cast<uint64_t>(idInBlockTable) * constInfo_.stateCacheStrideDim0 +
                 remainRowCnt * 2 * coff_ * constInfo_.headDim +
                 stateIdx * coff_ * constInfo_.headDim;
             uint64_t ubOffset = copyFinishRowCnt * coff_ * dBaseSize;
@@ -668,17 +668,26 @@ KeyPoolBlockVectorFullLoad<COMP>::ReadFromCacheState(const LocalTensor<T> &outpu
     while (copyFinishRowCnt < seqCnt) {
         uint64_t blockIdOffset = curSeqIdx / constInfo_.blockSize;
         uint64_t remainRowCnt = curSeqIdx % constInfo_.blockSize;
-        uint64_t idInBlockTable = blockTableGm.GetValue(blockTablebaseOffset + blockIdOffset);
+        int32_t idInBlockTable = blockTableGm.GetValue(blockTablebaseOffset + blockIdOffset);
         uint32_t copyRowCount = constInfo_.blockSize - remainRowCnt;
         if (copyFinishRowCnt + copyRowCount > seqCnt) {
             copyRowCount = seqCnt - copyFinishRowCnt;
         }
-        uint64_t stateOffset = idInBlockTable * constInfo_.stateCacheStrideDim0 +
-                               remainRowCnt * 2 * coff_ * constInfo_.headDim + stateIdx * coff_ * constInfo_.headDim +
-                               dStartIdx;
-
-        DataCopyWithInputQue(output[copyFinishRowCnt * coff_ * dDealSize], state[stateOffset], copyRowCount, dDealSize,
-                             coff_ * constInfo_.headDim * 2, coff_ * dDealSize);
+        uint64_t outputOffset = copyFinishRowCnt * coff_ * dDealSize;
+        if (idInBlockTable >= 0) {
+            uint64_t stateOffset =
+                static_cast<uint64_t>(idInBlockTable) * constInfo_.stateCacheStrideDim0 +
+                remainRowCnt * 2 * coff_ * constInfo_.headDim + stateIdx * coff_ * constInfo_.headDim + dStartIdx;
+            DataCopyWithInputQue(output[outputOffset], state[stateOffset], copyRowCount, dDealSize,
+                                 coff_ * constInfo_.headDim * 2, coff_ * dDealSize);
+        } else {
+            for (uint32_t offset = 0; offset < dDealSize; offset += FP32_REPEAT_ELEMENT_NUM) {
+                uint32_t cols = min(dDealSize - offset, FP32_REPEAT_ELEMENT_NUM);
+                Duplicate(output[outputOffset + offset], FLOAT_ZERO, cols, copyRowCount, 1,
+                          coff_ * dDealSize / REPEAT_STRIDE_NUM);
+            }
+            PipeBarrier<PIPE_V>();
+        }
         copyFinishRowCnt += copyRowCount;
         curSeqIdx += copyRowCount;
     }

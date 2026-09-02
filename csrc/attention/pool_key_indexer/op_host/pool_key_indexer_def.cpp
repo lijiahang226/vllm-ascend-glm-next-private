@@ -37,16 +37,19 @@ public:
             .ParamType(REQUIRED)
             .DataTypeList({ge::DT_INT64})
             .FormatList({ge::FORMAT_ND})
+            .ValueDepend(OPTIONAL)
             .AutoContiguous();
         this->Input("actual_seq_q")
             .ParamType(OPTIONAL)
             .DataTypeList({ge::DT_INT64})
             .FormatList({ge::FORMAT_ND})
+            .ValueDepend(OPTIONAL)
             .AutoContiguous();
         this->Input("actual_seq_k")
             .ParamType(OPTIONAL)
             .DataTypeList({ge::DT_INT64})
             .FormatList({ge::FORMAT_ND})
+            .ValueDepend(OPTIONAL)
             .AutoContiguous();
         this->Input("block_table")
             .ParamType(OPTIONAL)
@@ -89,7 +92,8 @@ public:
             .DynamicRankSupportFlag(true)
             .DynamicShapeSupportFlag(true)
             .NeedCheckSupportFlag(false)
-            .PrecisionReduceFlag(true);
+            .PrecisionReduceFlag(true)
+            .ExtendCfgInfo("aclnnSupport.value", "support_aclnn");
         this->AICore().AddConfig("ascend910b", aicoreConfig);
         this->AICore().AddConfig("ascend910_93", aicoreConfig);
 
@@ -99,13 +103,10 @@ public:
         //   2) BF16  quant_mode=-1 (no quant)     : q/k/weights=BF16,    descale=FLOAT
         //   3) FP8   quant_mode=0  (per-token FP8) : q/k=FP8_E4M3FN, weights=FP16, descale=FLOAT
         //   4) FP8   quant_mode=1  (mxFP8)         : q/k=FP8_E4M3FN, weights=FP16, descale=FLOAT8_E8M0
-        // Note: pool_tail_k / actual_seq_q / actual_seq_k (DT_INT64) and
+        // Note: pool_tail_k / actual_seq_q / actual_seq_k (DT_INT64 + ValueDepend) and
         //       block_table / outputs inherit from the top-level declaration; not
-        //       re-declared here. These are plain device tensors (no ValueDepend):
-        //       tiling derives B from shapes and skips host value validation when
-        //       values are not host-visible, while the kernel reads them from GM at
-        //       runtime. This keeps the op ACLGraph-compatible (values may change
-        //       between capture and replay, unlike baked host ValueDepend inputs).
+        //       re-declared here. The generated Tensor workspace API accepts device
+        //       tensors so ACLGraph replay can consume refreshed values from GM.
         // Note: in FP8 combos weights is declared as FP16 (representative); tiling still
         //       accepts BF16 weights at runtime.
         OpAICoreConfig aicoreConfig950;
@@ -139,7 +140,8 @@ public:
             .DynamicRankSupportFlag(true)
             .DynamicShapeSupportFlag(true)
             .NeedCheckSupportFlag(false)
-            .PrecisionReduceFlag(true);
+            .PrecisionReduceFlag(true)
+            .ExtendCfgInfo("aclnnSupport.value", "support_aclnn");
         this->AICore().AddConfig("ascend950", aicoreConfig950);
     }
 };

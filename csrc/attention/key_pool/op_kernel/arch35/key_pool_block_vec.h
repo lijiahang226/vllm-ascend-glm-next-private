@@ -720,17 +720,28 @@ __aicore__ inline void KeyPoolBlockVector<COMP>::ReadFromCacheState(const LocalT
         while (copyFinishRowCnt < seqCnt) {
             uint64_t blockIdOffset = curSeqIdx / constInfo_.blockSize;
             uint64_t remainRowCnt = curSeqIdx % constInfo_.blockSize;
-            uint64_t idInBlockTable = blockTableGm.GetValue(blockTablebaseOffset + blockIdOffset);
+            int32_t idInBlockTable = blockTableGm.GetValue(blockTablebaseOffset + blockIdOffset);
             uint32_t copyRowCount = constInfo_.blockSize - remainRowCnt;
             if (copyFinishRowCnt + copyRowCount > seqCnt) {
                 copyRowCount = seqCnt - copyFinishRowCnt;
             }
-            uint64_t stateOffset = idInBlockTable * constInfo_.stateCacheStrideDim0 +
-                                   remainRowCnt * STATE_INTERLEAVE_FACTOR * coff_ * constInfo_.headDim +
-                                   stateIdx * coff_ * constInfo_.headDim + dStartIdx;
-
-            DataCopyWithInputQue(output[copyFinishRowCnt * coff_ * dDealSize], state[stateOffset], copyRowCount,
-                                 dDealSize, coff_ * constInfo_.headDim * STATE_INTERLEAVE_FACTOR, coff_ * dDealSize);
+            uint64_t outputOffset = copyFinishRowCnt * coff_ * dDealSize;
+            if (idInBlockTable >= 0) {
+                uint64_t stateOffset =
+                    static_cast<uint64_t>(idInBlockTable) * constInfo_.stateCacheStrideDim0 +
+                    remainRowCnt * STATE_INTERLEAVE_FACTOR * coff_ * constInfo_.headDim +
+                    stateIdx * coff_ * constInfo_.headDim + dStartIdx;
+                DataCopyWithInputQue(output[outputOffset], state[stateOffset], copyRowCount,
+                                     dDealSize, coff_ * constInfo_.headDim * STATE_INTERLEAVE_FACTOR,
+                                     coff_ * dDealSize);
+            } else {
+                for (uint32_t offset = 0; offset < dDealSize; offset += FP32_REPEAT_ELEMENT_NUM) {
+                    uint32_t cols = min(dDealSize - offset, FP32_REPEAT_ELEMENT_NUM);
+                    Duplicate(output[outputOffset + offset], FLOAT_ZERO, cols, copyRowCount, 1,
+                              coff_ * dDealSize / REPEAT_STRIDE_NUM);
+                }
+                PipeBarrier<PIPE_V>();
+            }
             copyFinishRowCnt += copyRowCount;
             curSeqIdx += copyRowCount;
         }
@@ -738,19 +749,30 @@ __aicore__ inline void KeyPoolBlockVector<COMP>::ReadFromCacheState(const LocalT
         uint32_t curSeqIdx = startSeqIdx;
         uint32_t copyFinishRowCnt = 0;
         uint32_t seqCnt = endSeqIdx - startSeqIdx;
-        uint64_t idInBlockTable = blockTableGm.GetValue(batchIdx);
+        int32_t idInBlockTable = blockTableGm.GetValue(batchIdx);
         while (copyFinishRowCnt < seqCnt) {
             uint64_t remainRowCnt = curSeqIdx % constInfo_.blockSize;
             uint32_t copyRowCount = constInfo_.blockSize - remainRowCnt;
             if (copyFinishRowCnt + copyRowCount > seqCnt) {
                 copyRowCount = seqCnt - copyFinishRowCnt;
             }
-            uint64_t stateOffset = idInBlockTable * constInfo_.stateCacheStrideDim0 +
-                                   remainRowCnt * STATE_INTERLEAVE_FACTOR * coff_ * constInfo_.headDim +
-                                   stateIdx * coff_ * constInfo_.headDim + dStartIdx;
-
-            DataCopyWithInputQue(output[copyFinishRowCnt * coff_ * dDealSize], state[stateOffset], copyRowCount,
-                                 dDealSize, coff_ * constInfo_.headDim * STATE_INTERLEAVE_FACTOR, coff_ * dDealSize);
+            uint64_t outputOffset = copyFinishRowCnt * coff_ * dDealSize;
+            if (idInBlockTable >= 0) {
+                uint64_t stateOffset =
+                    static_cast<uint64_t>(idInBlockTable) * constInfo_.stateCacheStrideDim0 +
+                    remainRowCnt * STATE_INTERLEAVE_FACTOR * coff_ * constInfo_.headDim +
+                    stateIdx * coff_ * constInfo_.headDim + dStartIdx;
+                DataCopyWithInputQue(output[outputOffset], state[stateOffset], copyRowCount,
+                                     dDealSize, coff_ * constInfo_.headDim * STATE_INTERLEAVE_FACTOR,
+                                     coff_ * dDealSize);
+            } else {
+                for (uint32_t offset = 0; offset < dDealSize; offset += FP32_REPEAT_ELEMENT_NUM) {
+                    uint32_t cols = min(dDealSize - offset, FP32_REPEAT_ELEMENT_NUM);
+                    Duplicate(output[outputOffset + offset], FLOAT_ZERO, cols, copyRowCount, 1,
+                              coff_ * dDealSize / REPEAT_STRIDE_NUM);
+                }
+                PipeBarrier<PIPE_V>();
+            }
             copyFinishRowCnt += copyRowCount;
             curSeqIdx += copyRowCount;
         }
@@ -773,13 +795,13 @@ __aicore__ inline void KeyPoolBlockVector<COMP>::WriteToCacheState(const GlobalT
         while (copyFinishRowCnt < seqCnt) {
             uint64_t blockIdOffset = curSeqIdx / constInfo_.blockSize;
             uint64_t remainRowCnt = curSeqIdx % constInfo_.blockSize;
-            uint64_t idInBlockTable = blockTableGm.GetValue(blockTablebaseOffset + blockIdOffset);
+            int32_t idInBlockTable = blockTableGm.GetValue(blockTablebaseOffset + blockIdOffset);
             uint32_t copyRowCount = constInfo_.blockSize - remainRowCnt;
             if (copyFinishRowCnt + copyRowCount > seqCnt) {
                 copyRowCount = seqCnt - copyFinishRowCnt;
             }
-            if (idInBlockTable != 0) { // 32
-                uint64_t stateOffset = idInBlockTable * constInfo_.stateCacheStrideDim0 +
+            if (idInBlockTable >= 0) {
+                uint64_t stateOffset = static_cast<uint64_t>(idInBlockTable) * constInfo_.stateCacheStrideDim0 +
                                        remainRowCnt * STATE_INTERLEAVE_FACTOR * coff_ * constInfo_.headDim +
                                        stateIdx * coff_ * constInfo_.headDim + dStartIdx;
                 DataCopyWithOutputQue(state[stateOffset], input[copyFinishRowCnt * coff_ * dDealSize], copyRowCount,
@@ -794,18 +816,22 @@ __aicore__ inline void KeyPoolBlockVector<COMP>::WriteToCacheState(const GlobalT
         uint32_t curSeqIdx = startSeqIdx;
         uint32_t copyFinishRowCnt = 0;
         uint32_t seqCnt = endSeqIdx - startSeqIdx;
-        uint64_t idInBlockTable = blockTableGm.GetValue(batchIdx);
+        int32_t idInBlockTable = blockTableGm.GetValue(batchIdx);
         while (copyFinishRowCnt < seqCnt) {
             uint64_t remainRowCnt = curSeqIdx % constInfo_.blockSize;
             uint32_t copyRowCount = constInfo_.blockSize - remainRowCnt;
             if (copyFinishRowCnt + copyRowCount > seqCnt) {
                 copyRowCount = seqCnt - copyFinishRowCnt;
             }
-            uint64_t stateOffset = idInBlockTable * constInfo_.stateCacheStrideDim0 +
-                                   remainRowCnt * STATE_INTERLEAVE_FACTOR * coff_ * constInfo_.headDim +
-                                   stateIdx * coff_ * constInfo_.headDim + dStartIdx;
-            DataCopyWithOutputQue(state[stateOffset], input[copyFinishRowCnt * coff_ * dDealSize], copyRowCount,
-                                  dDealSize, coff_ * dDealSize, coff_ * constInfo_.headDim * STATE_INTERLEAVE_FACTOR);
+            if (idInBlockTable >= 0) {
+                uint64_t stateOffset =
+                    static_cast<uint64_t>(idInBlockTable) * constInfo_.stateCacheStrideDim0 +
+                    remainRowCnt * STATE_INTERLEAVE_FACTOR * coff_ * constInfo_.headDim +
+                    stateIdx * coff_ * constInfo_.headDim + dStartIdx;
+                DataCopyWithOutputQue(state[stateOffset], input[copyFinishRowCnt * coff_ * dDealSize], copyRowCount,
+                                      dDealSize, coff_ * dDealSize,
+                                      coff_ * constInfo_.headDim * STATE_INTERLEAVE_FACTOR);
+            }
 
             copyFinishRowCnt += copyRowCount;
             curSeqIdx += copyRowCount;
@@ -1242,6 +1268,8 @@ __aicore__ inline void KeyPoolBlockVector<COMP>::PrepareNormalizedKv(
                 normalizedSliceIterator.IteratorSlice();
             }
 
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
             uint64_t normalizedOffset =
                 normalizedKvDbOffset_ +
                 static_cast<uint64_t>(compressedCnt_ - normalizedPoolBase_) *
@@ -1307,6 +1335,8 @@ __aicore__ inline void KeyPoolBlockVector<COMP>::PrepareNormalizedKv(
                 tailCacheSlice.sIdx += tailSlice.validSeqCnt - tailRows;
                 tailCacheSlice.validSeqCnt = tailRows;
                 tailCacheSlice.dealedSeqCnt = 0U;
+                SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+                WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
                 SaveState(tailKv, stateCacheGm_, stateBlockTableGm_,
                           tailCacheSlice, 0U, constInfo_.headDim, 0U);
             }
@@ -1532,51 +1562,13 @@ __aicore__ inline void KeyPoolBlockVector<COMP>::ComputeIncrementalPool()
         return;
     }
     dDealSize = min(dDealSize, constInfo_.headDim - dStartIdx);
-    uint32_t maxPoolCount = BUFFER_SIZE_BYTE_32K / (cmpRatio_ * dDealSize * sizeof(T));
-    maxPoolCount = max(maxPoolCount, 1U);
     uint32_t outputPoolCapacity =
         CeilDivT(constInfo_.maxBlockNumPerBatch * constInfo_.blockSize, cmpRatio_);
 
-    CopyInApe(apeUb, dStartIdx, dDealSize);
-    LocalTensor<T> scoreLocal = tmpBuff1.Get<T>();
-    LocalTensor<T> kvLocal = tmpBuff2.Get<T>();
-
     for (uint32_t bIdx = 0; bIdx < constInfo_.batchSize; bIdx++) {
-        // With LayerNorm, the cache is normalized after the streaming path.
-        // Rebuild first-pass pools from the normalized cache as well.
         uint32_t startPool = GetStartPos(bIdx) / cmpRatio_;
         uint32_t validPoolCount = (GetStartPos(bIdx) + GetSeqUsed(bIdx)) / cmpRatio_;
         uint32_t newPoolCount = validPoolCount > startPool ? validPoolCount - startPool : 0;
-        if (false) {
-            for (uint32_t poolStart = startPool; poolStart < validPoolCount; poolStart += maxPoolCount) {
-            uint32_t poolCount = min(maxPoolCount, validPoolCount - poolStart);
-            uint32_t tokenStart = poolStart * cmpRatio_;
-            uint32_t tokenEnd = (poolStart + poolCount) * cmpRatio_;
-            ReadFromCacheState(kvLocal, stateCacheGm_, stateBlockTableGm_, bIdx, tokenStart, tokenEnd,
-                               dStartIdx, dDealSize, 0U);
-            ReadFromCacheState(scoreLocal, stateCacheGm_, stateBlockTableGm_, bIdx, tokenStart, tokenEnd,
-                               dStartIdx, dDealSize, 1U);
-            AddApeToPooledScore(scoreLocal, poolCount, dDealSize);
-            PipeBarrier<PIPE_V>();
-            SoftmaxDN(scoreLocal, poolCount, dDealSize);
-            PipeBarrier<PIPE_V>();
-            RoundToHiddenDtype(scoreLocal, poolCount * cmpRatio_ * dDealSize);
-            PipeBarrier<PIPE_V>();
-            KvMulReduceScore(kvLocal, scoreLocal, scoreLocal, poolCount, dDealSize);
-            PipeBarrier<PIPE_V>();
-
-            LocalTensor<HIDDEN_STATES_T> outputUb = outputQue2.AllocTensor<HIDDEN_STATES_T>();
-            Cast(outputUb, scoreLocal, RoundMode::CAST_ROUND, poolCount * dDealSize);
-            outputQue2.EnQue(outputUb);
-            outputQue2.DeQue<HIDDEN_STATES_T>();
-            uint64_t outputPoolIdx =
-                static_cast<uint64_t>(bIdx) * outputPoolCapacity + poolStart - startPool;
-            uint64_t outGmOffset = outputPoolIdx * constInfo_.headDim + dStartIdx;
-            DataCopyAlignUbToGm(cmpKvOutGm_[outGmOffset], outputUb, poolCount, dDealSize, dDealSize,
-                                constInfo_.headDim);
-            outputQue2.FreeTensor(outputUb);
-            }
-        }
         const uint32_t clearPoolCapacity = max(
             1U, static_cast<uint32_t>(BUFFER_SIZE_BYTE_16K / (dDealSize * sizeof(HIDDEN_STATES_T))));
         for (uint32_t clearStart = newPoolCount; clearStart < outputPoolCapacity; clearStart += clearPoolCapacity) {

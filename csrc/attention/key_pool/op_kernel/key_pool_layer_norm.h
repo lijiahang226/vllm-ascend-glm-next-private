@@ -10,28 +10,29 @@
 
 namespace KeyPool {
 
-__aicore__ inline void KeyPoolLayerNorm(const LocalTensor<float> &out, const LocalTensor<float> &in,
-                                       const LocalTensor<float> &mean, const LocalTensor<float> &gamma,
-                                       const LocalTensor<float> &beta, float eps, uint32_t count)
+__aicore__ inline void KeyPoolLayerNorm(const LocalTensor<float> &data, const LocalTensor<float> &in,
+                                       const LocalTensor<float> &out, const LocalTensor<float> &mean,
+                                       const LocalTensor<float> &gamma, const LocalTensor<float> &beta, float eps,
+                                       uint32_t count)
 {
     const float reciprocal = 1.0f / static_cast<float>(static_cast<int64_t>(count));
 
     Duplicate(mean, reciprocal, count);
     PipeBarrier<PIPE_V>();
-    Mul(mean, in, mean, count);
+    Mul(in, data, mean, count);
     PipeBarrier<PIPE_V>();
-    ReduceSum(mean, mean, mean, count);
+    ReduceSum(in, in, in, count);
     SetFlag<HardEvent::V_S>(EVENT_ID0);
     WaitFlag<HardEvent::V_S>(EVENT_ID0);
-    float meanValue = mean.GetValue(0);
+    float meanValue = in.GetValue(0);
     SetFlag<HardEvent::S_V>(EVENT_ID0);
     WaitFlag<HardEvent::S_V>(EVENT_ID0);
     Duplicate(mean, meanValue, count);
     PipeBarrier<PIPE_V>();
 
-    Sub(in, in, mean, count);
+    Sub(data, data, mean, count);
     PipeBarrier<PIPE_V>();
-    Mul(out, in, in, count);
+    Mul(out, data, data, count);
     PipeBarrier<PIPE_V>();
     Muls(out, out, reciprocal, count);
     PipeBarrier<PIPE_V>();
@@ -48,12 +49,23 @@ __aicore__ inline void KeyPoolLayerNorm(const LocalTensor<float> &out, const Loc
     Sqrt(out, out, count);
     PipeBarrier<PIPE_V>();
 
-    Div(out, in, out, count);
+    Div(data, data, out, count);
     PipeBarrier<PIPE_V>();
-    Mul(out, out, gamma, count);
+    Mul(data, data, gamma, count);
     PipeBarrier<PIPE_V>();
-    Add(out, out, beta, count);
+    Add(data, data, beta, count);
     PipeBarrier<PIPE_V>();
+}
+
+// Keep the cache-transform helper source-compatible with the in-place
+// implementation. It is retained for the full-load path.
+__aicore__ inline void KeyPoolLayerNorm(const LocalTensor<float> &out, const LocalTensor<float> &in,
+                                       const LocalTensor<float> &mean, const LocalTensor<float> &gamma,
+                                       const LocalTensor<float> &beta, float eps, uint32_t count)
+{
+    DataCopy(out, in, count);
+    PipeBarrier<PIPE_V>();
+    KeyPoolLayerNorm(out, in, out, mean, gamma, beta, eps, count);
 }
 
 // Normalize complete current K rows before they enter the pooling path. The
@@ -74,19 +86,11 @@ __aicore__ inline void KeyPoolLayerNormRowsInplace(
     LocalTensor<float> beta = gamma[headDim];
     DataCopy(gamma, normWeight, headDim);
     DataCopy(beta, normBias, headDim);
+    SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
     for (uint32_t row = 0; row < rowCount; ++row) {
-        DataCopy(input, data[static_cast<uint64_t>(row) * rowStride], headDim);
-        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
-
-        WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        KeyPoolLayerNorm(output, input, mean, gamma, beta, eps, headDim);
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-
-        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        DataCopy(data[static_cast<uint64_t>(row) * rowStride], output, headDim);
-        SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-
-        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+        KeyPoolLayerNorm(data[static_cast<uint64_t>(row) * rowStride], input, output, mean, gamma, beta, eps,
+                         headDim);
     }
 }
 

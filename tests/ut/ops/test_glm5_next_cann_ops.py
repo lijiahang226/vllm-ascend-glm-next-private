@@ -24,7 +24,7 @@ def _make_bsh_inputs():
     gate_weight = torch.randn(8, 32, dtype=torch.bfloat16)
     ape = torch.randn(4, 8, dtype=torch.float32)
     state_cache = torch.zeros(5, 4, 16, dtype=torch.float32)
-    block_ids = torch.arange(1, 5, dtype=torch.int32)
+    block_ids = torch.arange(0, 4, dtype=torch.int32)
     cache_block_table = block_ids.reshape(2, 2)
     start_pos = torch.zeros(2, dtype=torch.int32)
     return (

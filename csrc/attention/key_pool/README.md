@@ -80,7 +80,7 @@
 | state_cache | 输入 | 公式中的$\left[kv\_state, score\_state\right]$, 表示kv\_state和score\_state的历史数据。 | FLOAT32     | ND         |
 | ape | 输入 | 公式中的$Ape$，表示positional biases。 | FLOAT32       | ND         |-         |
 | cmp\_ratio | 属性 | 用于稀疏计算，表示数据压缩率，取值范围为[2, 128]内的整数。 | INT32          | -         |
-| state\_block\_table | 可选输入 | 表示state\_cache存储使用的block映射表。<br>当其中元素的值为0时，表示当前位置无需进行更新state_cache操作。 | INT32 | ND         |
+| state\_block\_table | 可选输入 | 表示state\_cache存储使用的block映射表。<br>物理block id从0开始；负数表示当前位置无需更新state_cache。 | INT32 | ND         |
 | cu\_seqlens | 可选输入 | 表示不同Batch中的有效token数。  | INT32          | ND         |
 | seqused | 可选输入 | 表示不同Batch中实际参与压缩的token数。<br>如果指定为None时，表示和每个Batch上的Sequence Length长度相同。 | INT32          | ND         |
 | start\_pos | 可选输入 | 表示计算起始位置。 | INT32          | ND         |

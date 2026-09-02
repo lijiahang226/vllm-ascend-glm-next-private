@@ -34,6 +34,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 INDEXER_KPOOL_MLA_SPARSE_ATTN_QUERY_CHUNK_SIZE = 16
 INDEXER_KPOOL_MLA_SAS_METADATA_SIZE = 1024
 GLM5_SFA_KERNEL_BLOCK_SIZE = 128
+KEY_POOL_INVALID_BLOCK_ID = -1
 
 
 @dataclass
@@ -248,9 +249,8 @@ class AscendIndexerKPoolStateMetadata:
     cache_role: str
     # CANN KeyPool/PoolKeyIndexer dependency parameters (pre-built at build
     # time, shared by all layers). All are device tensors: PoolKeyIndexer's
-    # pool_tail_k/actual_seq_q/actual_seq_k follow the device-tensor
-    # convention (no ValueDepend) and are read from GM at runtime, so graph
-    # mode updates them per step as graph inputs without baking into tiling.
+    # ValueDepend inputs use the generated Tensor workspace API and are read
+    # from GM at runtime, so graph replay observes per-step buffer updates.
     cann_start_pos: torch.Tensor | None = None
     cann_cu_seqlens: torch.Tensor | None = None
     cann_pool_tail_k: torch.Tensor | None = None
@@ -292,10 +292,10 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
         # CANN dependency parameters use persistent buffers refreshed in place
         # at build time: the model forward reads them directly without
         # allocating new tensors or triggering host-device sync. All are
-        # device tensors (PoolKeyIndexer sequence lengths follow the
-        # device-tensor convention); the buffers are graph-stable objects
-        # across capture/replay, refreshed per build, so no host value is
-        # baked into tiling. The custom ops are always built together with
+        # device tensors (including PoolKeyIndexer ValueDepend inputs); the
+        # buffers are graph-stable objects across capture/replay and refreshed
+        # per build, so no host value is baked into tiling. The custom ops are
+        # always built together with
         # vllm-ascend, so the CANN params are always enabled.
         self._cann_enabled = True
         if self._cann_enabled:
@@ -311,8 +311,9 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
             self._cann_pool_tail_k = torch.empty(max_num_seqs, dtype=torch.int64, device=device)
             self._cann_actual_seq_q = torch.empty(max_num_seqs, dtype=torch.int64, device=device)
             self._cann_actual_seq_k = torch.empty(max_num_seqs, dtype=torch.int64, device=device)
-            self._cann_state_block_table = torch.zeros(
+            self._cann_state_block_table = torch.full(
                 (max_num_seqs, self._cann_max_blocks),
+                KEY_POOL_INVALID_BLOCK_ID,
                 dtype=torch.int32,
                 device=device,
             )
@@ -331,9 +332,9 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
         end_pos = seq_lens
         self._cann_start_pos[:num_reqs].copy_(start_pos.to(torch.int32))
         self._cann_cu_seqlens[: num_reqs + 1].copy_(query_start_loc.to(torch.int32))
-        # PoolKeyIndexer sequence lengths are device tensors (no ValueDepend);
-        # the kernel reads them from GM at runtime, so build only does
-        # device-to-device copies with no D2H sync.
+        # PoolKeyIndexer sequence lengths stay in device buffers and dispatch
+        # through the ValueDepend Tensor API. The kernel reads them from GM at
+        # runtime, so build only does device-to-device copies with no D2H sync.
         self._cann_pool_tail_k[:num_reqs].copy_(
             torch.remainder(end_pos, self.compress_ratio).to(torch.int64)
         )
@@ -343,22 +344,24 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
         )
         # Full-width state block table: the sliding-window cache (one physical
         # block per request) is mapped by logical block address, which the CANN
-        # op addresses as pos // block_size. Rows outside [first_block,
-        # last_block] stay zero (invalid) and the kernel skips them.
+        # op addresses as pos // block_size. vLLM physical block IDs are
+        # natively 0-based; -1 marks entries outside the active logical range.
         table = self._cann_state_block_table[:num_reqs]
         first_blocks = torch.div(start_pos, self.block_size, rounding_mode="floor")
         last_blocks = torch.div(end_pos - 1, self.block_size, rounding_mode="floor")
         physical = common_attn_metadata.block_table_tensor[:num_reqs, 0]
         block_ids = torch.arange(self._cann_max_blocks, device=table.device)
-        in_range = (block_ids[None, :] >= first_blocks[:, None]) & (
-            block_ids[None, :] <= last_blocks[:, None]
+        in_range = (
+            (physical[:, None] >= 0)
+            & (block_ids[None, :] >= first_blocks[:, None])
+            & (block_ids[None, :] <= last_blocks[:, None])
         )
         expanded = physical[:, None].to(torch.int32).expand(num_reqs, self._cann_max_blocks)
         table.copy_(
             torch.where(
                 in_range,
                 expanded,
-                torch.zeros_like(expanded),
+                torch.full_like(expanded, KEY_POOL_INVALID_BLOCK_ID),
             )
         )
         metadata.cann_state_block_table = table
