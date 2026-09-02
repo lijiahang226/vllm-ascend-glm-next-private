@@ -19,12 +19,12 @@
 using namespace ge;
 namespace optiling {
 
-// ValueDepend 输入(pool_tail_k / actual_seq_q / actual_seq_k)的 host 可见性判断。
+// Sequence-metadata inputs may be host-visible in standalone host tests, but
+// the production eager/graph path passes ordinary device tensors.
 // GetData() 对 device tensor 同样返回非空指针(device 地址), 在 host 侧解引用会
 // 段错误, 因此取值前必须先确认数据位于 host。仅以下两种来源允许读取值:
-//   - aclnn Array 变体(eager CPU 输入): 框架桥接的 fake tensor, kOnHost;
-//   - aclnn Tensor 变体的 CPU 输入: host 指针原样包装, kOnHost/kFollowing。
-// device tensor(GE 图模式 / eager 经 Tensor 变体直传 NPU 输入)跳过 host 侧值
+//   - CPU tensor inputs: host pointer, kOnHost/kFollowing.
+// device tensor(GE 图模式 / eager NPU 输入)跳过 host 侧值
 // 校验, 由 kernel 运行期从 GM 读值(GetActualSeqLen), 与既有 GE 图模式口径一致。
 static bool IsHostVisibleValue(const gert::Tensor *tensor)
 {
@@ -712,7 +712,7 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
         }
     }
 
-    // ---- Value-range validation (requires ValueDepend + support_aclnn) ----
+    // ---- Value-range validation when input data is host-visible ----
 
     // #5/#6: actual_seq_q prefix-sum (TND): determines B, validates non-decreasing + last==T1
     if (info.layoutQ == PkiDataLayout::TND) {
@@ -724,7 +724,7 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
         info.bSize = static_cast<uint32_t>(asqCount);
         const int64_t *asqData = IsHostVisibleValue(asqTensor) ? asqTensor->GetData<int64_t>() : nullptr;
         if (asqData == nullptr) {
-            // Device tensor(GE 图模式 / eager Tensor 变体 NPU 输入): tiling 期值不可见。
+            // Device tensor(GE 图模式 / eager NPU 输入): tiling 期值不可见。
             // 跳过 host 侧值校验; kernel 运行期从 GM 读前缀和(GetActualSeqLen)。
             OP_LOGI(context_, "TND: actual_seq_q data is not host-visible (device tensor), skip value validation");
         } else {
@@ -759,7 +759,7 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
                     return ge::GRAPH_FAILED);
 
         if (askData == nullptr) {
-            // Device tensor(GE 图模式 / eager Tensor 变体 NPU 输入): tiling 期值不可见。
+            // Device tensor(GE 图模式 / eager NPU 输入): tiling 期值不可见。
             // 跳过 host 侧值校验; kernel 运行期从 GM 读值(GetActualSeqLen)。
             // PA maxBlockNumPerSeq 检查同样推迟(block_table 上界由 kernel 寻址保证)。
             OP_LOGI(context_, "actual_seq_k data is not host-visible (device tensor), skip value validation");

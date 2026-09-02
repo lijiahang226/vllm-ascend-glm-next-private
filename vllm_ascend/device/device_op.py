@@ -1769,17 +1769,13 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         # cache bytes (NaN outputs in some cache layouts). Sort every row
         # ascending (-1 padding sinks to the tail) so each adjacent column
         # pair maps to consecutive KV tokens. The attended set is unchanged.
-        sorted_topk = torch.where(
-            topk_indices >= 0,
-            topk_indices,
-            torch.iinfo(torch.int32).max,
+        invalid_topk = torch.iinfo(torch.int32).max
+        sorted_topk = topk_indices.masked_fill(
+            topk_indices < 0,
+            invalid_topk,
         )
         sorted_topk, _ = torch.sort(sorted_topk, dim=-1)
-        sorted_topk = torch.where(
-            sorted_topk != torch.iinfo(torch.int32).max,
-            sorted_topk,
-            -1,
-        )
+        sorted_topk.masked_fill_(sorted_topk == invalid_topk, -1)
         topk_indices = sorted_topk
         ori_topk_length = (topk_indices >= 0).sum(dim=-1, keepdim=True).to(torch.int32)
 

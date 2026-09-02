@@ -845,9 +845,10 @@ at::Tensor npu_key_pool_meta(
     double norm_eps,
     int64_t rotary_mode)
 {
-    (void)hidden_states;
     (void)gate_weight;
     (void)ape;
+    (void)state_cache;
+    (void)cache_block_table;
     (void)norm_weight;
     (void)norm_bias;
     (void)cos;
@@ -856,12 +857,14 @@ at::Tensor npu_key_pool_meta(
     (void)seqused;
     (void)norm_eps;
     (void)rotary_mode;
-    // Matches key_pool_infershape: [B, ceil(cols * block_size / R), D]; the
-    // output dtype/device follows hidden_states (ConstructKeyPoolOutputTensor
-    // allocates with hidden_states.options()).
+    // Matches key_pool_infershape. Cache-table width covers addressable
+    // history and must not determine this invocation's temporary output.
     int64_t b = start_pos.size(0);
     int64_t d = wk.size(0);
-    int64_t sr = (cache_block_table.size(1) * state_cache.size(1) + cmp_ratio - 1) / cmp_ratio;
+    int64_t tokens_per_batch = hidden_states.dim() == 2
+                                   ? hidden_states.size(0)
+                                   : hidden_states.size(1);
+    int64_t sr = (tokens_per_batch + cmp_ratio - 1) / cmp_ratio;
     return at::empty_symint({b, sr, d}, hidden_states.options());
 }
 

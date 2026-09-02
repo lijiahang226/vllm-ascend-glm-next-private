@@ -37,19 +37,16 @@ public:
             .ParamType(REQUIRED)
             .DataTypeList({ge::DT_INT64})
             .FormatList({ge::FORMAT_ND})
-            .ValueDepend(OPTIONAL)
             .AutoContiguous();
         this->Input("actual_seq_q")
             .ParamType(OPTIONAL)
             .DataTypeList({ge::DT_INT64})
             .FormatList({ge::FORMAT_ND})
-            .ValueDepend(OPTIONAL)
             .AutoContiguous();
         this->Input("actual_seq_k")
             .ParamType(OPTIONAL)
             .DataTypeList({ge::DT_INT64})
             .FormatList({ge::FORMAT_ND})
-            .ValueDepend(OPTIONAL)
             .AutoContiguous();
         this->Input("block_table")
             .ParamType(OPTIONAL)
@@ -103,10 +100,11 @@ public:
         //   2) BF16  quant_mode=-1 (no quant)     : q/k/weights=BF16,    descale=FLOAT
         //   3) FP8   quant_mode=0  (per-token FP8) : q/k=FP8_E4M3FN, weights=FP16, descale=FLOAT
         //   4) FP8   quant_mode=1  (mxFP8)         : q/k=FP8_E4M3FN, weights=FP16, descale=FLOAT8_E8M0
-        // Note: pool_tail_k / actual_seq_q / actual_seq_k (DT_INT64 + ValueDepend) and
+        // Note: pool_tail_k / actual_seq_q / actual_seq_k (DT_INT64) and
         //       block_table / outputs inherit from the top-level declaration; not
-        //       re-declared here. The generated Tensor workspace API accepts device
-        //       tensors so ACLGraph replay can consume refreshed values from GM.
+        //       re-declared here. These remain ordinary device tensors: tiling
+        //       derives B from shapes and the kernel reads their values from GM,
+        //       allowing ACLGraph replay to consume refreshed values.
         // Note: in FP8 combos weights is declared as FP16 (representative); tiling still
         //       accepts BF16 weights at runtime.
         OpAICoreConfig aicoreConfig950;

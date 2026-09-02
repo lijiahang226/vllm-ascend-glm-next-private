@@ -134,6 +134,10 @@ ge::graphStatus KeyPoolTiling::SetBaseInfo()
     } else {
         baseParams_->batchSize = context_->seqLens.shape->GetStorageShape().GetDim(KEY_POOL_DIM_INDEX_0) - 1;
         baseParams_->tokenSize = context_->hidden_states.shape->GetStorageShape().GetDim(KEY_POOL_DIM_INDEX_0);
+        // TH has no common per-batch S.  Keep seqSize equal to the total
+        // token count so fixed output-capacity calculations are independent
+        // of the (potentially max-model-length) cache block table.
+        baseParams_->seqSize = baseParams_->tokenSize;
         baseParams_->hiddenSize = context_->hidden_states.shape->GetStorageShape().GetDim(KEY_POOL_DIM_INDEX_1);
     }
 

@@ -1854,7 +1854,7 @@ def test_indexer_kpool_forward_dispatches_cann_in_eager(mock_get_forward_context
 
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
 def test_indexer_kpool_forward_dispatches_cann_in_full_graph(mock_get_forward_context):
-    """CANN path stays enabled with graph-stable ValueDepend Tensor inputs."""
+    """CANN path stays enabled with graph-stable device Tensor inputs."""
     mock_get_forward_context.return_value = SimpleNamespace(
         cudagraph_runtime_mode=CUDAGraphMode.FULL,
     )
@@ -1907,8 +1907,6 @@ def test_indexer_kpool_state_builder_builds_cann_params_once():
         torch.device("cpu"),
     )
 
-    # CANN params are not built when CANN is disabled (or ops unavailable).
-    builder._cann_enabled = False
     common_metadata = SimpleNamespace(
         num_reqs=2,
         num_input_tokens=6,
@@ -1917,29 +1915,12 @@ def test_indexer_kpool_state_builder_builds_cann_params_once():
         slot_mapping=torch.zeros(6, dtype=torch.int64),
         block_table_tensor=torch.tensor([[0], [9]], dtype=torch.int32),
     )
-    metadata_off = builder.build(0, common_metadata)
-    assert metadata_off.cann_start_pos is None
-
-    # Simulate the CANN extension being available and verify the build logic.
-    builder._cann_enabled = True
-    builder._cann_max_blocks = (64 + 4 - 1) // 4
-    builder._cann_start_pos = torch.empty(4, dtype=torch.int32)
-    builder._cann_end_pos = torch.empty(4, dtype=torch.int32)
-    builder._cann_cu_seqlens = torch.empty(5, dtype=torch.int32)
-    builder._cann_pool_tail_k = torch.empty(4, dtype=torch.int64)
-    builder._cann_actual_seq_q = torch.empty(4, dtype=torch.int64)
-    builder._cann_actual_seq_k = torch.empty(4, dtype=torch.int64)
-    builder._cann_state_block_table = torch.full(
-        (4, builder._cann_max_blocks),
-        KEY_POOL_INVALID_BLOCK_ID,
-        dtype=torch.int32,
-    )
-
     metadata = builder.build(0, common_metadata)
 
     # start_pos = seq_lens - query_lens = [10-4, 14-2] = [6, 12]
     assert metadata.cann_start_pos.tolist() == [6, 12]
     assert metadata.cann_cu_seqlens.tolist() == [0, 4, 6]
+    assert metadata.cann_cu_seqlens.data_ptr() == common_metadata.query_start_loc.data_ptr()
     # pool_tail_k = end_pos % cmp_ratio = [10 % 4, 14 % 4] = [2, 2]
     assert metadata.cann_pool_tail_k.tolist() == [2, 2]
     assert metadata.cann_pool_tail_k.dtype == torch.int64
@@ -1958,9 +1939,14 @@ def test_indexer_kpool_state_builder_builds_cann_params_once():
     # batch 1 keeps vLLM physical block 9 without remapping.
     assert metadata.cann_state_block_table[1, 3].item() == 9
     assert metadata.cann_state_block_table[1, 0].item() == KEY_POOL_INVALID_BLOCK_ID
-    # Persistent buffers are reused: same object, refreshed in place.
-    assert metadata.cann_state_block_table is builder._cann_state_block_table[:2]
-    assert metadata.cann_pool_tail_k is builder._cann_pool_tail_k[:2]
+    # Persistent buffers are reused: slices share the builder storage.
+    assert (
+        metadata.cann_state_block_table.data_ptr()
+        == builder._cann_state_block_table.data_ptr()
+    )
+    assert metadata.cann_pool_tail_k.data_ptr() == builder._cann_pool_tail_k.data_ptr()
+    assert builder._cann_invalid_block_id.shape == ()
+    assert builder._cann_invalid_block_id.item() == KEY_POOL_INVALID_BLOCK_ID
 
 
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
@@ -2026,7 +2012,9 @@ def test_indexer_kpool_forward_cann_uses_cann_ops(
         state_cache=state_layer,
         attn_layer_name="layer.attn",
     )
-    mock_key_pool.return_value = torch.zeros((1, 4, 2), dtype=torch.bfloat16)
+    # T=1, R=4: output capacity follows this invocation, not the four-column
+    # state block table.
+    mock_key_pool.return_value = torch.zeros((1, 1, 2), dtype=torch.bfloat16)
     mock_pki.return_value = torch.zeros((1, 7), dtype=torch.int32)
 
     result = op.forward_cann(

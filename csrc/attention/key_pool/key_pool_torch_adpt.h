@@ -48,12 +48,15 @@ at::Tensor ConstructKeyPoolOutputTensor(const at::Tensor& hidden_states,
     TORCH_CHECK(cache_block_table.dim() == KEY_POOL_DIM_TWO,
                 "cache_block_table dim num[", cache_block_table.dim(),
                 "] should be 2");
-    int64_t pcap = (cache_block_table.size(1) * state_cache.size(1) +
-                    cmp_ratio - 1) /
-                   cmp_ratio;
+    // The block table covers addressable history. A call can complete at
+    // most ceil(tokens / cmp_ratio) pools for any one sequence.
+    int64_t tokens_per_batch = hidden_states_dim == KEY_POOL_DIM_TWO
+                                   ? hidden_states.size(0)
+                                   : hidden_states.size(1);
+    int64_t pcap = (tokens_per_batch + cmp_ratio - 1) / cmp_ratio;
     pooled_key_size = {cache_block_table.size(0), pcap, wk.size(0)};
 
-    pooled_key = at::zeros(pooled_key_size,
+    pooled_key = at::empty(pooled_key_size,
                            hidden_states.options().dtype(hidden_states.dtype()));
     return pooled_key;
 }

@@ -409,7 +409,7 @@ def _append_tail_to_topk(
     history_values = torch.gather(topk_result, 1, safe_history)
     tail_values = (tail_start[:, None] + tail_offsets).to(torch.int32)
 
-    output = torch.where(is_history, history_values, -1)
+    output = history_values.masked_fill(~is_history, -1)
     return torch.where(is_tail, tail_values, output)
 
 

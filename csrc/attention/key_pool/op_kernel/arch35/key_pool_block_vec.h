@@ -1017,8 +1017,7 @@ __aicore__ inline void KeyPoolBlockVector<COMP>::CopyOutVec1ResToOutput(const Lo
     Cast(outputUb, comperssoredUb, RoundMode::CAST_ROUND, compressTcSize * dDealSize);
     outputQue2.EnQue(outputUb);
     outputQue2.DeQue<HIDDEN_STATES_T>();
-    uint32_t outputPoolCapacity =
-        CeilDivT(constInfo_.maxBlockNumPerBatch * constInfo_.blockSize, cmpRatio_);
+    uint32_t outputPoolCapacity = CeilDivT(constInfo_.sSize, cmpRatio_);
     uint32_t bIdx = sliceInfo.bIdx;
     uint32_t sIdx = sliceInfo.sIdx;
     uint64_t ubOffset = 0;
@@ -1562,8 +1561,7 @@ __aicore__ inline void KeyPoolBlockVector<COMP>::ComputeIncrementalPool()
         return;
     }
     dDealSize = min(dDealSize, constInfo_.headDim - dStartIdx);
-    uint32_t outputPoolCapacity =
-        CeilDivT(constInfo_.maxBlockNumPerBatch * constInfo_.blockSize, cmpRatio_);
+    uint32_t outputPoolCapacity = CeilDivT(constInfo_.sSize, cmpRatio_);
 
     for (uint32_t bIdx = 0; bIdx < constInfo_.batchSize; bIdx++) {
         uint32_t startPool = GetStartPos(bIdx) / cmpRatio_;

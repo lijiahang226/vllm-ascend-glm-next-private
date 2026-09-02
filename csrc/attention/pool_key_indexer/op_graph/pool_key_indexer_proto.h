@@ -19,8 +19,8 @@ namespace ge {
  * @brief Selects top-k pooled keys and expands them to token indices.
  *
  * Inputs use BSND/TND query layouts and BSND/TND/PA_BBND key layouts.
- * pool_tail_k and actual_seq_q/actual_seq_k use INT64 ValueDepend semantics;
- * the generated Tensor ACLNN variant keeps device values graph-replayable.
+ * Sequence metadata stays in INT64 device tensors and is consumed by the
+ * kernel at runtime, so refreshed values remain graph-replayable.
  */
 REG_OP(PoolKeyIndexer)
     .INPUT(query, TensorType({DT_FLOAT16, DT_BF16, DT_FLOAT8_E4M3FN}))

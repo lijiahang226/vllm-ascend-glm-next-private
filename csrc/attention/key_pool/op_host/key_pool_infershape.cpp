@@ -94,18 +94,15 @@ ge::graphStatus GetKeyPoolShapeDim(const gert::InferShapeContext* context, KeyPo
         shapeParam.isBsMerge = true;
         auto cuSeqlensShape = context->GetOptionalInputShape(CU_SEQLENS_INPUT_INDEX);
         shapeParam.B = cuSeqlensShape->GetDim(DIM_INDEX_0) - 1;
-        shapeParam.Sr = (cacheBlockTableShape->GetDim(DIM_INDEX_1) * stateCacheShape->GetDim(DIM_INDEX_1) +
-            cmpRatio - 1) / cmpRatio;
         shapeParam.T = hiddenStatesShape->GetDim(DIM_INDEX_0);
+        // A call can complete at most ceil(T / cmpRatio) pools for any one
+        // sequence.  Cache-table width describes addressability, not output
+        // size, and may span the full model context.
+        shapeParam.Sr = (shapeParam.T + cmpRatio - 1) / cmpRatio;
         shapeParam.H = hiddenStatesShape->GetDim(DIM_INDEX_1);
     }
 
     shapeParam.D = wkShape->GetDim(DIM_INDEX_0);
-    if (!shapeParam.isBsMerge) {
-        shapeParam.Sr = (cacheBlockTableShape->GetDim(DIM_INDEX_1) * stateCacheShape->GetDim(DIM_INDEX_1) +
-            cmpRatio - 1) / cmpRatio;
-    }
-
     return GRAPH_SUCCESS;
 }
 

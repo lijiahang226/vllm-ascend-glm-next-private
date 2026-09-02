@@ -981,8 +981,7 @@ __aicore__ inline void KeyPoolBlockVectorFullLoad<COMP>::CopyOutVec1ResToOutput(
     Cast(outputUb, comperssoredUb, RoundMode::CAST_ROUND, compressTcSize * dDealSize);
     outputQue1.EnQue(outputUb);
     outputQue1.DeQue<HIDDEN_STATES_T>();
-    uint32_t outputPoolCapacity =
-        CeilDivT(constInfo_.maxBlockNumPerBatch * constInfo_.blockSize, cmpRatio_);
+    uint32_t outputPoolCapacity = CeilDivT(constInfo_.sSize, cmpRatio_);
     uint32_t bIdx = sliceInfo.bIdx;
     uint32_t sIdx = sliceInfo.sIdx;
     uint64_t ubOffset = 0;
@@ -1269,8 +1268,7 @@ __aicore__ inline void KeyPoolBlockVectorFullLoad<COMP>::ComputeIncrementalPool(
     dDealSize = min(dDealSize, constInfo_.headDim - dStartIdx);
     uint32_t maxPoolCount = BUFFER_SIZE_BYTE_16K / (cmpRatio_ * dDealSize * sizeof(T));
     maxPoolCount = max(maxPoolCount, 1U);
-    uint32_t outputPoolCapacity =
-        CeilDivT(constInfo_.maxBlockNumPerBatch * constInfo_.blockSize, cmpRatio_);
+    uint32_t outputPoolCapacity = CeilDivT(constInfo_.sSize, cmpRatio_);
 
     apeUb = inputQueApe.AllocTensor<T>();
     CopyInApe(dStartIdx, dDealSize);

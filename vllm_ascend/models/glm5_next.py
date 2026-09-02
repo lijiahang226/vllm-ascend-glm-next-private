@@ -633,7 +633,7 @@ class AscendSparseAttnIndexerKpool(nn.Module):
                 topk_offsets = topk_offsets.squeeze(1)
             tail_values = (tail_raw + topk_offsets.to(torch.int64).unsqueeze(1)).to(torch.int32)
 
-        output = torch.where(is_history, history_values, -1)
+        output = history_values.masked_fill(~is_history, -1)
         return torch.where(is_tail, tail_values, output)
 
     @staticmethod
@@ -1105,8 +1105,8 @@ class AscendSparseAttnIndexerKpool(nn.Module):
     ) -> torch.Tensor:
         # CANN KeyPool + PoolKeyIndexer fused path (the only indexer path;
         # GLM-5 Next never uses RoPE on the indexer K, so there is no Triton
-        # fallback). PoolKeyIndexer sequence lengths use the ValueDepend Tensor
-        # API and are read from GM at runtime; KeyPool iterates batches by
+        # fallback). PoolKeyIndexer reads sequence lengths from GM at runtime;
+        # KeyPool iterates batches by
         # cu_seqlens differences, so padded rows are naturally ignored in full
         # graph and replay reads refreshed device values.
         return self.forward_cann(
@@ -1165,8 +1165,7 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             raise TypeError("GLM-5 indexer cache must be one bfloat16 K tensor.")
 
         # CANN dependency parameters are pre-built by the metadata builder
-        # (all device tensors; PoolKeyIndexer ValueDepend inputs use the Tensor
-        # API and are read from GM at runtime). Read-only here: no construction,
+        # (all device tensors read from GM at runtime). Read-only here: no construction,
         # no host-device sync.
         start_pos = state_metadata.cann_start_pos
         cu_seqlens = state_metadata.cann_cu_seqlens
