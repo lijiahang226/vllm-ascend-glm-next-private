@@ -54,6 +54,7 @@ def _stable_argsort_for_npu(tensor: torch.Tensor) -> torch.Tensor:
     return torch.argsort(tensor, stable=True)
 
 
+@dataclass
 class AscendGDNAttentionMetadata(GDNAttentionMetadata):
     """GDN metadata plus a host-side copy of the non-spec query prefix.
 
