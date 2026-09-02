@@ -34,7 +34,6 @@ from vllm_ascend.device.device_op import DeviceOperator
 INDEXER_KPOOL_MLA_SPARSE_ATTN_QUERY_CHUNK_SIZE = 16
 INDEXER_KPOOL_MLA_SAS_METADATA_SIZE = 1024
 GLM5_SFA_KERNEL_BLOCK_SIZE = 128
-KEY_POOL_INVALID_BLOCK_ID = -1
 
 
 @dataclass
@@ -300,20 +299,10 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
         self._cann_pool_tail_k = torch.empty(max_num_seqs, dtype=torch.int64, device=device)
         self._cann_actual_seq_q = torch.empty(max_num_seqs, dtype=torch.int64, device=device)
         self._cann_actual_seq_k = torch.empty(max_num_seqs, dtype=torch.int64, device=device)
-        self._cann_state_block_table = torch.full(
+        self._cann_state_block_table = torch.empty(
             (max_num_seqs, self._cann_max_blocks),
-            KEY_POOL_INVALID_BLOCK_ID,
             dtype=torch.int32,
             device=device,
-        )
-        self._cann_block_ids = torch.arange(
-            self._cann_max_blocks, dtype=torch.int32, device=device
-        )
-        # torch_npu requires both torch.where branches to be tensors when an
-        # out tensor is supplied. A persistent scalar broadcasts without a
-        # per-step full_like allocation and keeps its address graph-stable.
-        self._cann_invalid_block_id = torch.tensor(
-            KEY_POOL_INVALID_BLOCK_ID, dtype=torch.int32, device=device
         )
 
     def _build_cann_params(
@@ -339,27 +328,16 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
         self._cann_actual_seq_k[:num_reqs].copy_(
             torch.div(end_pos, self.compress_ratio, rounding_mode="floor")
         )
-        # Full-width state block table: the sliding-window cache (one physical
-        # block per request) is mapped by logical block address, which the CANN
-        # op addresses as pos // block_size. vLLM physical block IDs are
-        # natively 0-based; -1 marks entries outside the active logical range.
+        # KeyPool addresses this table with the absolute logical page id.  The
+        # GLM-5 compressor state is a one-page sliding tail, so every logical
+        # page of one request intentionally aliases the same physical page.
+        # Materialize that view in persistent storage: passing an expanded
+        # stride-0 view would make ACLNN allocate an AutoContiguous temporary,
+        # while a scalar branch in torch.where becomes a host scalar argument
+        # on torch_npu eager and can yield an invalid GM address.
         table = self._cann_state_block_table[:num_reqs]
-        first_blocks = torch.div(start_pos, self.block_size, rounding_mode="floor")
-        last_blocks = torch.div(end_pos - 1, self.block_size, rounding_mode="floor")
         physical = common_attn_metadata.block_table_tensor[:num_reqs, 0]
-        block_ids = self._cann_block_ids
-        in_range = (
-            (physical[:, None] >= 0)
-            & (block_ids[None, :] >= first_blocks[:, None])
-            & (block_ids[None, :] <= last_blocks[:, None])
-        )
-        expanded = physical[:, None].expand(num_reqs, self._cann_max_blocks)
-        torch.where(
-            in_range,
-            expanded,
-            self._cann_invalid_block_id,
-            out=table,
-        )
+        table.copy_(physical[:, None].expand_as(table))
         metadata.cann_state_block_table = table
 
         metadata.cann_start_pos = self._cann_start_pos[:num_reqs]
@@ -723,11 +701,10 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
             values,
             torch.zeros_like(values),
         ).sum(dim=0)
-        expected_zero = torch.where(
-            row_zero_mask.any(),
-            update_zero,
-            row_zero,
-        )
+        row_zero_selected = row_zero_mask.view(
+            -1, *([1] * (values.ndim - 1))
+        ).expand_as(values).any(dim=0)
+        expected_zero = torch.where(row_zero_selected, update_zero, row_zero)
         cache[block_ids, block_offsets] = safe_values
         cache[0, 0].copy_(expected_zero)
 

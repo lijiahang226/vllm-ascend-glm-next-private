@@ -455,11 +455,15 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             dtype=torch.int32,
             device=device,
         )
-        # torch_npu binary out variants require a Tensor ``other``. Keep the
-        # comparison scalar persistent so metadata builds do not allocate it
-        # per step and ACLGraph observes a stable address.
-        self._zero_draft_token = torch.zeros((), dtype=torch.int32, device=device)
-        self._zero_draft_token_cpu = torch.zeros((), dtype=torch.int32, device="cpu")
+        # torch_npu binary out variants require a Tensor ``other``. A 0-D NPU
+        # tensor is still lowered as a scalar host argument in eager mode, so
+        # keep same-shape persistent vectors and slice them to the active rows.
+        self._zero_draft_tokens = torch.zeros(
+            (sequence_index_capacity,), dtype=torch.int32, device=device
+        )
+        self._zero_draft_tokens_cpu = torch.zeros(
+            (sequence_index_capacity,), dtype=torch.int32, device="cpu"
+        )
 
     def _init_reorder_batch_threshold(
         self,
@@ -699,7 +703,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             spec_sequence_masks_cpu = self.spec_sequence_masks_cpu[:num_reqs]
             torch.ge(
                 num_decode_draft_tokens_cpu,
-                self._zero_draft_token_cpu,
+                self._zero_draft_tokens_cpu[:num_reqs],
                 out=spec_sequence_masks_cpu,
             )
             # NOTE: spec-sized (num_spec + 1) prefill tail chunks are not
@@ -720,7 +724,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 if num_decode_draft_tokens is not None:
                     torch.ge(
                         num_decode_draft_tokens[:num_reqs],
-                        self._zero_draft_token,
+                        self._zero_draft_tokens[:num_reqs],
                         out=spec_sequence_masks,
                     )
                 else:

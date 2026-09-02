@@ -442,7 +442,10 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             values,
             torch.zeros_like(values),
         ).sum(dim=0)
-        expected_zero = torch.where(row_zero_mask.any(), update_zero, row_zero)
+        row_zero_selected = row_zero_mask.view(
+            -1, *([1] * (values.ndim - 1))
+        ).expand_as(values).any(dim=0)
+        expected_zero = torch.where(row_zero_selected, update_zero, row_zero)
         # Avoid aclnnScatterNdUpdateV2 in ACLGraph capture. Padded rows use
         # row zero as a fixed-shape sentinel and it is restored immediately.
         cache_rows[safe_slots] = safe_values
@@ -477,11 +480,10 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             values,
             torch.zeros_like(values),
         ).sum(dim=0)
-        expected_zero = torch.where(
-            row_zero_mask.any(),
-            update_zero,
-            row_zero,
-        )
+        row_zero_selected = row_zero_mask.view(
+            -1, *([1] * (values.ndim - 1))
+        ).expand_as(values).any(dim=0)
+        expected_zero = torch.where(row_zero_selected, update_zero, row_zero)
         cache[block_ids, block_offsets] = safe_values
         cache[0, 0].copy_(expected_zero)
 

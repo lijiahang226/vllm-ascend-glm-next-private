@@ -197,6 +197,22 @@ def _make_builder(
     return AscendGDNAttentionMetadataBuilder(spec, ["layer0"], vllm_config, device)
 
 
+def test_gdn_builder_uses_rank_one_comparison_buffers():
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=1,
+    )
+
+    assert builder._zero_draft_tokens.ndim == 1
+    assert builder._zero_draft_tokens_cpu.ndim == 1
+    assert builder._zero_draft_tokens.shape == builder.spec_sequence_masks.shape
+    assert (
+        builder._zero_draft_tokens_cpu.shape
+        == builder.spec_sequence_masks_cpu.shape
+    )
+
+
 def _build_attn_metadata(
     batch_spec: BatchSpec,
     *,

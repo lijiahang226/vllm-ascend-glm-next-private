@@ -33,7 +33,6 @@ from vllm_ascend.attention.indexer_kpool_mla_v1 import (
     AscendIndexerKPoolMLAMetadataBuilder,
     AscendIndexerKPoolStateBackend,
     AscendIndexerKPoolStateMetadataBuilder,
-    KEY_POOL_INVALID_BLOCK_ID,
 )
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
 from vllm_ascend.core.kv_cache_interface import (
@@ -1930,23 +1929,21 @@ def test_indexer_kpool_state_builder_builds_cann_params_once():
     # actual_seq_k = floor(seq_lens / cmp_ratio) = [2, 3]
     assert metadata.cann_actual_seq_k.tolist() == [2, 3]
     assert metadata.cann_actual_seq_k.dtype == torch.int64
-    # New pools cover logical blocks [floor(6/4), floor(9/4)] = [1, 2].
-    # KeyPool accepts vLLM's native 0-based physical block IDs; -1 is invalid.
+    # The state cache is a one-page sliding tail: every absolute logical page
+    # for a request aliases that request's single physical state page.
     assert metadata.cann_state_block_table[0, 1].item() == 0
     assert metadata.cann_state_block_table[0, 2].item() == 0
-    assert metadata.cann_state_block_table[0, 0].item() == KEY_POOL_INVALID_BLOCK_ID
+    assert metadata.cann_state_block_table[0, 0].item() == 0
     assert common_metadata.block_table_tensor[0, 0].item() == 0
     # batch 1 keeps vLLM physical block 9 without remapping.
     assert metadata.cann_state_block_table[1, 3].item() == 9
-    assert metadata.cann_state_block_table[1, 0].item() == KEY_POOL_INVALID_BLOCK_ID
+    assert metadata.cann_state_block_table[1, 0].item() == 9
     # Persistent buffers are reused: slices share the builder storage.
     assert (
         metadata.cann_state_block_table.data_ptr()
         == builder._cann_state_block_table.data_ptr()
     )
     assert metadata.cann_pool_tail_k.data_ptr() == builder._cann_pool_tail_k.data_ptr()
-    assert builder._cann_invalid_block_id.shape == ()
-    assert builder._cann_invalid_block_id.item() == KEY_POOL_INVALID_BLOCK_ID
 
 
 @patch("vllm_ascend.models.glm5_next.get_forward_context")

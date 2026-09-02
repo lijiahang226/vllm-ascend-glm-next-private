@@ -149,3 +149,50 @@ def test_cann_pool_key_indexer_matches_previous_indexer_chain():
         torch.sort(previous[:, :index_topk], dim=-1).values,
     )
     torch.testing.assert_close(cann[:, index_topk:], previous[:, index_topk:])
+
+
+def test_cann_pool_key_indexer_returns_causal_tail_before_first_pool():
+    """The first request must not lose its tail when no pool exists yet."""
+    torch.manual_seed(13)
+    device = torch.device("npu")
+    pool_size, index_topk = 4, 8
+    num_tokens, num_heads, head_dim = 2, 4, 128
+
+    query = torch.randn(
+        num_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    weights = torch.randn(
+        num_tokens, num_heads, dtype=torch.bfloat16, device=device
+    )
+    cache = torch.zeros(
+        1, 1, 1, head_dim, dtype=torch.bfloat16, device=device
+    )
+    cann = glm5_next_pool_key_indexer(
+        query,
+        cache,
+        weights,
+        torch.tensor([num_tokens], dtype=torch.int64, device=device),
+        actual_seq_q=torch.tensor(
+            [num_tokens], dtype=torch.int64, device=device
+        ),
+        actual_seq_k=torch.tensor([0], dtype=torch.int64, device=device),
+        block_table=torch.tensor([[0]], dtype=torch.int32, device=device),
+        layout_q="TND",
+        layout_k="PA_BBND",
+        topk=index_topk,
+        pool_size=pool_size,
+        mask_mode=3,
+    )
+    torch.npu.synchronize()
+
+    expected = torch.full(
+        (num_tokens, index_topk + pool_size - 1),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    expected[0, index_topk] = 0
+    expected[1, index_topk : index_topk + 2] = torch.tensor(
+        [0, 1], dtype=torch.int32, device=device
+    )
+    torch.testing.assert_close(cann, expected)
