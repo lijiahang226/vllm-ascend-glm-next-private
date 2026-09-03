@@ -1210,16 +1210,15 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         # shape and cannot be captured, and it triggers a host sync).
         # Non-pool-completing tokens have slot -1 and are skipped by
         # _scatter_paged_cache, with pooled rows masked to zero by valid_rows.
-        selected = torch.arange(num_tokens, device=hidden_states.device)
-        if selected.numel() > 0:
+        if num_tokens > 0:
             token_ids = torch.arange(num_tokens, device=hidden_states.device)
             request_ids = torch.bucketize(
                 token_ids,
                 attn_metadata.cum_query_lens,
                 right=True,
             ).clamp_max(attn_metadata.seq_lens.shape[0] - 1)
-            selected_request_ids = request_ids[selected]
-            selected_positions = positions[selected]
+            selected_request_ids = request_ids
+            selected_positions = positions[:num_tokens]
             pool_ids = torch.div(
                 selected_positions + 1,
                 index_kpool,
@@ -1238,7 +1237,7 @@ class AscendSparseAttnIndexerKpool(nn.Module):
                 pooled,
                 torch.zeros_like(pooled),
             )
-            slots = indexer_metadata.slot_mapping[selected].to(torch.int64)
+            slots = indexer_metadata.slot_mapping[:num_tokens].to(torch.int64)
             self._scatter_paged_cache(
                 indexer_cache,
                 slots,

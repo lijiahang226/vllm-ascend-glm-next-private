@@ -390,7 +390,8 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::DealActSeqLenIsZero(uint32_t b
             uint32_t tBase = bIdx == 0 ? 0 : static_cast<uint32_t>(actualSeqLengthsGmQ.GetValue(bIdx - 1));
             uint32_t s1Count = tempLoopInfo.actS1Size;
 
-            for (uint32_t s1Idx = s1Start; s1Idx < s1Count; s1Idx++) {
+            for (uint32_t s1Idx = s1Start + tmpBlockIdx % 2;
+                 s1Idx < s1Count; s1Idx += 2) {
                 uint64_t indiceOutOffset =
                     (tBase + s1Idx) * constInfo.kHeadNum * idxOutStride + // T轴、s1轴偏移
                     n2Idx * idxOutStride;                                 // N2轴偏移
@@ -401,7 +402,8 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::DealActSeqLenIsZero(uint32_t b
                     tempLoopInfo.actS1Size);
             }
         } else if (constInfo.outputLayout == PkiLayout::BSND) {
-            for (uint32_t s1Idx = s1Start; s1Idx < constInfo.qSeqSize; s1Idx++) {
+            for (uint32_t s1Idx = s1Start + tmpBlockIdx % 2;
+                 s1Idx < constInfo.qSeqSize; s1Idx += 2) {
                 // B,S1,N2,K
                 uint64_t indiceOutOffset = bIdx * constInfo.qSeqSize * constInfo.kHeadNum * idxOutStride +
                                            s1Idx * constInfo.kHeadNum * idxOutStride + // B轴、S1轴偏移
@@ -647,7 +649,12 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::ProcessInvalid()
                                     ? static_cast<int32_t>(
                                           poolTailKGm_.GetValue(bIdx))
                                     : 0;
-            for (uint32_t s1Idx = 0; s1Idx < actS1Size; ++s1Idx) {
+            // TND has no padding rows. BSND does, and those rows must still be
+            // initialized just like the former whole-output fast path.
+            uint32_t rowsToClean = constInfo.outputLayout == PkiLayout::TND
+                                       ? actS1Size
+                                       : constInfo.qSeqSize;
+            for (uint32_t s1Idx = 0; s1Idx < rowsToClean; ++s1Idx) {
                 for (uint32_t n2Idx = 0; n2Idx < constInfo.kHeadNum;
                      ++n2Idx) {
                     uint64_t row =
@@ -659,10 +666,12 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::ProcessInvalid()
                     }
                     int64_t idxOutBase = row * idxOutStride;
                     vectorService.CleanInvalidOutput(idxOutBase);
-                    vectorService.WriteTailOnly(
-                        idxOutBase, poolTailK,
-                        static_cast<int32_t>(actS2SizeOrig), s1Idx,
-                        actS1Size);
+                    if (s1Idx < actS1Size) {
+                        vectorService.WriteTailOnly(
+                            idxOutBase, poolTailK,
+                            static_cast<int32_t>(actS2SizeOrig), s1Idx,
+                            actS1Size);
+                    }
                 }
             }
         }

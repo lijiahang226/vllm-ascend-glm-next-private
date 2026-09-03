@@ -859,13 +859,15 @@ at::Tensor npu_key_pool_meta(
     (void)rotary_mode;
     // Matches key_pool_infershape. Cache-table width covers addressable
     // history and must not determine this invocation's temporary output.
-    int64_t b = start_pos.size(0);
-    int64_t d = wk.size(0);
-    int64_t tokens_per_batch = hidden_states.dim() == 2
-                                   ? hidden_states.size(0)
-                                   : hidden_states.size(1);
-    int64_t sr = (tokens_per_batch + cmp_ratio - 1) / cmp_ratio;
-    return at::empty_symint({b, sr, d}, hidden_states.options());
+    c10::SymInt b = start_pos.sym_size(0);
+    c10::SymInt d = wk.sym_size(0);
+    c10::SymInt tokens_per_batch = hidden_states.dim() == 2
+                                       ? hidden_states.sym_size(0)
+                                       : hidden_states.sym_size(1);
+    c10::SymInt ratio(cmp_ratio);
+    c10::SymInt sr = (tokens_per_batch + ratio - c10::SymInt(1)) / ratio;
+    c10::SymDimVector output_shape{b, sr, d};
+    return at::empty_symint(output_shape, hidden_states.options());
 }
 
 std::tuple<at::Tensor, at::Tensor> npu_pool_key_indexer_meta(
@@ -902,25 +904,28 @@ std::tuple<at::Tensor, at::Tensor> npu_pool_key_indexer_meta(
     //   TND:  indices [T1, topk + pool_size - 1],     values [T1, topk / pool_size]
     // indices are always INT32; values are FLOAT and empty ({0}) unless
     // return_value is set.
-    int64_t indices_last = topk + pool_size - 1;
-    int64_t values_last = topk / pool_size;
+    c10::SymInt indices_last(topk + pool_size - 1);
+    c10::SymInt values_last(topk / pool_size);
     bool is_bsnd = (std::string(layout_q) == "BSND");
     at::Tensor indices;
     at::Tensor values;
     if (is_bsnd) {
-        indices = at::empty_symint(
-            {query.size(0), query.size(1), indices_last},
-            query.options().dtype(at::kInt));
-        values = return_value
-                     ? at::empty_symint({query.size(0), query.size(1), values_last},
-                                        query.options().dtype(at::kFloat))
-                     : at::empty_symint({0}, query.options().dtype(at::kFloat));
-    } else {
-        int64_t t1 = query.size(0);
-        indices = at::empty_symint({t1, indices_last},
+        c10::SymDimVector indices_shape{
+            query.sym_size(0), query.sym_size(1), indices_last};
+        indices = at::empty_symint(indices_shape,
                                    query.options().dtype(at::kInt));
         values = return_value
-                     ? at::empty_symint({t1, values_last},
+                     ? at::empty_symint(
+                           c10::SymDimVector{query.sym_size(0),
+                                             query.sym_size(1), values_last},
+                           query.options().dtype(at::kFloat))
+                     : at::empty_symint({0}, query.options().dtype(at::kFloat));
+    } else {
+        c10::SymInt t1 = query.sym_size(0);
+        indices = at::empty_symint(c10::SymDimVector{t1, indices_last},
+                                   query.options().dtype(at::kInt));
+        values = return_value
+                     ? at::empty_symint(c10::SymDimVector{t1, values_last},
                                         query.options().dtype(at::kFloat))
                      : at::empty_symint({0}, query.options().dtype(at::kFloat));
     }

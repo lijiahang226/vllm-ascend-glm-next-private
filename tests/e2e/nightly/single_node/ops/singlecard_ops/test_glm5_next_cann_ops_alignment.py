@@ -196,3 +196,51 @@ def test_cann_pool_key_indexer_returns_causal_tail_before_first_pool():
         [0, 1], dtype=torch.int32, device=device
     )
     torch.testing.assert_close(cann, expected)
+
+
+def test_cann_pool_key_indexer_handles_empty_request_in_mixed_batch():
+    """An empty-pool request remains valid when another request launches MM."""
+    torch.manual_seed(17)
+    device = torch.device("npu")
+    pool_size, index_topk = 4, 8
+    tokens_per_request, num_heads, head_dim = 2, 4, 128
+    num_tokens = 2 * tokens_per_request
+
+    query = torch.randn(
+        num_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    weights = torch.randn(
+        num_tokens, num_heads, dtype=torch.bfloat16, device=device
+    )
+    cache = torch.randn(
+        2, 1, 1, head_dim, dtype=torch.bfloat16, device=device
+    )
+    cann = glm5_next_pool_key_indexer(
+        query,
+        cache,
+        weights,
+        torch.tensor([2, 2], dtype=torch.int64, device=device),
+        actual_seq_q=torch.tensor([2, 4], dtype=torch.int64, device=device),
+        # Request 0 launches the pool-level matmul; request 1 must take the
+        # per-request empty-pool path inside the same kernel invocation.
+        actual_seq_k=torch.tensor([1, 0], dtype=torch.int64, device=device),
+        block_table=torch.tensor([[0], [1]], dtype=torch.int32, device=device),
+        layout_q="TND",
+        layout_k="PA_BBND",
+        topk=index_topk,
+        pool_size=pool_size,
+        mask_mode=3,
+    )
+    torch.npu.synchronize()
+
+    expected_empty_request = torch.full(
+        (tokens_per_request, index_topk + pool_size - 1),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    expected_empty_request[0, index_topk] = 0
+    expected_empty_request[1, index_topk : index_topk + 2] = torch.tensor(
+        [0, 1], dtype=torch.int32, device=device
+    )
+    torch.testing.assert_close(cann[tokens_per_request:], expected_empty_request)

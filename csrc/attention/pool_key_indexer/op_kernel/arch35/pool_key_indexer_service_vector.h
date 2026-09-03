@@ -73,13 +73,16 @@ public:
     __aicore__ inline void InitVecInputTensor(GlobalTensor<W_T> weightsGm, GlobalTensor<int32_t> indiceOutGm,
                                               GlobalTensor<float> valueOutGm, GlobalTensor<int32_t> blockTableGm);
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
-    __aicore__ inline void WriteTailOnly(int64_t idxOutBase, int32_t poolTailK,
-                                        int32_t lOrig, uint32_t curS1Idx,
-                                        uint32_t curS1Size);
+    __aicore__ inline void CleanInvalidOutputWithTail(
+        int64_t idxOutBase, int32_t poolTailK, int32_t lOrig,
+        uint32_t curS1Idx, uint32_t curS1Size);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
 
 private:
+    __aicore__ inline void WriteInvalidOutput(
+        int64_t idxOutBase, int32_t poolTailK, int32_t lOrig,
+        uint32_t curS1Idx, uint32_t curS1Size);
     __aicore__ inline void ExpandAndAppendIndices(LocalTensor<int32_t> poolIndices,
                                                   LocalTensor<int32_t> &tokenIndices,
                                                   LocalTensor<int32_t> &workBuf,
@@ -318,53 +321,76 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::FreeEventID()
 }
 
 template <typename LIT>
-__aicore__ inline void PoolKeyIndexerServiceVector<LIT>::WriteTailOnly(
-    int64_t idxOutBase, int32_t poolTailK, int32_t lOrig,
-    uint32_t curS1Idx, uint32_t curS1Size)
+__aicore__ inline void PoolKeyIndexerServiceVector<LIT>::CleanInvalidOutput(int64_t invalidS1Offset)
 {
-    if (poolSize_ <= 1 || poolTailK <= 0) {
-        return;
-    }
-    int32_t globalPosQ = lOrig - static_cast<int32_t>(curS1Size) +
-                         static_cast<int32_t>(curS1Idx);
-    int32_t tailStart = lOrig - poolTailK;
-    int32_t maxTailK = PkiCommon::Min(
-        poolTailK, static_cast<int32_t>(poolSize_ - 1));
-    int32_t visibleTailK = PkiCommon::Max(
-        0, PkiCommon::Min(maxTailK, globalPosQ - tailStart + 1));
-    if (visibleTailK <= 0) {
-        return;
-    }
-
-    SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
-    WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
-    uint32_t tailLen = poolSize_ - 1;
-    Duplicate<int32_t>(expandOutLocal_, -1,
-                       PkiCommon::Align(tailLen, (uint32_t)8));
-    VToSSync();
-    for (int32_t t = 0; t < visibleTailK; ++t) {
-        expandOutLocal_.SetValue(static_cast<uint32_t>(t), tailStart + t);
-    }
-    SToMTE3Sync();
-    AscendC::DataCopyParams copyOutParams;
-    copyOutParams.blockCount = 1;
-    copyOutParams.blockLen = tailLen * sizeof(int32_t);
-    copyOutParams.srcStride = 0;
-    copyOutParams.dstStride = 0;
-    AscendC::DataCopyPad(
-        indiceOutGm[idxOutBase + constInfo_.sparseCount * poolSize_],
-        expandOutLocal_, copyOutParams);
+    WriteInvalidOutput(invalidS1Offset, 0, 0, 0, 0);
 }
 
 template <typename LIT>
-__aicore__ inline void PoolKeyIndexerServiceVector<LIT>::CleanInvalidOutput(int64_t invalidS1Offset)
+__aicore__ inline void PoolKeyIndexerServiceVector<LIT>::CleanInvalidOutputWithTail(
+    int64_t idxOutBase, int32_t poolTailK, int32_t lOrig,
+    uint32_t curS1Idx, uint32_t curS1Size)
 {
-    // init -1 and copy to output
-    uint64_t dealSize = (poolSize_ > 1) ? outputLen_ : constInfo_.sparseCount;
-    GlobalTensor<int32_t> indexOutput = indiceOutGm[invalidS1Offset];
-    AscendC::InitGlobalMemory(indexOutput, dealSize, constInfo_.INVALID_IDX);
+    WriteInvalidOutput(idxOutBase, poolTailK, lOrig, curS1Idx, curS1Size);
+}
+
+template <typename LIT>
+__aicore__ inline void PoolKeyIndexerServiceVector<LIT>::WriteInvalidOutput(
+    int64_t idxOutBase, int32_t poolTailK, int32_t lOrig,
+    uint32_t curS1Idx, uint32_t curS1Size)
+{
+    // Keep the same fixed-event lifecycle as ProcessTopK: AllocEventID primes
+    // MTE3_V, every row consumes it before reusing the UB and restores it
+    // after the final MTE3 copy.  This avoids racing InitGlobalMemory against
+    // a tail overwrite on A5.
+    WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
+
+    LocalTensor<int32_t> indexLocal;
+    uint32_t indexLen;
+    if (poolSize_ > 1) {
+        indexLocal = expandOutLocal_;
+        indexLen = outputLen_;
+    } else {
+        indexLocal = indicesOutLocal_.template ReinterpretCast<int32_t>();
+        indexLen = constInfo_.sparseCount;
+    }
+    Duplicate<int32_t>(indexLocal, constInfo_.INVALID_IDX,
+                       PkiCommon::Align(indexLen, (uint32_t)8));
+
+    if (poolSize_ > 1 && poolTailK > 0) {
+        int32_t tailStart = lOrig - poolTailK;
+        int32_t maxTailK = PkiCommon::Min(
+            poolTailK, static_cast<int32_t>(poolSize_ - 1));
+        int32_t visibleTailK = maxTailK;
+        if (constInfo_.maskMode != 0) {
+            int32_t globalPosQ = lOrig - static_cast<int32_t>(curS1Size) +
+                                 static_cast<int32_t>(curS1Idx);
+            visibleTailK = PkiCommon::Max(
+                0, PkiCommon::Min(maxTailK,
+                                  globalPosQ - tailStart + 1));
+        }
+        if (visibleTailK > 0) {
+            VToSSync();
+            uint32_t tailOffset = constInfo_.sparseCount * poolSize_;
+            for (int32_t t = 0; t < visibleTailK; ++t) {
+                indexLocal.SetValue(tailOffset + static_cast<uint32_t>(t),
+                                    tailStart + t);
+            }
+            SToMTE3Sync();
+        }
+    }
+
+    SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
+    WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
+    AscendC::DataCopyParams copyOutParams;
+    copyOutParams.blockCount = 1;
+    copyOutParams.blockLen = indexLen * sizeof(int32_t);
+    copyOutParams.srcStride = 0;
+    copyOutParams.dstStride = 0;
+    AscendC::DataCopyPad(indiceOutGm[idxOutBase], indexLocal, copyOutParams);
+    SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
+
     if (returnValue) {
-        SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
         WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
         Duplicate(valueOutLocal_.template ReinterpretCast<uint32_t>(), constInfo_.INVALID_VAL, constInfo_.sparseCount);
 
@@ -376,11 +402,12 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::CleanInvalidOutput(int6
         copyOutValueParams.blockLen = constInfo_.sparseCount * sizeof(float);
         copyOutValueParams.srcStride = 0;
         copyOutValueParams.dstStride = 0;
-        // invalidS1Offset 是 indices 行偏移(行宽 outputLen_/sparseCount);
+        // idxOutBase 是 indices 行偏移(行宽 outputLen_/sparseCount);
         // value 行宽为 sparseCount, 需换算行号后重算偏移, 否则越界写且本行 value 漏写
         uint64_t idxStride = (poolSize_ > 1) ? outputLen_ : constInfo_.sparseCount;
-        uint64_t valueOffset = (static_cast<uint64_t>(invalidS1Offset) / idxStride) * constInfo_.sparseCount;
+        uint64_t valueOffset = (static_cast<uint64_t>(idxOutBase) / idxStride) * constInfo_.sparseCount;
         AscendC::DataCopyPad(valueOutGm[valueOffset], valueOutLocal_, copyOutValueParams);
+        SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
     }
 }
 
@@ -407,6 +434,8 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ExpandAndAppendIndices(
             visibleTailK = maxTailK;
         } else {
             int32_t globalPosQ = L_orig - static_cast<int32_t>(curS1Size) + static_cast<int32_t>(curS1Idx);
+            // Tail visibility is measured from the first unfinished token,
+            // not from the unrelated top-k output width.
             int32_t tailStart = L_orig - poolTailK;
             visibleTailK = PkiCommon::Max(0,
                                           PkiCommon::Min(maxTailK, globalPosQ - tailStart + 1));
@@ -603,41 +632,11 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ProcessTopK(const PkiCo
             validS2Len = ((int32_t)i + cuRealAcSeq) / static_cast<int32_t>(constInfo_.poolSize);
         }
         if (validS2Len <= 0) {
-            WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
-            if (poolSize_ > 1) {
-                Duplicate(expandOutLocal_, neg, PkiCommon::Align(outputLen_, (uint32_t)8));
-                SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
-                WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
-                AscendC::DataCopyPad(indiceOutGm[info.indiceOutOffset + (curS1Idx + rowIdx) * outputLen_],
-                                     expandOutLocal_,
-                                     copyOutParams);
-            } else {
-                Duplicate(indicesOutLocal_.ReinterpretCast<int32_t>(), neg, topkCount_);
-                SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
-                WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
-                AscendC::DataCopyPad(indiceOutGm[info.indiceOutOffset + (curS1Idx + rowIdx) * topkCount_],
-                                     indicesOutLocal_.ReinterpretCast<int32_t>(),
-                                     copyOutParams);
-            }
-            SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
-            if (returnValue) {
-                WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
-                Duplicate(valueOutLocal_.template ReinterpretCast<uint32_t>(), constInfo_.INVALID_VAL, topkCount_);
-
-                SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
-                WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
-
-                AscendC::DataCopyParams copyOutValueParams;
-                copyOutValueParams.blockCount = 1;
-                copyOutValueParams.blockLen = topkCount_ * sizeof(float);
-                copyOutValueParams.srcStride = 0;
-                copyOutValueParams.dstStride = 0;
-                AscendC::DataCopyPad(
-                    valueOutGm[info.valueOutOffset + (curS1Idx + rowIdx) * topkCount_],
-                    valueOutLocal_,
-                    copyOutValueParams);
-                SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
-            }
+            uint32_t idxStride = poolSize_ > 1 ? outputLen_ : topkCount_;
+            CleanInvalidOutputWithTail(
+                info.indiceOutOffset + (curS1Idx + rowIdx) * idxStride,
+                info.poolTailK, static_cast<int32_t>(info.actS2SizeOrig),
+                static_cast<uint32_t>(curAivS1Idx + i), info.actS1Size);
             continue;
         }
 

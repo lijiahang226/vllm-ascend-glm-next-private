@@ -360,6 +360,8 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ExpandAndAppendIndices(
             visibleTailK = maxTailK;
         } else {
             int32_t globalPosQ = L_orig - static_cast<int32_t>(curS1Size) + static_cast<int32_t>(curS1Idx);
+            // Tail visibility is measured from the first unfinished token,
+            // not from the unrelated top-k output width.
             int32_t tailStart = L_orig - poolTailK;
             visibleTailK = PkiCommon::Max(0,
                                           PkiCommon::Min(maxTailK, globalPosQ - tailStart + 1));
@@ -460,6 +462,7 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::WriteTailOnly(
     }
     int32_t globalPosQ = lOrig - static_cast<int32_t>(curS1Size) +
                          static_cast<int32_t>(curS1Idx);
+    // Match the Triton path when no completed pool exists yet.
     int32_t tailStart = lOrig - poolTailK;
     int32_t maxTailK = PkiCommon::Min(
         poolTailK, static_cast<int32_t>(poolSize_ - 1));
@@ -480,6 +483,9 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::WriteTailOnly(
     DataCopyPad(indiceOutGm[idxOutBase + constInfo_.sparseCount * poolSize_],
                 expandOutLocal_,
                 {1, static_cast<uint16_t>(tailLen * sizeof(int32_t)), 0, 0});
+    // The next row reuses expandOutLocal_.  Wait for this tail copy before a
+    // subsequent Duplicate can overwrite the same UB.
+    MTE3ToVSync();
 }
 
 template <typename LIT>
@@ -817,7 +823,11 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ProcessVec(const PkiCom
             }
         } else if (cuRealAcSeq <= 0) {
             uint64_t idxStride = (poolSize_ > 1) ? outputLen_ : constInfo_.sparseCount;
-            CleanInvalidOutput(info.indiceOutOffset + cuS1Idx * idxStride);
+            int64_t idxOutBase = info.indiceOutOffset + cuS1Idx * idxStride;
+            CleanInvalidOutput(idxOutBase);
+            WriteTailOnly(idxOutBase, info.poolTailK,
+                          static_cast<int32_t>(info.actS2SizeOrig),
+                          static_cast<uint32_t>(cuS1Idx), info.actS1Size);
         }
     }
 
