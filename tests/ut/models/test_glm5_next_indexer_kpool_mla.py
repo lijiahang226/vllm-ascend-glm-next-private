@@ -1060,10 +1060,12 @@ def test_glm5_target_allocator_uses_twelve_large_and_eleven_small_tensors():
     vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(num_gpu_blocks_override=None),
     )
+    # The CANN key_pool dummy state pages are deducted from available_memory
+    # upfront, so add them back to keep num_blocks == 3.
     config = get_kv_cache_config_from_groups(
         vllm_config,
         groups,
-        available_memory=bytes_per_block * 3,
+        available_memory=bytes_per_block * 3 + 11 * layout.small_page_size,
     )
     num_blocks = config.num_blocks
     tensors = config.kv_cache_tensors
@@ -1077,9 +1079,10 @@ def test_glm5_target_allocator_uses_twelve_large_and_eleven_small_tensors():
     assert config.needs_kv_cache_zeroing
     assert len(tensors) == 23
     assert all(tensor.size == layout.main_page_size * 3 for tensor in tensors[:12])
-    # One extra padded page per small slot covers the CANN key_pool dummy
-    # state block 0 (plan §5.1).
-    assert all(tensor.size == layout.small_page_size * (3 + 1) for tensor in tensors[12:])
+    # KVCacheTensor.size stays page_size * num_blocks so the upstream
+    # block-count normalization sees exactly num_blocks; the dummy state page
+    # is added only at the physical allocation stage in the model runner.
+    assert all(tensor.size == layout.small_page_size * 3 for tensor in tensors[12:])
     assert tensors[0].shared_by == [
         "model.layers.3.self_attn.attn",
         "model.layers.0.mamba",
@@ -1107,7 +1110,7 @@ def test_glm5_combined_layout_adds_mtp_indexer_state_small_page():
     num_blocks, tensors = _get_kv_cache_config_deepseek_v4(
         SimpleNamespace(cache_config=SimpleNamespace(num_gpu_blocks_override=None)),
         groups,
-        available_memory=bytes_per_block * 2,
+        available_memory=bytes_per_block * 2 + 12 * layout.small_page_size,
     )
 
     assert num_blocks == 2
@@ -1182,7 +1185,7 @@ def test_indexer_kpool_mla_standalone_mtp_allocator_uses_two_page_classes():
     num_blocks, tensors = _get_kv_cache_config_deepseek_v4(
         vllm_config,
         groups,
-        available_memory=bytes_per_block * 3,
+        available_memory=bytes_per_block * 3 + small_page_size,
     )
 
     assert num_blocks == 3
@@ -1193,8 +1196,9 @@ def test_indexer_kpool_mla_standalone_mtp_allocator_uses_two_page_classes():
         "layer.indexer.k_cache",
         "layer.indexer.compressor.state_cache",
     ]
-    # Extra padded page for the CANN key_pool dummy state block 0.
-    assert tensors[1].size == small_page_size * (num_blocks + 1)
+    # KVCacheTensor.size stays page_size * num_blocks (upstream-compatible);
+    # the CANN key_pool dummy state page is added at physical allocation.
+    assert tensors[1].size == small_page_size * num_blocks
 
 
 def test_glm5_memory_accounting_counts_combined_full_group_once():
@@ -1222,6 +1226,60 @@ def test_glm5_memory_accounting_counts_combined_full_group_once():
         full_blocks * bytes_per_block + 11 * layout.small_page_size
     )
     assert full_blocks < old_overcount
+
+
+def test_glm5_top_level_get_kv_cache_configs_keeps_upstream_divisibility():
+    """The top-level get_kv_cache_configs() must see KVCacheTensor.size ==
+    page_size * num_blocks for every tensor (upstream block-count
+    normalization), while the CANN key_pool dummy state page is accounted
+    for in the memory budget (plan §5.1). The existing allocator UTs call
+    the internal planner directly and therefore do not cover this upstream
+    divisibility path."""
+    specs, _ = _make_glm5_cache_groups(include_mtp=False)
+    groups = get_kv_cache_groups(SimpleNamespace(), specs)
+    layout = _get_glm5_cache_layout(groups)
+    assert layout is not None
+    bytes_per_block = (
+        12 * layout.main_page_size + 11 * layout.small_page_size
+    )
+    vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={"kv_cache_spec": specs},
+        ),
+        cache_config=SimpleNamespace(
+            num_gpu_blocks_override=None,
+            block_size=384,
+            enable_prefix_caching=False,
+            hash_block_size=None,
+            mamba_cache_mode="none",
+        ),
+        model_config=SimpleNamespace(max_model_len=1024),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        kv_transfer_config=None,
+    )
+    config = upstream_kv_cache_utils.get_kv_cache_configs(
+        vllm_config,
+        available_memory=bytes_per_block * 3 + 11 * layout.small_page_size,
+    )
+
+    assert config.num_blocks == 3
+    tensors = config.kv_cache_tensors
+    assert len(tensors) == 23
+    # Upstream block-count normalization: every tensor size is an exact
+    # multiple of its page size and equals page_size * num_blocks. The dummy
+    # state page must NOT leak into the planned tensor sizes.
+    assert all(tensor.size == layout.main_page_size * 3 for tensor in tensors[:12])
+    assert all(tensor.size == layout.small_page_size * 3 for tensor in tensors[12:])
+    # The dummy state page is part of the planned memory budget, so the
+    # actual allocation (state view N+1) never exceeds it.
+    assert _max_memory_usage_bytes_from_groups(vllm_config, config.kv_cache_groups) == (
+        layout.full_group.kv_cache_spec.max_memory_usage_pages(vllm_config) * bytes_per_block
+        + 11 * layout.small_page_size
+    )
 
 
 def test_indexer_kpool_mla_compressed_slot_mapping_only_writes_completed_pools():

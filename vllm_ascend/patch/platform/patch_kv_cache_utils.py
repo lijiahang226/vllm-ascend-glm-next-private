@@ -667,9 +667,19 @@ def _get_kv_cache_config_deepseek_v4(
             glm5_layout.main_slot_count * glm5_layout.main_page_size
             + glm5_layout.small_slot_count * glm5_layout.small_page_size
         )
+        # CANN key_pool needs one extra all-zero dummy physical block 0 in
+        # the compressor-state cache (vLLM block b -> key_pool block b+1,
+        # plan §5.1). The dummy page is added only at the physical allocation
+        # stage in the model runner, so its memory must be deducted from
+        # available_memory here to keep the actual allocation within the
+        # planned budget. KVCacheTensor.size stays page_size * num_blocks so
+        # the upstream block-count normalization sees exactly num_blocks.
+        dummy_pages_bytes = (
+            glm5_layout.small_slot_count * glm5_layout.small_page_size
+        )
         num_blocks = may_override_num_blocks(
             vllm_config,
-            available_memory // bytes_per_block,
+            (available_memory - dummy_pages_bytes) // bytes_per_block,
         )
         kv_cache_tensors: list[KVCacheTensor] = []
         for slot_idx in range(glm5_layout.main_slot_count):
@@ -686,14 +696,9 @@ def _get_kv_cache_config_deepseek_v4(
                 )
             )
         for slot_idx in range(glm5_layout.small_slot_count):
-            # CANN key_pool needs one extra all-zero dummy physical block 0 in
-            # the compressor-state cache (vLLM block b maps to key_pool b+1,
-            # plan §5.1). The state layer shares its KVCacheTensor with the
-            # compressed indexer layer, so the whole small slot gets one extra
-            # padded page; the indexer view simply uses the prefix.
             kv_cache_tensors.append(
                 KVCacheTensor(
-                    size=glm5_layout.small_page_size * (num_blocks + 1),
+                    size=glm5_layout.small_page_size * num_blocks,
                     shared_by=[
                         glm5_layout.indexer_names[slot_idx],
                         glm5_layout.state_names[slot_idx],

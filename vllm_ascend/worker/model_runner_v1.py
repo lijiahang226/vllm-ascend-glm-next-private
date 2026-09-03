@@ -4088,8 +4088,22 @@ class NPUModelRunner(GPUModelRunner):
             # state 和 KDA 分别规划好 KVCacheTensor。这里不能再根据层名把
             # cache 拆成 K/V；直接按规划结果一一分配并绑定即可。
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                extra_bytes = 0
+                for layer_name in kv_cache_tensor.shared_by:
+                    spec = layer_kv_cache_spec.get(layer_name)
+                    if isinstance(spec, AscendIndexerKPoolStateSpec):
+                        # CANN key_pool needs one extra all-zero dummy physical
+                        # block 0 in the compressor-state cache (vLLM block b ->
+                        # key_pool block b+1, plan §5.1). The planner keeps
+                        # KVCacheTensor.size = page_size * N so the upstream
+                        # block-count normalization sees N blocks; the dummy
+                        # page is added only here at the physical allocation
+                        # stage, and its memory was deducted from
+                        # available_memory upfront.
+                        extra_bytes = spec.page_size_bytes
+                        break
                 tensor = self._allocate_int8_cache_tensor(
-                    kv_cache_tensor.size,
+                    kv_cache_tensor.size + extra_bytes,
                     alignment,
                 )
                 for layer_name in kv_cache_tensor.shared_by:
@@ -4506,6 +4520,13 @@ class NPUModelRunner(GPUModelRunner):
                             current_kv_cache_spec.dtype
                         ).view(cache_shape)
                         continue
+                    # The small-slot raw tensor carries one extra dummy page
+                    # for the CANN key_pool state cache (allocated above), so
+                    # the derived count is N+1. Both the compressed indexer
+                    # and the state views are addressed with the scheduler's N
+                    # blocks; the state backend adds the dummy block itself
+                    # via get_kv_cache_shape (plan §5.1).
+                    num_blocks = kv_cache_config.num_blocks
                     is_quantized_indexer_cache = (
                         isinstance(current_kv_cache_spec, MLAAttentionSpec)
                         and current_kv_cache_spec.compress_ratio > 1
