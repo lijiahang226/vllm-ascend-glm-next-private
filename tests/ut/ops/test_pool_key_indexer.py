@@ -25,12 +25,45 @@ import pytest
 import torch
 
 from tests.ut.ops.helpers.c_ascend_loader import ensure_c_ascend_loaded
-from tests.ut.ops.helpers.glm5_next_cann_reference import (
-    pool_key_indexer_reference,
-    sparse_to_dense_token_ids,
+from tests.ut.ops.helpers.glm5_next_cann_reference import sparse_to_dense_token_ids
+from tests.ut.ops.helpers.pool_key_indexer_reference import (
+    pool_key_indexer_reference as _official_pki_reference,
 )
 
 TORCH_DTYPES = (torch.bfloat16, torch.float16)
+
+
+def pool_key_indexer_reference(
+    query,
+    pool_key,
+    weights,
+    pool_tail_k,
+    *,
+    actual_seq_q,
+    actual_seq_k,
+    block_table,
+    topk,
+    pool_size,
+    mask_mode=3,
+) -> torch.Tensor:
+    """Official CANN golden wrapper: TND query / PA_BBND paged key, returns
+    the sparse indices only (the golden also returns the selected pool
+    scores, which the e2e contract check consumes separately)."""
+    indices, _ = _official_pki_reference(
+        query,
+        pool_key,
+        weights,
+        pool_tail_k,
+        actual_seq_q=actual_seq_q,
+        actual_seq_k=actual_seq_k,
+        block_table=block_table,
+        layout_q="TND",
+        layout_k="PA_BBND",
+        topk=topk,
+        pool_size=pool_size,
+        mask_mode=mask_mode,
+    )
+    return indices
 
 
 def _run_indexer(
@@ -374,10 +407,11 @@ def test_pki_reference_noncontiguous_stride0_and_out_of_order_blocks():
         [tok for p in expected_pools for tok in range(p * 4, (p + 1) * 4)]
     )
     # Request-level tail [L_orig - 1, L_orig) = [48] (L_orig = 12*4+1 = 49)
-    # is appended at column 8 (kernel contract).
+    # is appended at column 8 (kernel contract). The golden emits the selected
+    # pools in score-descending order, so compare as sets.
     assert out.shape == (1, 11)
     tokens = sparse_to_dense_token_ids(out, 49)[0]
-    assert tokens == expected_tokens + [48]
+    assert sorted(tokens) == sorted(expected_tokens + [48])
 
 
 def test_pki_reference_physical_block_zero_and_padding():

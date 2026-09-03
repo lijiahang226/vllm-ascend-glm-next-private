@@ -1,25 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Standalone PyTorch references for the GLM-5 Next CANN operators.
+"""Standalone PyTorch reference for the GLM-5 Next CANN ``key_pool`` op.
 
-These implement the operator contracts (plan §9.1) independently of the CANN
-ops and of the framework wrappers they replace. They are CPU-run UTs here and
-serve as the oracle for the NPU accuracy tests in
+This implements the key_pool operator contract (plan §9.1) independently of
+the CANN op and of the framework wrappers it replaces. It is CPU-run in the
+UTs here and serves as the oracle for the NPU accuracy tests in
 ``tests/e2e/models/test_glm5_next_key_pool.py``.
 
-Contract notes (from ``aclnnKeyPool`` / ``aclnnKpoolIndexer`` docs and the
-op_host tiling):
+The ``pool_key_indexer`` oracle is the official CANN golden vendored at
+``tests/ut/ops/helpers/pool_key_indexer_reference.py``.
+
+Contract notes (from the ``aclnnKeyPool`` doc and the op_host tiling):
 - ``key_pool`` writes each incoming chunk's ``[K, gate]`` rows into an FP32
   state cache addressed through the state block table (``0`` = no update),
   then compresses every pool that becomes complete inside the chunk: a
   per-row softmax over the pool axis of ``gate + ape`` followed by a weighted
   sum of K.
-- ``pool_key_indexer`` scores each visible pool as the head-weighted sum of
-  per-head ReLU dot products scaled by ``1 / sqrt(head_dim)``, selects the
-  top ``topk // pool_size`` pools causally per query token, expands pool ids
-  into token ids, and appends the request-level tail ``[L_orig - pool_tail_k,
-  L_orig)`` (kernel ``ExpandAndAppendIndices``; causally capped to rows whose
-  position has progressed past the expanded region).
 """
 
 from __future__ import annotations
@@ -156,107 +152,6 @@ def key_pool_reference(
             pooled[b, pool - first_pool] = (scores * pool_k).sum(dim=0)
 
     return pooled.to(input_dtype)
-
-
-def _visible_pool_count(pos: int, pool_size: int, total_pools: int) -> int:
-    return min((pos + 1) // pool_size, total_pools)
-
-
-def pool_key_indexer_reference(
-    query: torch.Tensor,
-    pool_key: torch.Tensor,
-    weights: torch.Tensor,
-    pool_tail_k: torch.Tensor,
-    *,
-    actual_seq_q: torch.Tensor,
-    actual_seq_k: torch.Tensor,
-    block_table: torch.Tensor | None,
-    topk: int,
-    pool_size: int,
-    mask_mode: int = 3,
-) -> torch.Tensor:
-    """Reference of the CANN ``pool_key_indexer`` contract (TND query,
-    PA_BBND paged key, causal mask; plan §9.1).
-
-    Args:
-        query: ``[T, H, D]`` BF16/FP16 query.
-        pool_key: ``[blocks, block_size, 1, D]`` BF16 compressed K cache.
-        weights: ``[T, H]`` head weights; the framework-side factor
-            ``num_heads**-0.5`` is expected to be applied by the caller (the
-            op itself applies ``head_dim**-0.5`` and per-head ReLU).
-        pool_tail_k: ``[B]`` INT64 ``seq_lens % pool_size``.
-        actual_seq_q: ``[B]`` INT64 cumulative query ends (TND prefix sums).
-        actual_seq_k: ``[B]`` INT64 per-request pool counts
-            ``floor(seq_lens / pool_size)`` (PA, not prefix sums).
-        block_table: ``[B, pages]`` INT32 paged block table (``0``-based
-            physical ids, padded entries must be masked by ``actual_seq_k``).
-        topk: token budget; must be divisible by ``pool_size``.
-        pool_size: ``index_kpool``.
-        mask_mode: 0 (no mask) or 3 (causal).
-
-    Returns:
-        ``[T, topk + pool_size - 1]`` INT32 sparse token indices, ``-1``
-        padded: selected pools expanded to token ids followed by the
-        request-level tail ``[L_orig - pool_tail_k, L_orig)`` (plan §7,
-        kernel ``ExpandAndAppendIndices``).
-    """
-    query = query.float()
-    pool_key = pool_key.float()
-    weights = weights.float()
-    head_dim = query.shape[-1]
-    batch = actual_seq_q.numel()
-    sparse_count = topk // pool_size
-    out_width = topk + pool_size - 1
-    output = torch.full((query.shape[0], out_width), -1, dtype=torch.int32)
-    query_ends = [0] + [int(v) for v in actual_seq_q.tolist()]
-    scale = 1.0 / math.sqrt(head_dim)
-
-    for b in range(batch):
-        q_start, q_end = query_ends[b], query_ends[b + 1]
-        tail = int(pool_tail_k[b])
-        total_pools = int(actual_seq_k[b])
-        seq_len = total_pools * pool_size + tail
-        qlen = q_end - q_start
-        for j in range(q_start, q_end):
-            # Reconstruct the token's absolute position inside the request.
-            pos = seq_len - qlen + (j - q_start)
-            visible = _visible_pool_count(pos, pool_size, total_pools) if mask_mode == 3 else total_pools
-            scores = torch.full((visible,), float("-inf"), dtype=torch.float32)
-            for p in range(visible):
-                page = p // pool_key.shape[1]
-                if block_table is not None and page < block_table.shape[1]:
-                    block_id = int(block_table[b, page])
-                else:
-                    block_id = p  # fall back to identity addressing for tests
-                if block_id < 0:
-                    continue
-                k_vec = pool_key[block_id, p % pool_key.shape[1], 0]
-                per_head = torch.nn.functional.relu(
-                    (query[j] * k_vec).sum(dim=-1) * scale
-                )
-                scores[p] = (per_head * weights[j]).sum()
-            # Top-k with first-wins tie breaking in ascending pool order.
-            k = min(sparse_count, visible)
-            selected = torch.topk(scores, k, largest=True).indices if k > 0 else torch.empty(0, dtype=torch.long)
-            selected = torch.sort(selected).values  # deterministic ascending order
-            col = 0
-            for pool in selected.tolist():
-                for token in range(pool * pool_size, (pool + 1) * pool_size):
-                    output[j, col] = token
-                    col += 1
-            # Tail append (kernel ExpandAndAppendIndices): the request-level
-            # tail [L_orig - pool_tail_k, L_orig) is written at columns
-            # [topk, topk + pool_size). Under causal masking the count is
-            # capped by (pos - topk + 1) so early prefill rows do not see
-            # tail columns before the expanded region is complete.
-            if tail > 0:
-                if mask_mode == 0:
-                    visible_tail_k = tail
-                else:
-                    visible_tail_k = max(0, min(tail, pos - topk + 1))
-                for t in range(visible_tail_k):
-                    output[j, topk + t] = seq_len - tail + t
-    return output
 
 
 def sparse_to_dense_token_ids(
