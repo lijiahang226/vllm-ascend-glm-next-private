@@ -227,14 +227,16 @@ def _check_pki_against_golden(indices, values, inp, topk=TOPK, pool_size=R, atol
     Rows beyond the last actual_seq_q are padded (physical T may exceed the
     summed query lengths in graph buckets) and are out of scope.
     """
+    # The official golden is a CPU implementation (its internal arange/full
+    # create CPU tensors), so move the inputs to CPU before calling it.
     gold_idx, gold_val = _official_pki_reference(
-        inp["query"],
-        inp["pool_key"],
-        inp["weights"],
-        inp["pool_tail_k"],
-        actual_seq_q=inp["actual_seq_q"],
-        actual_seq_k=inp["actual_seq_k"],
-        block_table=inp["block_table"],
+        inp["query"].cpu(),
+        inp["pool_key"].cpu(),
+        inp["weights"].cpu(),
+        inp["pool_tail_k"].cpu(),
+        actual_seq_q=inp["actual_seq_q"].cpu(),
+        actual_seq_k=inp["actual_seq_k"].cpu(),
+        block_table=inp["block_table"].cpu(),
         layout_q="TND",
         layout_k="PA_BBND",
         topk=topk,
