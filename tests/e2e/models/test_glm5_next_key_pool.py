@@ -274,9 +274,13 @@ def _check_pki_contract(indices, values, inp, topk=TOPK, pool_size=R, atol=2e-2,
                 min_selected = min(selected_scores)
                 max_non = max(non_selected) if non_selected else float("-inf")
                 assert max_non <= min_selected + atol, (row, min_selected, max_non, pools)
-                # The op-reported values must match the selected pool scores.
-                op_values = [float(v) for v in values[row, :selected_count]]
-                for got, expect in zip(op_values, selected_scores):
+                # The op reports the selected pools' scores in its own top-k
+                # order (score-descending), which is not the ascending pool
+                # order used above; compare the sorted value sets instead.
+                op_values = sorted(float(v) for v in values[row, :selected_count])
+                expected_values = sorted(selected_scores)
+                assert len(op_values) == len(expected_values), (row, op_values, expected_values)
+                for got, expect in zip(op_values, expected_values):
                     assert abs(got - expect) <= atol + rtol * abs(expect), (row, got, expect)
             elif non_selected:
                 assert max(non_selected) <= atol, (row, non_selected)
