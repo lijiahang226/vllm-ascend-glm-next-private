@@ -92,6 +92,107 @@ std::vector<bool> IsContiguousAxes(const at::Tensor& tensor)
     return result;
 }
 
+// pool_tail_k / actual_seq_q / actual_seq_k are device ValueDepend tensors
+// in vLLM.  The generated host API, aclnnPoolKeyIndexerGetWorkspaceSize,
+// accepts aclIntArray* for those arguments, whereas the graph-safe tensor API
+// accepts aclTensor*.  EXEC_NPU_CMD derives the workspace API name from the run
+// API and therefore cannot express this split-name pair.  Calling the host API
+// with converted aclTensor* arguments corrupts its array lengths and can surface
+// as std::bad_alloc before the kernel is launched.
+template <typename... Ts>
+void RunPoolKeyIndexerTensor(const at::Device& compute_device, Ts&... args)
+{
+    using namespace at_npu::native;
+
+    const c10::OptionalDeviceGuard device_guard(compute_device);
+    static const auto get_workspace_size_func_addr =
+        GetOpApiFuncAddr("aclnnPoolKeyIndexerTensorGetWorkspaceSize");
+    static const auto op_api_func_addr =
+        GetOpApiFuncAddr("aclnnPoolKeyIndexer");
+    static const auto init_mem_addr =
+        GetOpApiFuncAddr("InitHugeMemThreadLocal");
+    static const auto uninit_mem_addr =
+        GetOpApiFuncAddr("UnInitHugeMemThreadLocal");
+    static const auto release_mem_addr = GetOpApiFuncAddr("ReleaseHugeMem");
+
+    TORCH_CHECK(get_workspace_size_func_addr != nullptr &&
+                    op_api_func_addr != nullptr,
+                "aclnnPoolKeyIndexerTensorGetWorkspaceSize or "
+                "aclnnPoolKeyIndexer not found in opapi libraries");
+
+    auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);
+    uint64_t workspace_size = 0;
+    uint64_t* workspace_size_addr = &workspace_size;
+    aclOpExecutor* executor = nullptr;
+    aclOpExecutor** executor_addr = &executor;
+    InitHugeMemThreadLocal init_mem_func =
+        reinterpret_cast<InitHugeMemThreadLocal>(init_mem_addr);
+    UnInitHugeMemThreadLocal uninit_mem_func =
+        reinterpret_cast<UnInitHugeMemThreadLocal>(uninit_mem_addr);
+    ReleaseHugeMem release_mem_func =
+        reinterpret_cast<ReleaseHugeMem>(release_mem_addr);
+
+    if (init_mem_func != nullptr) {
+        init_mem_func(nullptr, false);
+    }
+
+    auto converted_params =
+        ConvertTypes(args..., workspace_size_addr, executor_addr);
+    auto get_workspace_size_func = ConvertToOpApiFunc(
+        converted_params, get_workspace_size_func_addr);
+    auto workspace_status = call(get_workspace_size_func, converted_params);
+    if (workspace_status != 0) {
+        ReleaseConvertTypes(converted_params);
+        if (release_mem_func != nullptr) {
+            release_mem_func(nullptr, false);
+        }
+        if (uninit_mem_func != nullptr) {
+            uninit_mem_func(nullptr, false);
+        }
+        TORCH_CHECK(false,
+                    "call aclnnPoolKeyIndexerTensorGetWorkspaceSize failed, "
+                    "detail:", aclGetRecentErrMsg());
+    }
+
+    // Keep the tensor alive until OpCommand has launched the custom handler.
+    at::Tensor workspace_tensor;
+    void* workspace_addr = nullptr;
+    if (workspace_size != 0) {
+        at::TensorOptions options =
+            at::TensorOptions(torch_npu::utils::get_npu_device_type());
+        workspace_tensor =
+            at::empty({static_cast<int64_t>(workspace_size)},
+                      options.dtype(at::kByte));
+        workspace_addr = const_cast<void*>(workspace_tensor.storage().data());
+    }
+
+    auto acl_call = [converted_params, workspace_addr, workspace_size,
+                     acl_stream, executor, op_api_func_addr,
+                     release_mem_func]() mutable -> int {
+        using OpApiFunc =
+            int (*)(void*, uint64_t, aclOpExecutor*, const aclrtStream);
+        auto op_api_func = reinterpret_cast<OpApiFunc>(op_api_func_addr);
+        auto api_status =
+            op_api_func(workspace_addr, workspace_size, executor, acl_stream);
+        ReleaseConvertTypes(converted_params);
+        if (release_mem_func != nullptr) {
+            release_mem_func(nullptr, false);
+        }
+        TORCH_CHECK(api_status == 0,
+                    "call aclnnPoolKeyIndexer failed, detail:",
+                    aclGetRecentErrMsg());
+        return api_status;
+    };
+
+    at_npu::native::OpCommand cmd;
+    cmd.Name("aclnnPoolKeyIndexer");
+    cmd.SetCustomHandler(acl_call);
+    cmd.Run();
+    if (uninit_mem_func != nullptr) {
+        uninit_mem_func(nullptr, false);
+    }
+}
+
 std::tuple<at::Tensor, at::Tensor> pool_key_indexer(
     const at::Tensor& query, const at::Tensor& pool_key,
     const at::Tensor& weights, const at::Tensor& pool_tail_k,
@@ -136,18 +237,24 @@ std::tuple<at::Tensor, at::Tensor> pool_key_indexer(
     TORCH_CHECK(pool_tail_k.scalar_type() == at::kLong &&
                     pool_tail_k.dim() == 1,
                 "pool_tail_k must be rank-1 INT64");
+    TORCH_CHECK(pool_tail_k.is_contiguous(),
+                "pool_tail_k must be contiguous");
 
     if (actual_seq_q.has_value()) {
         check_same_device(*actual_seq_q, "actual_seq_q");
         TORCH_CHECK(actual_seq_q->scalar_type() == at::kLong &&
                         actual_seq_q->dim() == 1,
                     "actual_seq_q must be rank-1 INT64");
+        TORCH_CHECK(actual_seq_q->is_contiguous(),
+                    "actual_seq_q must be contiguous");
     }
     if (actual_seq_k.has_value()) {
         check_same_device(*actual_seq_k, "actual_seq_k");
         TORCH_CHECK(actual_seq_k->scalar_type() == at::kLong &&
                         actual_seq_k->dim() == 1,
                     "actual_seq_k must be rank-1 INT64");
+        TORCH_CHECK(actual_seq_k->is_contiguous(),
+                    "actual_seq_k must be contiguous");
     }
     if (block_table.has_value()) {
         check_same_device(*block_table, "block_table");
@@ -227,14 +334,14 @@ std::tuple<at::Tensor, at::Tensor> pool_key_indexer(
         }
     }
 
-    // These are ordinary device tensors. Tiling only derives dimensions from
-    // their shapes; the kernel reads values from GM at execution time, so the
-    // standard generated ACLNN API is both eager- and ACLGraph-safe.
-    EXEC_NPU_CMD(aclnnPoolKeyIndexer, query, pool_key, weights, pool_tail_k,
-                 actual_seq_q, actual_seq_k, block_table, q_descale, k_descale,
-                 topk, pool_size, query_layout_ptr, key_layout_ptr, mask_mode,
-                 quant_mode, return_value, key_stride0, sparse_indices_out,
-                 sparse_values_out);
+    // These ValueDepend buffers are persistent contiguous NPU tensors owned by
+    // the metadata builder.  Pass them through without copies so their fixed
+    // addresses and graph-replay updates are preserved.
+    RunPoolKeyIndexerTensor(
+        query.device(), query, pool_key, weights, pool_tail_k, actual_seq_q,
+        actual_seq_k, block_table, q_descale, k_descale, topk, pool_size,
+        query_layout_ptr, key_layout_ptr, mask_mode, quant_mode, return_value,
+        key_stride0, sparse_indices_out, sparse_values_out);
 
     return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out,
                                               sparse_values_out);
