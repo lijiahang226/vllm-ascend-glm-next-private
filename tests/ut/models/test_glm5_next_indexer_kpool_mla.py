@@ -273,7 +273,29 @@ def test_indexer_kpool_mla_collects_metadata_by_exact_cache_layer_name():
 def test_indexer_kpool_state_uses_independent_backend_for_four_token_pages():
     assert AscendGlm5NextCompressorStateCache.get_attn_backend(None) is AscendIndexerKPoolStateBackend
     assert select_common_block_size(4, [AscendIndexerKPoolStateBackend]) == 4
-    assert AscendIndexerKPoolStateBackend.get_kv_cache_shape(8, 4, 1, 256) == (8, 4, 256)
+    # CANN key_pool needs an extra all-zero dummy physical block 0 (vLLM
+    # block b -> key_pool block b+1, plan §5.1).
+    assert AscendIndexerKPoolStateBackend.get_kv_cache_shape(8, 4, 1, 256) == (9, 4, 256)
+
+
+def test_indexer_kpool_state_cache_requires_float32_for_cann_key_pool():
+    with pytest.raises(ValueError, match="float32"):
+        AscendGlm5NextCompressorStateCache(
+            state_dim=256,
+            dtype=torch.bfloat16,
+            compress_ratio=4,
+            cache_config=SimpleNamespace(block_size=128),
+            prefix="layer.indexer.compressor.state_cache",
+        )
+    layer = AscendGlm5NextCompressorStateCache(
+        state_dim=256,
+        dtype=torch.float32,
+        compress_ratio=4,
+        cache_config=SimpleNamespace(block_size=128),
+        prefix="layer.indexer.compressor.state_cache",
+    )
+    assert layer.dtype == torch.float32
+    assert layer.get_kv_cache_spec(SimpleNamespace(model_config=None)).dtype == torch.float32
 
 
 def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
@@ -309,6 +331,7 @@ def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
             [[21, 22, 23, 6, 7, 8]],
             dtype=torch.int32,
         ),
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
     )
 
     metadata = builder.build(0, common_metadata)
@@ -338,6 +361,7 @@ def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
     common_metadata.seq_lens = torch.tensor([8], dtype=torch.int32)
     common_metadata._seq_lens_cpu = torch.tensor([8], dtype=torch.int32)
     common_metadata.block_table_tensor = torch.tensor([[9, 10, 11]], dtype=torch.int32)
+    common_metadata.query_start_loc = torch.tensor([0, 4], dtype=torch.int32)
 
     replay_metadata = builder.build(0, common_metadata)
 
@@ -347,6 +371,134 @@ def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
     assert replay_metadata.slot_mapping.tolist() == [-1, -1, -1, 3 * 96 + 1]
     assert replay_metadata.seq_lens.tolist() == [2]
     assert replay_metadata.block_table.tolist() == [[3]]
+
+
+def test_indexer_kpool_state_metadata_builds_cann_key_pool_inputs_in_place():
+    """KeyPool inputs: start_pos / cu_seqlens / converted state block table
+    must come from fixed-address NPU buffers updated in place (plan §5.2)."""
+    spec = AscendIndexerKPoolStateSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float32,
+        sliding_window=4,
+        cache_role="indexer_state",
+        model_version="glm5_next",
+    )
+    builder = AscendIndexerKPoolStateMetadataBuilder(
+        spec,
+        ["layer.indexer.compressor.state_cache"],
+        SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_seqs=4),
+            model_config=SimpleNamespace(max_model_len=64),
+        ),
+        torch.device("cpu"),
+    )
+    common_metadata = SimpleNamespace(
+        num_reqs=2,
+        num_input_tokens=3,
+        query_start_loc=torch.tensor([0, 1, 3], dtype=torch.int32),
+        seq_lens=torch.tensor([5, 8], dtype=torch.int32),
+        block_table_tensor=torch.tensor([[-1, 2, 0], [3, -1, 4]], dtype=torch.int32),
+        slot_mapping=torch.tensor([0, 1, 2]),
+    )
+
+    metadata = builder.build(0, common_metadata)
+
+    # start_pos = seq_lens - query_lens (plan §5.2).
+    assert metadata.start_pos.tolist() == [4, 6]
+    # cu_seqlens = [0, cumsum(query_lens)] == query_start_loc.
+    assert metadata.cu_seqlens.tolist() == [0, 1, 3]
+    # KeyPool block table conversion: vLLM id >= 0 -> id + 1, -1 -> 0.
+    assert metadata.block_table.tolist() == [[0, 3, 1], [4, 0, 5]]
+    first_ptrs = (
+        metadata.start_pos.data_ptr(),
+        metadata.cu_seqlens.data_ptr(),
+        metadata.block_table.data_ptr(),
+    )
+
+    replay_metadata = builder.build(0, common_metadata)
+    assert (
+        replay_metadata.start_pos.data_ptr(),
+        replay_metadata.cu_seqlens.data_ptr(),
+        replay_metadata.block_table.data_ptr(),
+    ) == first_ptrs
+    # A changed input refreshes the same buffers with the new values.
+    common_metadata.seq_lens = torch.tensor([7, 9], dtype=torch.int32)
+    common_metadata.query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
+    common_metadata.block_table_tensor = torch.tensor([[5, -1], [6, 7]], dtype=torch.int32)
+    replay2 = builder.build(0, common_metadata)
+    assert replay2.start_pos.tolist() == [5, 7]
+    assert replay2.cu_seqlens.tolist() == [0, 2, 4]
+    assert replay2.block_table.tolist() == [[6, 0], [7, 8]]
+    assert (
+        replay2.start_pos.data_ptr(),
+        replay2.cu_seqlens.data_ptr(),
+        replay2.block_table.data_ptr(),
+    ) == first_ptrs
+
+
+def test_indexer_kpool_metadata_builds_pool_key_indexer_value_inputs_in_place():
+    """PoolKeyIndexer ValueDepend inputs: actual_seq_q / actual_seq_k /
+    pool_tail_k from fixed-address buffers updated in place (plan §5.2)."""
+    spec = MLAAttentionSpec(
+        block_size=384,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        compress_ratio=4,
+        model_version="glm5_next",
+    )
+    builder = AscendIndexerKPoolMetadataBuilder(
+        spec,
+        ["model.layers.0.self_attn.indexer.k_cache"],
+        SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=16,
+                max_num_seqs=4,
+            ),
+            model_config=SimpleNamespace(max_model_len=768),
+        ),
+        torch.device("cpu"),
+    )
+    common_metadata = SimpleNamespace(
+        num_reqs=2,
+        num_input_tokens=3,
+        positions=torch.tensor([40, 41, 42]),
+        slot_mapping=torch.tensor([9 * 384 + 40, 9 * 384 + 41, 9 * 384 + 42]),
+        seq_lens=torch.tensor([41, 82], dtype=torch.int32),
+        _seq_lens_cpu=torch.tensor([41, 82], dtype=torch.int32),
+        seq_lens_cpu=None,
+        block_table_tensor=torch.tensor(
+            [[21, 22, 23, 6, 7, 8], [10, 11, 12, 13, 14, 15]],
+            dtype=torch.int32,
+        ),
+        query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
+    )
+
+    metadata = builder.build(0, common_metadata)
+
+    assert metadata.actual_seq_q.tolist() == [2, 3]
+    assert metadata.actual_seq_k.tolist() == [10, 20]
+    assert metadata.pool_tail_k.tolist() == [1, 2]
+    first_ptrs = (
+        metadata.actual_seq_q.data_ptr(),
+        metadata.actual_seq_k.data_ptr(),
+        metadata.pool_tail_k.data_ptr(),
+    )
+
+    common_metadata.seq_lens = torch.tensor([43, 84], dtype=torch.int32)
+    common_metadata._seq_lens_cpu = torch.tensor([43, 84], dtype=torch.int32)
+    common_metadata.query_start_loc = torch.tensor([0, 3, 5], dtype=torch.int32)
+    replay = builder.build(0, common_metadata)
+    assert replay.actual_seq_q.tolist() == [3, 5]
+    assert replay.actual_seq_k.tolist() == [10, 21]
+    assert replay.pool_tail_k.tolist() == [3, 0]
+    assert (
+        replay.actual_seq_q.data_ptr(),
+        replay.actual_seq_k.data_ptr(),
+        replay.pool_tail_k.data_ptr(),
+    ) == first_ptrs
 
 
 def test_glm5_latest_config_schema_drives_attention_and_mlp_layout():
@@ -747,7 +899,7 @@ def _make_glm5_cache_groups(
             block_size=16,
             num_kv_heads=1,
             head_size=256,
-            dtype=torch.bfloat16,
+            dtype=torch.float32,
             sliding_window=16,
             cache_role="indexer_state",
             model_version="glm5_next",
@@ -902,7 +1054,7 @@ def test_glm5_target_allocator_uses_twelve_large_and_eleven_small_tensors():
         if isinstance(spec, (MLAAttentionSpec, MambaSpec)) and getattr(spec, "compress_ratio", 1) == 1
     )
     assert layout.main_page_size == 384 * 512 * 2
-    assert layout.small_page_size == 16 * 256 * 2
+    assert layout.small_page_size == 16 * 256 * 4  # FP32 compressor-state cache
 
     bytes_per_block = 12 * layout.main_page_size + 11 * layout.small_page_size
     vllm_config = SimpleNamespace(
@@ -925,7 +1077,9 @@ def test_glm5_target_allocator_uses_twelve_large_and_eleven_small_tensors():
     assert config.needs_kv_cache_zeroing
     assert len(tensors) == 23
     assert all(tensor.size == layout.main_page_size * 3 for tensor in tensors[:12])
-    assert all(tensor.size == layout.small_page_size * 3 for tensor in tensors[12:])
+    # One extra padded page per small slot covers the CANN key_pool dummy
+    # state block 0 (plan §5.1).
+    assert all(tensor.size == layout.small_page_size * (3 + 1) for tensor in tensors[12:])
     assert tensors[0].shared_by == [
         "model.layers.3.self_attn.attn",
         "model.layers.0.mamba",
@@ -1007,7 +1161,7 @@ def test_indexer_kpool_mla_standalone_mtp_allocator_uses_two_page_classes():
             block_size=4,
             num_kv_heads=1,
             head_size=256,
-            dtype=torch.bfloat16,
+            dtype=torch.float32,
             sliding_window=4,
             cache_role="indexer_state",
             model_version="glm5_next",
@@ -1039,7 +1193,8 @@ def test_indexer_kpool_mla_standalone_mtp_allocator_uses_two_page_classes():
         "layer.indexer.k_cache",
         "layer.indexer.compressor.state_cache",
     ]
-    assert tensors[1].size == small_page_size * num_blocks
+    # Extra padded page for the CANN key_pool dummy state block 0.
+    assert tensors[1].size == small_page_size * (num_blocks + 1)
 
 
 def test_glm5_memory_accounting_counts_combined_full_group_once():
@@ -1061,7 +1216,11 @@ def test_glm5_memory_accounting_counts_combined_full_group_once():
         for group in groups
     )
 
-    assert _max_memory_usage_bytes_from_groups(vllm_config, groups) == (full_blocks * bytes_per_block)
+    # bytes_per_block * full_blocks plus the dummy pages reserved for the
+    # CANN key_pool state cache (plan §5.1).
+    assert _max_memory_usage_bytes_from_groups(vllm_config, groups) == (
+        full_blocks * bytes_per_block + 11 * layout.small_page_size
+    )
     assert full_blocks < old_overcount
 
 
@@ -1323,15 +1482,18 @@ def test_glm5_indexer_paged_write_preserves_physical_page_stride():
     "torch.ops.vllm.glm5_next_kpool_compress_and_write_cache",
     create=True,
 )
+@patch("torch.ops._C_ascend.pool_key_indexer", create=True)
+@patch("torch.ops._C_ascend.key_pool", create=True)
+@patch("vllm_ascend.models.glm5_next.get_forward_context")
 def test_glm5_indexer_eager_mtp_ignores_padded_input_rows(
-    mock_compress,
-    mock_lightning_indexer,
     mock_get_forward_context,
+    mock_key_pool,
+    mock_pki,
 ):
     expected = torch.tensor([[[0, 1, 2, 3]]], dtype=torch.int32)
-    mock_lightning_indexer.return_value = expected
+    mock_pki.return_value = (expected, torch.empty(0, dtype=torch.float32))
 
-    state_cache = torch.zeros((1, 4, 4), dtype=torch.bfloat16)
+    state_cache = torch.zeros((1, 4, 4), dtype=torch.float32)
     indexer_cache = torch.zeros((1, 1, 1, 2), dtype=torch.bfloat16)
     state_layer = SimpleNamespace(
         prefix="layer.indexer.state",
@@ -1344,12 +1506,17 @@ def test_glm5_indexer_eager_mtp_ignores_padded_input_rows(
     )
     state_metadata = SimpleNamespace(
         slot_mapping=torch.tensor([3, -1, -1, -1, -1, -1, -1]),
-        block_table=torch.tensor([[0]], dtype=torch.int32),
+        block_table=torch.tensor([[1]], dtype=torch.int32),  # converted (+1)
+        start_pos=torch.tensor([3], dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
         block_size=4,
     )
     indexer_metadata = SimpleNamespace(
         slot_mapping=torch.tensor([0, -1, -1, -1, -1, -1, -1]),
         block_table=torch.tensor([[0]], dtype=torch.int32),
+        actual_seq_q=torch.tensor([1], dtype=torch.int64),
+        actual_seq_k=torch.tensor([1], dtype=torch.int64),
+        pool_tail_k=torch.tensor([0], dtype=torch.int64),
         seq_lens=torch.tensor([1], dtype=torch.int32),
         seq_lens_cpu=torch.tensor([1], dtype=torch.int32),
     )
@@ -1379,32 +1546,40 @@ def test_glm5_indexer_eager_mtp_ignores_padded_input_rows(
         state_cache=state_layer,
         attn_layer_name="layer.attn",
     )
+    mock_key_pool.return_value = torch.full((1, 1, 2), 2.0, dtype=torch.bfloat16)
 
     result = op.forward_ascend(
         torch.empty((7, 1)),
         torch.zeros((7, 1, 2), dtype=torch.bfloat16),
-        torch.arange(14, dtype=torch.bfloat16).view(7, 2),
         torch.ones((7, 1), dtype=torch.bfloat16),
-        gate_score=torch.zeros((7, 2), dtype=torch.bfloat16),
+        wk=torch.zeros((2, 1), dtype=torch.bfloat16),
+        gate_weight=torch.zeros((2, 1), dtype=torch.bfloat16),
+        norm_weight=None,
+        norm_bias=None,
         compress_ape=torch.zeros((4, 2), dtype=torch.float32),
         index_kpool=4,
         positions=torch.arange(7, dtype=torch.int64),
     )
 
     torch.testing.assert_close(result, expected)
-    assert mock_compress.call_args.args[1].shape[0] == 1
-    assert mock_compress.call_args.args[4].shape[0] == 1
-    assert mock_lightning_indexer.call_args.args[0].shape[0] == 1
-    assert mock_lightning_indexer.call_args.args[6].shape[0] == 1
+    # Eager MTP: only the real first-pass rows reach the CANN ops.
+    assert mock_key_pool.call_args.args[0].shape[0] == 1
+    assert mock_key_pool.call_args.args[4] is state_cache  # Tensor(a!) mutation alias
+    assert mock_pki.call_args.args[0].shape[0] == 1
+    # The completed pool row was scattered into the paged K cache.
+    assert indexer_cache[0, 0, 0, 0] == 2.0
+    # ValueDepend inputs come from the metadata NPU buffers, never from CPU.
+    assert mock_pki.call_args.kwargs["actual_seq_q"].dtype == torch.int64
+    assert mock_pki.call_args.kwargs["pool_size"] == 4
 
 
+@patch("torch.ops._C_ascend.pool_key_indexer", create=True)
+@patch("torch.ops._C_ascend.key_pool", create=True)
 @patch("vllm_ascend.models.glm5_next.get_forward_context")
-@patch("torch.ops.vllm.glm5_next_lightning_indexer", create=True)
-@patch("torch_npu.npu_scatter_nd_update_", create=True)
 def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
-    mock_scatter,
-    mock_lightning_indexer,
     mock_get_forward_context,
+    mock_key_pool,
+    mock_pki,
 ):
     expected = torch.tensor(
         [
@@ -1413,9 +1588,9 @@ def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
         ],
         dtype=torch.int32,
     )
-    mock_lightning_indexer.return_value = expected
+    mock_pki.return_value = (expected, torch.empty(0, dtype=torch.float32))
 
-    state_cache = torch.zeros((1, 4, 4), dtype=torch.bfloat16)
+    state_cache = torch.zeros((1, 4, 4), dtype=torch.float32)
     indexer_cache = torch.zeros((1, 1, 1, 2), dtype=torch.bfloat16)
     state_layer = SimpleNamespace(
         prefix="layer.indexer.state",
@@ -1428,12 +1603,17 @@ def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
     )
     state_metadata = SimpleNamespace(
         slot_mapping=torch.tensor([3, -1], dtype=torch.int64),
-        block_table=torch.tensor([[0], [0]], dtype=torch.int32),
+        block_table=torch.tensor([[1], [1]], dtype=torch.int32),
+        start_pos=torch.tensor([3, 0], dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, 1, 2], dtype=torch.int32),
         block_size=4,
     )
     indexer_metadata = SimpleNamespace(
         slot_mapping=torch.tensor([0, -1], dtype=torch.int64),
         block_table=torch.tensor([[0], [0]], dtype=torch.int32),
+        actual_seq_q=torch.tensor([1, 2], dtype=torch.int64),
+        actual_seq_k=torch.tensor([1, 0], dtype=torch.int64),
+        pool_tail_k=torch.tensor([0, 1], dtype=torch.int64),
         seq_lens=torch.tensor([1, 0], dtype=torch.int32),
         seq_lens_cpu=SimpleNamespace(
             max=lambda: pytest.fail("full decode must not read CPU max sequence length")
@@ -1464,6 +1644,11 @@ def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
         state_cache=state_layer,
         attn_layer_name="layer.attn",
     )
+    pooled_key = torch.zeros((2, 1, 2), dtype=torch.bfloat16)
+    pooled_key[0, 0] = torch.tensor([2.0, 2.0], dtype=torch.bfloat16)
+    pooled_key[1, 0] = torch.tensor([3.0, 3.0], dtype=torch.bfloat16)
+    mock_key_pool.return_value = pooled_key
+
     with patch.object(
         op,
         "indexer_kpool_topk_pytorch",
@@ -1472,21 +1657,28 @@ def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
         result = op.forward_ascend(
             torch.empty((2, 1)),
             torch.zeros((2, 1, 2), dtype=torch.bfloat16),
-            torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.bfloat16),
             torch.ones((2, 1), dtype=torch.bfloat16),
-            gate_score=torch.zeros((2, 2), dtype=torch.bfloat16),
+            wk=torch.zeros((2, 1), dtype=torch.bfloat16),
+            gate_weight=torch.zeros((2, 1), dtype=torch.bfloat16),
+            norm_weight=None,
+            norm_bias=None,
             compress_ape=torch.zeros((4, 2), dtype=torch.float32),
             index_kpool=4,
             positions=torch.tensor([3, 0], dtype=torch.int64),
         )
 
     torch.testing.assert_close(result, expected)
-    assert indexer_cache[0, 0, 0, 0] > 0
-    assert mock_lightning_indexer.call_count == 1
-    assert mock_lightning_indexer.call_args.kwargs["index_topk"] == 4
-    assert mock_lightning_indexer.call_args.kwargs["index_kpool"] == 4
-    assert mock_lightning_indexer.call_args.kwargs["max_pool_seq_len"] == 1
-    mock_scatter.assert_not_called()
+    # Request 0's pooled row (written) is 2.0; request 1's slot is -1 so its
+    # row must not reach the cache.
+    assert indexer_cache[0, 0, 0, 0] == 2.0
+    assert mock_pki.call_count == 1
+    assert mock_pki.call_args.kwargs["topk"] == 4
+    assert mock_pki.call_args.kwargs["pool_size"] == 4
+    assert mock_pki.call_args.kwargs["layout_q"] == "TND"
+    assert mock_pki.call_args.kwargs["layout_k"] == "PA_BBND"
+    assert mock_pki.call_args.kwargs["mask_mode"] == 3
+    assert mock_pki.call_args.kwargs["quant_mode"] == -1
+    assert mock_pki.call_args.kwargs["return_value"] is False
 
 
 def test_indexer_kpool_mla_indexer_small_ops_use_bfloat16_cache_contract():
@@ -1537,6 +1729,31 @@ def test_glm5_indexer_class_keeps_upstream_forward_contracts():
         "positions",
         "rotary_emb",
     ]
+
+
+def test_cann_indexer_forward_contracts_match_key_pool_wiring():
+    """The Ascend-CANN indexer takes the KeyPool inputs (wk / gate_weight /
+    k_norm) instead of precomputed k and gate_score (plan §4/§6)."""
+    expected_op_forward = [
+        "self",
+        "hidden_states",
+        "q_quant",
+        "weights",
+        "wk",
+        "gate_weight",
+        "norm_weight",
+        "norm_bias",
+        "norm_eps",
+        "compress_ape",
+        "index_kpool",
+        "positions",
+    ]
+    for name in ("forward_native", "forward_ascend"):
+        parameters = list(inspect.signature(getattr(AscendSparseAttnIndexerKpool, name)).parameters)
+        assert parameters == expected_op_forward
+        assert inspect.signature(getattr(AscendSparseAttnIndexerKpool, name)).parameters["wk"].kind == (
+            inspect.Parameter.KEYWORD_ONLY
+        )
 
 
 def test_indexer_kpool_mla_bf16_mqa_logits_matches_weighted_query_key_product():

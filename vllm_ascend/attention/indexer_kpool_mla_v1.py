@@ -36,6 +36,8 @@ from vllm_ascend.device.device_op import DeviceOperator
 INDEXER_KPOOL_MLA_SPARSE_ATTN_QUERY_CHUNK_SIZE = 16
 INDEXER_KPOOL_MLA_SAS_METADATA_SIZE = 1024
 GLM5_SFA_KERNEL_BLOCK_SIZE = 128
+# CANN pool_key_indexer PA_BBND block dimension upper bound (16-aligned, <=1024).
+INDEXER_KPOOL_MAX_BLOCK_SIZE = 1024
 
 
 @dataclass
@@ -50,13 +52,24 @@ class AscendIndexerKPoolMLAMetadata(AscendSFAMetadata):
 
 @dataclass
 class AscendIndexerKPoolMetadata:
-    """压缩 Indexer K cache 读写和 top-k 所需的最小 metadata。"""
+    """压缩 Indexer K cache 读写和 top-k 所需的最小 metadata。
+
+    CANN ``pool_key_indexer`` 需要（计划 §5.2）：
+    - ``actual_seq_q``：INT64 ``[B]``，``cumsum(query_lens)``（TND 前缀和）；
+    - ``actual_seq_k``：INT64 ``[B]``，``floor(seq_lens / index_kpool)``，
+      PA_BBND 下是每个请求的有效 pool 数，不是前缀和；
+    - ``pool_tail_k``：INT64 ``[B]``，``seq_lens % index_kpool``；
+    全部来自 builder 的固定地址 NPU buffer，只做原地更新。
+    """
 
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     positions: torch.Tensor
+    actual_seq_q: torch.Tensor
+    actual_seq_k: torch.Tensor
+    pool_tail_k: torch.Tensor
     block_size: int
     compress_ratio: int
     cache_role: str = "indexer"
@@ -108,6 +121,19 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         self.kernel_blocks_per_logical_block = (
             self.logical_block_size // GLM5_SFA_KERNEL_BLOCK_SIZE
         )
+        # CANN pool_key_indexer's PA_BBND layout requires the block dimension
+        # to be 16-aligned and <=1024. The indexer storage block is
+        # logical_block / compress_ratio; when it exceeds the CANN limit,
+        # reject with a hint instead of silently splitting the block on the
+        # framework side (plan §7).
+        if self.storage_block_size > INDEXER_KPOOL_MAX_BLOCK_SIZE:
+            raise ValueError(
+                "GLM-5 indexer storage block size "
+                f"{self.storage_block_size} exceeds the CANN pool_key_indexer "
+                f"PA_BBND limit ({INDEXER_KPOOL_MAX_BLOCK_SIZE}). "
+                "Increase tensor parallel size so the per-rank mamba state "
+                "shrinks the logical attention block."
+            )
         scheduler_config = vllm_config.scheduler_config
         # ACLGraph replay keeps the addresses captured on the first run. The
         # derived compressed metadata therefore needs persistent storage that
@@ -130,6 +156,25 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             scheduler_config.max_num_seqs,
             max_logical_blocks,
             dtype=torch.int32,
+            device=device,
+        )
+        # pool_key_indexer ValueDepend inputs (plan §5.2): persistent,
+        # fixed-address NPU buffers so ACLGraph replays with different
+        # lengths/tails re-read the updated values instead of capture-time
+        # constants.
+        self._actual_seq_q_buffer = torch.empty(
+            scheduler_config.max_num_seqs,
+            dtype=torch.int64,
+            device=device,
+        )
+        self._actual_seq_k_buffer = torch.empty(
+            scheduler_config.max_num_seqs,
+            dtype=torch.int64,
+            device=device,
+        )
+        self._pool_tail_k_buffer = torch.empty(
+            scheduler_config.max_num_seqs,
+            dtype=torch.int64,
             device=device,
         )
 
@@ -199,12 +244,32 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             rounding_mode="floor",
             out=block_table,
         )
+        # plan §5.2 (vLLM query_start_loc already has the leading 0):
+        #   actual_seq_q = cumsum(query_lens) == query_start_loc[1:] (TND
+        #     prefix sums of query ENDS, INT64)
+        #   actual_seq_k = floor(seq_lens / ratio)   (INT64, PA per-request count)
+        #   pool_tail_k  = seq_lens % ratio          (INT64)
+        query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
+        actual_seq_q = self._actual_seq_q_buffer[:num_reqs]
+        actual_seq_q.copy_(query_start_loc[1:].to(torch.int64))
+        actual_seq_k = self._actual_seq_k_buffer[:num_reqs]
+        torch.div(
+            seq_lens.to(torch.int64),
+            self.compress_ratio,
+            rounding_mode="floor",
+            out=actual_seq_k,
+        )
+        pool_tail_k = self._pool_tail_k_buffer[:num_reqs]
+        torch.remainder(seq_lens.to(torch.int64), self.compress_ratio, out=pool_tail_k)
         return AscendIndexerKPoolMetadata(
             block_table=block_table,
             slot_mapping=slot_mapping,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
+            actual_seq_q=actual_seq_q,
+            actual_seq_k=actual_seq_k,
+            pool_tail_k=pool_tail_k,
             block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
         )
@@ -242,10 +307,20 @@ class AscendIndexerKPoolBackend(AttentionBackend):
 
 @dataclass
 class AscendIndexerKPoolStateMetadata:
-    """仅包含 compressor tail cache 读写所需的寻址信息。"""
+    """仅包含 compressor tail cache 读写所需的寻址信息。
+
+    CANN ``key_pool`` 需要（计划 §5.2）：
+    - ``start_pos``：INT32 ``[B]``，每个请求本次 chunk 的起始绝对位置；
+    - ``cu_seqlens``：INT32 ``[B+1]``，``[0, cumsum(query_lens)]``；
+    - ``block_table``：INT32，vLLM block id 经 ``+1`` 转换（``-1`` → ``0``），
+      与算子的 ``0``=无效 约定对齐；
+    全部来自 builder 的固定地址 NPU buffer，只做原地更新。
+    """
 
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
+    start_pos: torch.Tensor
+    cu_seqlens: torch.Tensor
     block_size: int
     cache_role: str
 
@@ -279,6 +354,32 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.block_size = kv_cache_spec.block_size
         self.cache_role = kv_cache_spec.cache_role
+        scheduler_config = vllm_config.scheduler_config
+        model_config = vllm_config.model_config
+        # ACLGraph replay keeps the addresses captured on the first run. All
+        # key_pool length/table inputs therefore live in fixed-address NPU
+        # buffers that are refreshed in place on every builder invocation
+        # (plan §5.2); the capture region must never allocate these.
+        self._start_pos_buffer = torch.empty(
+            scheduler_config.max_num_seqs,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._cu_seqlens_buffer = torch.empty(
+            scheduler_config.max_num_seqs + 1,
+            dtype=torch.int32,
+            device=device,
+        )
+        max_state_blocks = cdiv(
+            model_config.max_model_len,
+            self.block_size,
+        )
+        self._state_block_table_buffer = torch.empty(
+            scheduler_config.max_num_seqs,
+            max_state_blocks,
+            dtype=torch.int32,
+            device=device,
+        )
 
     def build(
         self,
@@ -289,9 +390,46 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
         del common_prefix_len, fast_build
         num_reqs = common_attn_metadata.num_reqs
         num_input_tokens = common_attn_metadata.num_input_tokens
+        if num_reqs > self._start_pos_buffer.shape[0]:
+            raise ValueError(
+                "GLM-5 compressor-state metadata exceeds its persistent "
+                f"buffers: num_reqs={num_reqs}, capacity="
+                f"{self._start_pos_buffer.shape[0]}."
+            )
+        query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1].to(torch.int32)
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+        # plan §5.2 (vLLM query_start_loc already has the leading 0):
+        #   start_pos  = seq_lens - query_lens
+        #   cu_seqlens = [0, cumsum(query_lens)] == query_start_loc
+        start_pos = self._start_pos_buffer[:num_reqs]
+        torch.sub(seq_lens, query_lens, out=start_pos)
+        cu_seqlens = self._cu_seqlens_buffer[: num_reqs + 1]
+        cu_seqlens.copy_(query_start_loc)
+        cu_seqlens[0].fill_(0)
+        # KeyPool treats block id 0 as "no update"; vLLM treats -1 as invalid
+        # and physical block 0 as valid. Map: vLLM id >= 0 -> id + 1, -1 -> 0
+        # (plan §5.1). Physical block 0 of the state cache is kept as an
+        # all-zero dummy block, so the +1 mapping stays in range.
+        raw_block_table = common_attn_metadata.block_table_tensor[:num_reqs]
+        width = raw_block_table.shape[1]
+        if width > self._state_block_table_buffer.shape[1]:
+            raise ValueError(
+                "GLM-5 compressor-state block table exceeds its persistent "
+                f"buffer: width={width}, capacity="
+                f"{self._state_block_table_buffer.shape[1]}."
+            )
+        block_table = self._state_block_table_buffer[:num_reqs, :width]
+        # In-place refresh of the fixed-address buffer. Computed via a temp
+        # (same pattern as `slot_mapping.copy_(format_...)` below) because
+        # torch.where's out= variant rejects scalar `other` and promotes the
+        # result to int64.
+        block_table.copy_(torch.where(raw_block_table >= 0, raw_block_table + 1, 0))
         return AscendIndexerKPoolStateMetadata(
-            block_table=common_attn_metadata.block_table_tensor[:num_reqs],
+            block_table=block_table,
             slot_mapping=common_attn_metadata.slot_mapping[:num_input_tokens],
+            start_pos=start_pos,
+            cu_seqlens=cu_seqlens,
             block_size=self.block_size,
             cache_role=self.cache_role,
         )
@@ -324,7 +462,12 @@ class AscendIndexerKPoolStateBackend(AttentionBackend):
         del cache_type
         if num_kv_heads != 1:
             raise ValueError(f"Indexer KPool state cache requires one KV head, got {num_kv_heads}.")
-        return (num_blocks, block_size, head_size)
+        # CANN key_pool treats state block id 0 as "no update", while vLLM
+        # block 0 is a valid physical block. The framework maps vLLM id b to
+        # key_pool id b+1 and therefore needs one extra all-zero dummy block
+        # at index 0 (plan §5.1). The extra page is accounted for in the KV
+        # cache memory planning (patch/platform/patch_kv_cache_utils.py).
+        return (num_blocks + 1, block_size, head_size)
 
 
 class AscendIndexerKPoolMLAMetadataBuilder(AscendSFAMetadataBuilder):
@@ -675,7 +818,8 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
 
         # The SFA base stores this tensor before post-processing.  Make that
         # write initialize one complete compressor-state row: [K, empty gate].
-        state_k = k_li.to(torch.bfloat16).view(-1, self.head_dim).unsqueeze(1)
+        # CANN key_pool requires the state cache to be FP32 (plan §5.1).
+        state_k = k_li.to(torch.float32).view(-1, self.head_dim).unsqueeze(1)
         return torch.cat([state_k, torch.zeros_like(state_k)], dim=-1), None
 
     def exec_kv(

@@ -814,6 +814,9 @@ class NPUPlatform(Platform):
             (False, False, False): "vllm_ascend.attention.attention_v1.AscendAttentionBackend",
             (True, True, False): "vllm_ascend.attention.sfa_v1.AscendSFABackend",
             (True, False, True): "vllm_ascend.attention.dsa_v1.AscendDSABackend",
+            (False, True, False): (
+                "vllm_ascend.attention.indexer_kpool_mla_v1.AscendIndexerKPoolMLABackend"
+            ),
         }
         backend_map_310 = {
             (

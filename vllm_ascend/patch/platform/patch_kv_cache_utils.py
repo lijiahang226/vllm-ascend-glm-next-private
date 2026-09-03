@@ -686,9 +686,14 @@ def _get_kv_cache_config_deepseek_v4(
                 )
             )
         for slot_idx in range(glm5_layout.small_slot_count):
+            # CANN key_pool needs one extra all-zero dummy physical block 0 in
+            # the compressor-state cache (vLLM block b maps to key_pool b+1,
+            # plan §5.1). The state layer shares its KVCacheTensor with the
+            # compressed indexer layer, so the whole small slot gets one extra
+            # padded page; the indexer view simply uses the prefix.
             kv_cache_tensors.append(
                 KVCacheTensor(
-                    size=glm5_layout.small_page_size * num_blocks,
+                    size=glm5_layout.small_page_size * (num_blocks + 1),
                     shared_by=[
                         glm5_layout.indexer_names[slot_idx],
                         glm5_layout.state_names[slot_idx],
@@ -805,7 +810,10 @@ def _max_memory_usage_bytes_from_groups(
     # needed; summing per-group page counts would count the same physical
     # blocks once per group and massively overestimate the KV cache size.
     blocks_needed = glm5_layout.full_group.kv_cache_spec.max_memory_usage_pages(vllm_config)
-    return bytes_per_block * blocks_needed
+    # One extra all-zero dummy page per small slot for the CANN key_pool state
+    # cache (vLLM block b -> key_pool block b+1, plan §5.1).
+    dummy_pages_bytes = glm5_layout.small_slot_count * glm5_layout.small_page_size
+    return bytes_per_block * blocks_needed + dummy_pages_bytes
 
 
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
