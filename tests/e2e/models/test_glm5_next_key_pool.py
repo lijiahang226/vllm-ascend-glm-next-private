@@ -293,7 +293,9 @@ def _check_pki_contract(indices, values, inp, topk=TOPK, pool_size=R, atol=2e-2,
             ), (row, tail_vals, visible_tail)
             assert all(int(v) == -1 for v in indices[row, topk + visible_tail :]), row
             row += 1
-    assert row == indices.shape[0]
+    # Rows beyond the last actual_seq_q are padded (physical T may exceed the
+    # summed query lengths in graph buckets) and are out of contract scope.
+    assert row == actual_seq_q[-1], (row, actual_seq_q)
 
 
 def test_pool_key_indexer_npu_matches_reference_prefill():
@@ -329,8 +331,12 @@ def test_pool_key_indexer_npu_multi_request_decode():
 
 
 def test_pool_key_indexer_npu_graph_replay_reflects_new_values():
-    """Capture both ops once and replay with different lengths/tails and K
-    cache contents; outputs must track the new values (plan §8)."""
+    """Capture both ops once and replay with different content; outputs must
+    track the new values (plan §8). Graph capture bakes tensor SHAPES, so
+    replay only changes VALUES: hidden/query contents, K rows, block tables
+    and the ValueDepend lengths/tails. The PKI replay also exercises the
+    padded-T case (last actual_seq_q < physical T), which the Tensor
+    ValueDepend path must mask via the lengths read from GM."""
     key_inp = _key_pool_inputs(seq_len=9, chunk_len=5, start_pos=4, device=NPU, seed=7)
     pki_inp = _pki_inputs(seq_len=13, query_lens=[5], device=NPU, seed=8)
 
@@ -363,23 +369,31 @@ def test_pool_key_indexer_npu_graph_replay_reflects_new_values():
     with torch.npu.graph(graph):
         captured_indices, captured_values = run_step()
     torch.npu.synchronize()
+    # Capture-time actual_seq_q=[5]; rows 0..2 are compared against the
+    # replayed rows below (the replay shrinks actual_seq_q to 3).
     captured_tokens = [
         sorted(int(v) for v in captured_indices.cpu()[row] if v >= 0)
-        for row in range(captured_indices.shape[0])
+        for row in range(3)
     ]
 
-    # ---- replay with different content: new lengths, K rows, block table ----
-    key_inp2 = _key_pool_inputs(seq_len=11, chunk_len=3, start_pos=8, device=NPU, seed=9)
+    # ---- replay: same shapes, new values ----
+    # key_pool keeps chunk_len=5 so hidden stays [5, H]; new start_pos /
+    # state table / state content. seq_len=15 gives a valid state block for
+    # the tail write (position 12 -> page 3 -> block 4).
+    key_inp2 = _key_pool_inputs(seq_len=15, chunk_len=5, start_pos=8, device=NPU, seed=9)
     key_inp["hidden"].copy_(key_inp2["hidden"])
     key_inp["start_pos"].copy_(key_inp2["start_pos"])
     key_inp["cu_seqlens"].copy_(key_inp2["cu_seqlens"])
     key_inp["state_block_table"].copy_(key_inp2["state_block_table"])
     key_inp["state_cache"].zero_()
-    pki_inp2 = _pki_inputs(seq_len=9, query_lens=[3], device=NPU, seed=10)
+    # pool_key_indexer keeps the query shape [5, H, D]; new K rows / weights /
+    # block table, and a SHORTER actual_seq_q (3 < physical T=5) to exercise
+    # the padded-T masking path (plan §8).
+    pki_inp2 = _pki_inputs(seq_len=9, query_lens=[5], device=NPU, seed=10)
     pki_inp["query"].copy_(pki_inp2["query"])
     pki_inp["weights"].copy_(pki_inp2["weights"])
     pki_inp["pool_tail_k"].copy_(pki_inp2["pool_tail_k"])
-    pki_inp["actual_seq_q"].copy_(pki_inp2["actual_seq_q"])
+    pki_inp["actual_seq_q"].copy_(torch.tensor([3], dtype=torch.int64, device=NPU))
     pki_inp["actual_seq_k"].copy_(pki_inp2["actual_seq_k"])
     pki_inp["pool_key"].copy_(pki_inp2["pool_key"])
     pki_inp["block_table"].copy_(pki_inp2["block_table"])
@@ -387,9 +401,11 @@ def test_pool_key_indexer_npu_graph_replay_reflects_new_values():
     graph.replay()
     torch.npu.synchronize()
 
+    valid_rows = int(pki_inp["actual_seq_q"][-1].item())
+    assert valid_rows == 3
     replayed_tokens = [
         sorted(int(v) for v in captured_indices.cpu()[row] if v >= 0)
-        for row in range(captured_indices.shape[0])
+        for row in range(valid_rows)
     ]
     # The key_pool call inside the graph must have honored the new block
     # table: the replayed state cache is no longer empty even though the
