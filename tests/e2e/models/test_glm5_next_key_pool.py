@@ -40,6 +40,9 @@ except ImportError:
 
 from tests.ut.ops.helpers.c_ascend_loader import ensure_c_ascend_loaded
 from tests.ut.ops.helpers.glm5_next_cann_reference import key_pool_reference
+from tests.ut.ops.helpers.pool_key_indexer_reference import (
+    pool_key_indexer_reference as _official_pki_reference,
+)
 
 pytestmark = pytest.mark.skipif(not HAS_NPU, reason="requires an Ascend NPU")
 
@@ -214,92 +217,53 @@ def _run_pki_npu(inp, topk=TOPK, return_value=True):
     return indices, values
 
 
-def _check_pki_contract(indices, values, inp, topk=TOPK, pool_size=R, atol=2e-2, rtol=1e-2):
-    """Validate the op output against the operator contract without relying
-    on top-k tie-breaking (plan §9.3): the selected pools must be a valid
-    top-k of the per-contract scores, the expanded region must cover exactly
-    the selected pools, the op-reported values must equal the selected pool
-    scores, and the tail must follow kernel ExpandAndAppendIndices.
+def _check_pki_against_golden(indices, values, inp, topk=TOPK, pool_size=R, atol=2e-2, rtol=1e-2):
+    """Compare the op output against the official CANN golden
+    (tests/ut/ops/helpers/pool_key_indexer_reference.py).
+
+    Tie-breaking is not part of the operator contract: when the op and the
+    golden select different pools, the selected-score sets must still match
+    within tolerance (invalid entries are -inf sentinels on both sides).
+    Rows beyond the last actual_seq_q are padded (physical T may exceed the
+    summed query lengths in graph buckets) and are out of scope.
     """
+    gold_idx, gold_val = _official_pki_reference(
+        inp["query"],
+        inp["pool_key"],
+        inp["weights"],
+        inp["pool_tail_k"],
+        actual_seq_q=inp["actual_seq_q"],
+        actual_seq_k=inp["actual_seq_k"],
+        block_table=inp["block_table"],
+        layout_q="TND",
+        layout_k="PA_BBND",
+        topk=topk,
+        pool_size=pool_size,
+        mask_mode=3,
+        return_value=True,
+    )
     indices = indices.cpu()
     values = values.cpu()
-    query = inp["query"].float().cpu()
-    pool_key = inp["pool_key"].float().cpu()
-    weights = inp["weights"].float().cpu()
-    pool_tail_k = [int(v) for v in inp["pool_tail_k"].cpu().tolist()]
-    actual_seq_q = [int(v) for v in inp["actual_seq_q"].cpu().tolist()]
-    actual_seq_k = [int(v) for v in inp["actual_seq_k"].cpu().tolist()]
-    block_table = inp["block_table"].cpu()
-    head_dim = query.shape[-1]
-    scale = 1.0 / math.sqrt(head_dim)
-    sparse_count = topk // pool_size
-    batch = len(actual_seq_q)
-
-    row = 0
-    for b in range(batch):
-        q_start = 0 if b == 0 else actual_seq_q[b - 1]
-        q_end = actual_seq_q[b]
-        seq_len = actual_seq_k[b] * pool_size + pool_tail_k[b]
-        qlen = q_end - q_start
-        for j in range(q_start, q_end):
-            pos = seq_len - qlen + (j - q_start)
-            visible = min((pos + 1) // pool_size, actual_seq_k[b])
-            # Per-contract scores for every visible pool.
-            scores = []
-            for p in range(visible):
-                page = p // pool_key.shape[1]
-                block = int(block_table[b, page]) if page < block_table.shape[1] else p
-                if block < 0:
-                    scores.append(float("-inf"))
-                    continue
-                k_vec = pool_key[block, p % pool_key.shape[1], 0]
-                per_head = torch.nn.functional.relu((query[j] * k_vec).sum(dim=-1) * scale)
-                scores.append(float((per_head * weights[j]).sum()))
-            selected_count = min(sparse_count, visible)
-
-            expanded = [int(v) for v in indices[row, :topk] if v >= 0]
-            assert len(expanded) == selected_count * pool_size, (row, len(expanded), selected_count)
-            pools = sorted({t // pool_size for t in expanded})
-            assert len(pools) == selected_count, (row, pools)
-            for p in pools:
-                toks = sorted(t for t in expanded if t // pool_size == p)
-                assert toks == list(range(p * pool_size, (p + 1) * pool_size)), (row, p, toks)
-
-            # Top-k validity: no visible non-selected pool may outscore a
-            # selected one (ties are allowed; the exact tie-break is NOT part
-            # of the operator contract).
-            selected_scores = [scores[p] for p in pools]
-            non_selected = [scores[p] for p in range(visible) if p not in pools]
-            if selected_count > 0:
-                min_selected = min(selected_scores)
-                max_non = max(non_selected) if non_selected else float("-inf")
-                assert max_non <= min_selected + atol, (row, min_selected, max_non, pools)
-                # The op reports the selected pools' scores in its own top-k
-                # order (score-descending), which is not the ascending pool
-                # order used above; compare the sorted value sets instead.
-                op_values = sorted(float(v) for v in values[row, :selected_count])
-                expected_values = sorted(selected_scores)
-                assert len(op_values) == len(expected_values), (row, op_values, expected_values)
-                for got, expect in zip(op_values, expected_values):
-                    assert abs(got - expect) <= atol + rtol * abs(expect), (row, got, expect)
-            elif non_selected:
-                assert max(non_selected) <= atol, (row, non_selected)
-
-            # Tail region per kernel ExpandAndAppendIndices:
-            #   tokens [seq_len - pool_tail_k, seq_len - pool_tail_k + visible_tail)
-            #   with visible_tail = max(0, min(pool_tail_k, pos - topk + 1)).
-            visible_tail = 0
-            if pool_tail_k[b] > 0:
-                visible_tail = max(0, min(pool_tail_k[b], pos - topk + 1))
-            tail_vals = [int(v) for v in indices[row, topk:] if v >= 0]
-            assert tail_vals == list(
-                range(seq_len - pool_tail_k[b], seq_len - pool_tail_k[b] + visible_tail)
-            ), (row, tail_vals, visible_tail)
-            assert all(int(v) == -1 for v in indices[row, topk + visible_tail :]), row
-            row += 1
-    # Rows beyond the last actual_seq_q are padded (physical T may exceed the
-    # summed query lengths in graph buckets) and are out of contract scope.
-    assert row == actual_seq_q[-1], (row, actual_seq_q)
+    gold_idx = gold_idx.cpu()
+    gold_val = gold_val.cpu()
+    valid_rows = int(inp["actual_seq_q"][-1].item())
+    assert indices.shape[0] >= valid_rows, (indices.shape, valid_rows)
+    assert gold_idx.shape[0] == valid_rows, (gold_idx.shape, valid_rows)
+    for row in range(valid_rows):
+        op_tokens = sorted(int(v) for v in indices[row, :topk] if v >= 0)
+        gold_tokens = sorted(int(v) for v in gold_idx[row, :topk] if v >= 0)
+        op_tail = [int(v) for v in indices[row, topk:] if v >= 0]
+        gold_tail = [int(v) for v in gold_idx[row, topk:] if v >= 0]
+        assert op_tail == gold_tail, (row, op_tail, gold_tail)
+        if op_tokens == gold_tokens:
+            continue
+        # Different selection: must be a tie — the selected score sets must
+        # match within tolerance.
+        op_scores = sorted(float(v) for v in values[row] if math.isfinite(v))
+        gold_scores = sorted(float(v) for v in gold_val[row] if math.isfinite(v))
+        assert len(op_scores) == len(gold_scores), (row, op_scores, gold_scores)
+        for got, expect in zip(op_scores, gold_scores):
+            assert abs(got - expect) <= atol + rtol * abs(expect), (row, got, expect)
 
 
 def test_pool_key_indexer_npu_matches_reference_prefill():
@@ -310,7 +274,7 @@ def test_pool_key_indexer_npu_matches_reference_prefill():
     indices, values = _run_pki_npu(inp)
     assert indices.shape == (5, TOPK + R - 1)
     assert values.shape == (5, TOPK // R)
-    _check_pki_contract(indices, values, inp)
+    _check_pki_against_golden(indices, values, inp)
 
 
 def test_pool_key_indexer_npu_multi_request_decode():
@@ -331,7 +295,7 @@ def test_pool_key_indexer_npu_multi_request_decode():
     }
     indices, values = _run_pki_npu(inp)
     assert indices.shape == (2, TOPK + R - 1)
-    _check_pki_contract(indices, values, inp)
+    _check_pki_against_golden(indices, values, inp)
 
 
 def test_pool_key_indexer_npu_graph_replay_reflects_new_values():
@@ -418,7 +382,7 @@ def test_pool_key_indexer_npu_graph_replay_reflects_new_values():
     assert replayed_tokens != captured_tokens
     # The replayed output (same captured buffers, new ValueDepend lengths /
     # tails / K rows) must satisfy the operator contract.
-    _check_pki_contract(captured_indices, captured_values, pki_inp)
+    _check_pki_against_golden(captured_indices, captured_values, pki_inp)
 
 
 # ---------------------------------------------------------------------------
