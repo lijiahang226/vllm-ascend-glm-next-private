@@ -1056,7 +1056,7 @@ def test_glm5_target_allocator_uses_twelve_large_and_eleven_small_tensors():
     assert layout.main_page_size == 384 * 512 * 2
     assert layout.small_page_size == 16 * 256 * 4  # FP32 compressor-state cache
 
-    bytes_per_block = 12 * layout.main_page_size + 11 * layout.small_page_size
+    bytes_per_block = 12 * layout.main_page_size + 22 * layout.small_page_size
     vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(num_gpu_blocks_override=None),
     )
@@ -1077,7 +1077,7 @@ def test_glm5_target_allocator_uses_twelve_large_and_eleven_small_tensors():
     assert isinstance(mamba_spec, MambaSpec)
     assert config.has_mamba_layers
     assert config.needs_kv_cache_zeroing
-    assert len(tensors) == 23
+    assert len(tensors) == 34
     assert all(tensor.size == layout.main_page_size * 3 for tensor in tensors[:12])
     # KVCacheTensor.size stays page_size * num_blocks so the upstream
     # block-count normalization sees exactly num_blocks; the dummy state page
@@ -1090,8 +1090,14 @@ def test_glm5_target_allocator_uses_twelve_large_and_eleven_small_tensors():
         "model.layers.2.mamba",
     ]
     assert tensors[11].shared_by == ["model.layers.44.mamba"]
+    # The compressed indexer and the compressor state get SEPARATE physical
+    # allocations: key_pool addresses the state via the +1 block table, so a
+    # shared tensor would place vLLM block b's state on the same page as
+    # vLLM block b+1's indexer K.
     assert tensors[12].shared_by == [
         "model.layers.3.self_attn.indexer.k_cache",
+    ]
+    assert tensors[23].shared_by == [
         "model.layers.3.self_attn.indexer.compressor.state_cache",
     ]
 
@@ -1106,7 +1112,7 @@ def test_glm5_combined_layout_adds_mtp_indexer_state_small_page():
     assert layout.main_slot_count == 12
     assert layout.small_slot_count == 12
 
-    bytes_per_block = 12 * layout.main_page_size + 12 * layout.small_page_size
+    bytes_per_block = 12 * layout.main_page_size + 24 * layout.small_page_size
     num_blocks, tensors = _get_kv_cache_config_deepseek_v4(
         SimpleNamespace(cache_config=SimpleNamespace(num_gpu_blocks_override=None)),
         groups,
@@ -1114,13 +1120,15 @@ def test_glm5_combined_layout_adds_mtp_indexer_state_small_page():
     )
 
     assert num_blocks == 2
-    assert len(tensors) == 24
+    assert len(tensors) == 36
     assert tensors[11].shared_by == [
         "model.layers.45.self_attn.attn",
         "model.layers.44.mamba",
     ]
-    assert tensors[-1].shared_by == [
+    assert tensors[-2].shared_by == [
         "model.layers.45.self_attn.indexer.k_cache",
+    ]
+    assert tensors[-1].shared_by == [
         "model.layers.45.self_attn.indexer.compressor.state_cache",
     ]
 
@@ -1177,7 +1185,7 @@ def test_indexer_kpool_mla_standalone_mtp_allocator_uses_two_page_classes():
     main_page_size = specs["layer.attn"].page_size_bytes
     small_page_size = specs["layer.indexer.k_cache"].page_size_bytes
     assert small_page_size == specs["layer.indexer.compressor.state_cache"].page_size_bytes
-    bytes_per_block = main_page_size + small_page_size
+    bytes_per_block = main_page_size + 2 * small_page_size
     vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(num_gpu_blocks_override=None),
     )
@@ -1189,16 +1197,15 @@ def test_indexer_kpool_mla_standalone_mtp_allocator_uses_two_page_classes():
     )
 
     assert num_blocks == 3
-    assert len(tensors) == 2
+    assert len(tensors) == 3
     assert tensors[0].shared_by == ["layer.attn"]
     assert tensors[0].size == main_page_size * num_blocks
-    assert tensors[1].shared_by == [
-        "layer.indexer.k_cache",
-        "layer.indexer.compressor.state_cache",
-    ]
+    assert tensors[1].shared_by == ["layer.indexer.k_cache"]
+    assert tensors[2].shared_by == ["layer.indexer.compressor.state_cache"]
     # KVCacheTensor.size stays page_size * num_blocks (upstream-compatible);
     # the CANN key_pool dummy state page is added at physical allocation.
     assert tensors[1].size == small_page_size * num_blocks
+    assert tensors[2].size == small_page_size * num_blocks
 
 
 def test_glm5_memory_accounting_counts_combined_full_group_once():
@@ -1214,7 +1221,7 @@ def test_glm5_memory_accounting_counts_combined_full_group_once():
         cache_config=SimpleNamespace(mamba_cache_mode="none"),
     )
     full_blocks = layout.full_group.kv_cache_spec.max_memory_usage_pages(vllm_config)
-    bytes_per_block = 12 * layout.main_page_size + 11 * layout.small_page_size
+    bytes_per_block = 12 * layout.main_page_size + 22 * layout.small_page_size
     old_overcount = sum(
         _max_memory_usage_pages(vllm_config, group.kv_cache_spec)
         for group in groups
@@ -1240,7 +1247,7 @@ def test_glm5_top_level_get_kv_cache_configs_keeps_upstream_divisibility():
     layout = _get_glm5_cache_layout(groups)
     assert layout is not None
     bytes_per_block = (
-        12 * layout.main_page_size + 11 * layout.small_page_size
+        12 * layout.main_page_size + 22 * layout.small_page_size
     )
     vllm_config = SimpleNamespace(
         compilation_config=SimpleNamespace(
@@ -1268,7 +1275,7 @@ def test_glm5_top_level_get_kv_cache_configs_keeps_upstream_divisibility():
 
     assert config.num_blocks == 3
     tensors = config.kv_cache_tensors
-    assert len(tensors) == 23
+    assert len(tensors) == 34
     # Upstream block-count normalization: every tensor size is an exact
     # multiple of its page size and equals page_size * num_blocks. The dummy
     # state page must NOT leak into the planned tensor sizes.
@@ -1420,10 +1427,14 @@ def test_indexer_kpool_mla_decode_topk_uses_graph_compatible_ascend_op(mock_ligh
 
 @patch("vllm_ascend.attention.indexer_kpool_mla_v1.get_forward_context")
 @patch("torch_npu.npu_scatter_nd_update_", create=True)
-def test_indexer_kpool_mla_state_write_maps_negative_slots_to_restored_sentinel(
+def test_indexer_kpool_mla_state_prewrite_is_disabled_for_cann_key_pool(
     mock_scatter,
     mock_get_forward_context,
 ):
+    """CANN key_pool owns every compressor-state write (per-token [K, gate]
+    rows, cross-chunk tail, pool compression) and addresses the state through
+    the +1 block table; the SFA base class's pre-write used the raw slot
+    mapping and must be a no-op (plan §6)."""
     mock_get_forward_context.return_value = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL)
     raw_cache = torch.zeros(80, dtype=torch.bfloat16)
     cache = torch.as_strided(
@@ -1442,17 +1453,18 @@ def test_indexer_kpool_mla_state_write_maps_negative_slots_to_restored_sentinel(
     )
 
     mock_scatter.assert_not_called()
-    assert cache[1, 2].tolist() == [1.0] * 8
-    assert cache[0, 0].tolist() == [0.0] * 8
-    assert raw_cache[32:40].tolist() == [0.0] * 8
+    assert cache.tolist() == torch.zeros(2, 4, 8, dtype=torch.bfloat16).tolist()
+    assert raw_cache.tolist() == [0.0] * 80
 
 
 @patch("vllm_ascend.attention.indexer_kpool_mla_v1.get_forward_context")
 @patch("torch_npu.npu_scatter_nd_update_", create=True)
-def test_indexer_kpool_mla_eager_state_write_uses_paged_indices(
+def test_indexer_kpool_mla_eager_state_prewrite_is_disabled_for_cann_key_pool(
     mock_scatter,
     mock_get_forward_context,
 ):
+    """The eager pre-write path is disabled for the same reason: key_pool is
+    the sole writer of the compressor state."""
     mock_get_forward_context.return_value = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.NONE)
     raw_cache = torch.zeros(80, dtype=torch.bfloat16)
     cache = torch.as_strided(
@@ -1469,14 +1481,8 @@ def test_indexer_kpool_mla_eager_state_write_uses_paged_indices(
         values,
     )
 
-    mock_scatter.assert_called_once()
-    args = mock_scatter.call_args.args
-    assert args[0] is cache
-    torch.testing.assert_close(
-        args[1],
-        torch.tensor([[1, 2]], dtype=torch.int64),
-    )
-    torch.testing.assert_close(args[2], values[:1, 0])
+    mock_scatter.assert_not_called()
+    assert cache.tolist() == torch.zeros(2, 4, 8, dtype=torch.bfloat16).tolist()
 
 
 @patch("vllm_ascend.attention.indexer_kpool_mla_v1.get_forward_context")
@@ -1548,8 +1554,11 @@ def test_glm5_indexer_eager_mtp_ignores_padded_input_rows(
     mock_key_pool,
     mock_pki,
 ):
-    expected = torch.tensor([[[0, 1, 2, 3]]], dtype=torch.int32)
-    mock_pki.return_value = (expected, torch.empty(0, dtype=torch.float32))
+    pki_out = torch.tensor([[0, 1, 2, 3, -1, -1, -1]], dtype=torch.int32)
+    mock_pki.return_value = (pki_out, torch.empty(0, dtype=torch.float32))
+    # The framework restores the old Triton per-query tail in the last
+    # kpool-1 columns: row 0 is at position 0 -> tail [0] (plan §7).
+    expected = torch.tensor([[[0, 1, 2, 3, 0, -1, -1]]], dtype=torch.int32)
 
     state_cache = torch.zeros((1, 4, 4), dtype=torch.float32)
     indexer_cache = torch.zeros((1, 1, 1, 2), dtype=torch.bfloat16)
@@ -1646,7 +1655,12 @@ def test_indexer_kpool_mla_full_decode_avoids_dynamic_topk_and_cpu_length(
         ],
         dtype=torch.int32,
     )
-    mock_pki.return_value = (expected, torch.empty(0, dtype=torch.float32))
+    # The PKI op returns [T, topk+kpool-1] INT32; the framework overwrites
+    # the last kpool-1 columns with the per-query tail.
+    mock_pki.return_value = (
+        expected.squeeze(1),
+        torch.empty(0, dtype=torch.float32),
+    )
 
     state_cache = torch.zeros((1, 4, 4), dtype=torch.float32)
     indexer_cache = torch.zeros((1, 1, 1, 2), dtype=torch.bfloat16)

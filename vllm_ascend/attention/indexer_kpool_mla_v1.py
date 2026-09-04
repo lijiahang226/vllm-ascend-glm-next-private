@@ -249,18 +249,21 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         #     prefix sums of query ENDS, INT64)
         #   actual_seq_k = floor(seq_lens / ratio)   (INT64, PA per-request count)
         #   pool_tail_k  = seq_lens % ratio          (INT64)
+        # `seq_lens` above is ALREADY floor(original / ratio), so it is the
+        # pool count directly; pool_tail_k must come from the ORIGINAL token
+        # lengths (e.g. seq_len=41, ratio=4 -> actual_seq_k=10, pool_tail_k=1).
+        original_seq_lens = common_attn_metadata.seq_lens[:num_reqs]
         query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
         actual_seq_q = self._actual_seq_q_buffer[:num_reqs]
         actual_seq_q.copy_(query_start_loc[1:].to(torch.int64))
         actual_seq_k = self._actual_seq_k_buffer[:num_reqs]
-        torch.div(
-            seq_lens.to(torch.int64),
-            self.compress_ratio,
-            rounding_mode="floor",
-            out=actual_seq_k,
-        )
+        actual_seq_k.copy_(seq_lens.to(torch.int64))
         pool_tail_k = self._pool_tail_k_buffer[:num_reqs]
-        torch.remainder(seq_lens.to(torch.int64), self.compress_ratio, out=pool_tail_k)
+        torch.remainder(
+            original_seq_lens.to(torch.int64),
+            self.compress_ratio,
+            out=pool_tail_k,
+        )
         return AscendIndexerKPoolMetadata(
             block_table=block_table,
             slot_mapping=slot_mapping,
@@ -683,6 +686,21 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
 
     def _get_indexer_slot_mapping(self, attn_metadata):
         return self._indexer_kpool_mla_metadata["indexer_state"].slot_mapping
+
+    def _store_indexer_cache(
+        self,
+        cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        # CANN key_pool owns every compressor-state write (per-token
+        # [K, gate] rows, cross-chunk tail persistence, pool compression).
+        # The SFA base class's pre-write scattered [K, zero_gate] through the
+        # raw slot mapping while key_pool addresses the state through the +1
+        # block table, so the base write landed on the wrong physical pages
+        # and duplicated rows key_pool already writes. Disable it entirely.
+        del cache, slot_mapping, values
+        return
 
     def _store_indexer_cache(
         self,

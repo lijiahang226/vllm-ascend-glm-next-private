@@ -1292,7 +1292,7 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             indexer_cache.shape[1],
         )
 
-        # ---- PoolKeyIndexer: pool Top-K + expand + tail append ----
+        # ---- PoolKeyIndexer: pool Top-K + expand ----
         # The op applies 1/sqrt(head_dim) and per-head ReLU internally;
         # weights only carry the model-level num_heads**-0.5 factor (plan §7).
         indices, _ = torch.ops._C_ascend.pool_key_indexer(
@@ -1311,6 +1311,45 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             quant_mode=-1,
             return_value=False,
         )
+
+        # ---- Tail: restore the old Triton per-query semantics ----
+        # The CANN op appends the request-final tail [L - pool_tail_k, L)
+        # causally capped by (pos - topk + 1), so early prefill rows (and any
+        # row of a short request with seq_len < kpool) would be all -1. The
+        # old Triton path instead appended each query token's OWN running
+        # pool: tail_start = ((pos+1)//kpool)*kpool, tail_count = pos+1 -
+        # tail_start, so a non-empty request always had >= 1 valid index and
+        # the current token entered the attention. Keep the CANN selection
+        # for the completed pools and overwrite the last kpool-1 columns per
+        # query position (sfa_v1 npu_sparse_flash_mla cannot consume
+        # zero-length rows; frame-side semantics follow the old path).
+        tail_width = index_kpool - 1
+        if tail_width > 0:
+            positions_i64 = positions[:num_tokens].to(torch.int64)
+            tail_start = (
+                torch.div(
+                    positions_i64 + 1,
+                    index_kpool,
+                    rounding_mode="floor",
+                )
+                * index_kpool
+            )
+            tail_count = positions_i64 + 1 - tail_start  # [0, kpool-1]
+            tail_cols = torch.arange(
+                tail_width,
+                device=indices.device,
+                dtype=torch.int64,
+            )
+            is_tail = tail_cols.unsqueeze(0) < tail_count.unsqueeze(1)
+            tail_tokens = (
+                tail_start.unsqueeze(1) + tail_cols.unsqueeze(0)
+            ).to(torch.int32)
+            tail_out = torch.where(
+                is_tail,
+                tail_tokens,
+                torch.full_like(tail_tokens, -1),
+            )
+            indices[:, self.topk_tokens : self.topk_tokens + tail_width] = tail_out
         return indices.unsqueeze(1)
 
 

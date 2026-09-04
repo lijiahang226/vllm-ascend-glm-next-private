@@ -663,9 +663,14 @@ def _get_kv_cache_config_deepseek_v4(
     """
     glm5_layout = _get_glm5_cache_layout(kv_cache_groups)
     if glm5_layout is not None:
+        # The compressed indexer and the compressor state are SEPARATE
+        # allocations (key_pool addresses the state via the +1 block table,
+        # so a shared tensor would put vLLM block b's state on the same page
+        # as vLLM block b+1's indexer K): each small slot owns
+        # small_page_size per block for the indexer AND for the state.
         bytes_per_block = (
             glm5_layout.main_slot_count * glm5_layout.main_page_size
-            + glm5_layout.small_slot_count * glm5_layout.small_page_size
+            + 2 * glm5_layout.small_slot_count * glm5_layout.small_page_size
         )
         # CANN key_pool needs one extra all-zero dummy physical block 0 in
         # the compressor-state cache (vLLM block b -> key_pool block b+1,
@@ -696,13 +701,24 @@ def _get_kv_cache_config_deepseek_v4(
                 )
             )
         for slot_idx in range(glm5_layout.small_slot_count):
+            # The compressed indexer and the compressor-state caches must NOT
+            # share one raw allocation: key_pool addresses the state through
+            # the +1 block table (vLLM block b -> state block b+1, plan §5.1),
+            # so a shared tensor would place vLLM block b's state on the same
+            # physical page as vLLM block b+1's indexer K (state/indexer page
+            # offset mismatch corrupts both caches). Give each slot its own
+            # KVCacheTensor at page_size * num_blocks; the model runner adds
+            # the state's extra dummy page at the physical allocation stage.
             kv_cache_tensors.append(
                 KVCacheTensor(
                     size=glm5_layout.small_page_size * num_blocks,
-                    shared_by=[
-                        glm5_layout.indexer_names[slot_idx],
-                        glm5_layout.state_names[slot_idx],
-                    ],
+                    shared_by=[glm5_layout.indexer_names[slot_idx]],
+                )
+            )
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=glm5_layout.small_page_size * num_blocks,
+                    shared_by=[glm5_layout.state_names[slot_idx]],
                 )
             )
         return num_blocks, kv_cache_tensors
@@ -807,7 +823,7 @@ def _max_memory_usage_bytes_from_groups(
 
     bytes_per_block = (
         glm5_layout.main_slot_count * glm5_layout.main_page_size
-        + glm5_layout.small_slot_count * glm5_layout.small_page_size
+        + 2 * glm5_layout.small_slot_count * glm5_layout.small_page_size
     )
     # GLM-5 packs all main/indexer/state/Mamba slots into one shared block-id
     # pool, so the total memory is bytes_per_block * num_blocks.  The full
