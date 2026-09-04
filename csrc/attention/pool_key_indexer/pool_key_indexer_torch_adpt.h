@@ -58,7 +58,9 @@ std::tuple<at::Tensor, at::Tensor> ConstructPoolKeyIndexerOutputTensor(
     }
 
     at::Tensor sparse_indices_out =
-        at::empty(indices_shape, query.options().dtype(at::kInt));
+        // TEMPORARY DEBUG: at::full(-1) instead of at::empty to bisect whether
+        // the op fully writes the output (revert with the debug commit).
+        at::full(indices_shape, -1, query.options().dtype(at::kInt));
     at::Tensor sparse_values_out;
     if (return_value) {
         // Spec requires sparseValuesOut to be FLOAT (not query dtype)
