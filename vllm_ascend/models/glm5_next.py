@@ -364,52 +364,6 @@ class AscendGlm5NextCompressorStateCache(CompressorStateCache):
     def forward(self): ...
 
 
-def _dbg_minmax(t: torch.Tensor):
-    """TEMPORARY debug helper: (min, max) of a tensor, (-1, -1) when empty."""
-    if t.numel() == 0:
-        return (-1, -1)
-    return (t.min().item(), t.max().item())
-
-
-def _dbg_max_row(t: torch.Tensor):
-    """TEMPORARY debug helper: (row, col, value) of the max entry."""
-    if t.numel() == 0:
-        return None
-    max_val = t.max().item()
-    if max_val < 0:
-        return None
-    pos = (t == max_val).nonzero()[0].tolist()
-    return (pos, max_val, t[pos[0]].tolist())
-
-
-def _dbg_glm5(label: str, *items) -> None:
-    """TEMPORARY NPU fault-location helper (debug commit only, do not merge).
-
-    Synchronizes the NPU stream so async errors surface at the stage that
-    produced them, then prints the given tensors/scalars.
-    """
-    torch.npu.synchronize()
-    print(f"[GLM5-DEBUG] {label}", flush=True)
-    for name, value in items:
-        if value is None:
-            print(f"  {name}: None", flush=True)
-            continue
-        if torch.is_tensor(value):
-            v = value.detach().cpu()
-            if v.numel() == 0:
-                print(f"  {name}: shape={tuple(v.shape)} dtype={v.dtype} (empty)", flush=True)
-            elif v.numel() <= 32:
-                print(f"  {name}: shape={tuple(v.shape)} dtype={v.dtype} values={v.tolist()}", flush=True)
-            else:
-                print(
-                    f"  {name}: shape={tuple(v.shape)} dtype={v.dtype} "
-                    f"min={v.min().item()} max={v.max().item()}",
-                    flush=True,
-                )
-        else:
-            print(f"  {name}: {value}", flush=True)
-
-
 class AscendSparseAttnIndexerKpool(nn.Module):
     """Ascend implementation of vLLM's ``SparseAttnIndexerKpool``.
 
@@ -1247,11 +1201,6 @@ class AscendSparseAttnIndexerKpool(nn.Module):
         """
         if self.use_fp4_cache:
             raise ValueError("Ascend GLM-5 Indexer uses BF16 Q, not FP4.")
-        print(
-            f"[GLM5-DEBUG] indexer op enter: hidden={tuple(hidden_states.shape)} "
-            f"num_tokens={positions.shape[0] if positions is not None else '?'}",
-            flush=True,
-        )
         if isinstance(q_quant, tuple):
             q_values, q_scale = q_quant
             if q_scale is not None:
@@ -1312,17 +1261,6 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             norm_eps=norm_eps,
             rotary_mode=1,
         )
-        _dbg_glm5(
-            "key_pool done",
-            ("pooled_key", pooled_key),
-            ("state_blocks", state_cache.shape[0]),
-            (
-                "state_table_max",
-                state_metadata.block_table.max()
-                if state_metadata.block_table.numel()
-                else None,
-            ),
-        )
 
         # ---- Write this call's newly completed pools into the paged K cache.
         # Fixed-shape mapping/mask only: rows whose slot_mapping is -1 are
@@ -1353,32 +1291,10 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             rows,
             indexer_cache.shape[1],
         )
-        _dbg_glm5(
-            "indexer scatter done",
-            ("slots", indexer_metadata.slot_mapping[:num_tokens]),
-            ("indexer_blocks", indexer_cache.shape[0]),
-            (
-                "indexer_table_max",
-                indexer_metadata.block_table.max()
-                if indexer_metadata.block_table.numel()
-                else None,
-            ),
-        )
 
         # ---- PoolKeyIndexer: pool Top-K + expand ----
         # The op applies 1/sqrt(head_dim) and per-head ReLU internally;
         # weights only carry the model-level num_heads**-0.5 factor (plan §7).
-        print(
-            "PKI_CONTRACT",
-            "num_tokens=", num_tokens,
-            "q_rows=", q_values[:num_tokens].shape[0],
-            "weight_rows=", weights[:num_tokens].shape[0],
-            "actual_seq_q=", indexer_metadata.actual_seq_q.cpu().tolist(),
-            "block_table_shape=", indexer_metadata.block_table.shape,
-            "block_table_stride=", indexer_metadata.block_table.stride(),
-            "block_table_contiguous=", indexer_metadata.block_table.is_contiguous(),
-            flush=True,
-        )
         indices, _ = torch.ops._C_ascend.pool_key_indexer(
             q_values[:num_tokens],
             indexer_cache,
@@ -1394,33 +1310,6 @@ class AscendSparseAttnIndexerKpool(nn.Module):
             mask_mode=3,
             quant_mode=-1,
             return_value=False,
-        )
-        _dbg_glm5(
-            "pki done",
-            ("seq_lens", attn_metadata.seq_lens),
-            ("actual_seq_k", indexer_metadata.actual_seq_k),
-            ("pool_tail_k", indexer_metadata.pool_tail_k),
-            ("positions", positions[:num_tokens]),
-            ("valid_per_row", (indices >= 0).sum(dim=-1)),
-            (
-                "valid_minmax",
-                _dbg_minmax(indices[indices >= 0]),
-            ),
-            (
-                "causal_violations",
-                (
-                    (indices >= 0)
-                    & (indices >= (positions[:num_tokens].to(torch.int64) + 1).unsqueeze(1))
-                ).sum(),
-            ),
-            ("indexer_blocks", indexer_cache.shape[0]),
-            (
-                "indexer_table_max",
-                indexer_metadata.block_table.max()
-                if indexer_metadata.block_table.numel()
-                else None,
-            ),
-            ("max_idx_row", _dbg_max_row(indices)),
         )
 
         # ---- Tail: restore the old Triton per-query semantics ----
@@ -1461,11 +1350,6 @@ class AscendSparseAttnIndexerKpool(nn.Module):
                 torch.full_like(tail_tokens, -1),
             )
             indices[:, self.topk_tokens : self.topk_tokens + tail_width] = tail_out
-        _dbg_glm5(
-            "indexer out",
-            ("final_valid_per_row", (indices >= 0).sum(dim=-1)),
-            ("final_valid_minmax", _dbg_minmax(indices[indices >= 0])),
-        )
         return indices.unsqueeze(1)
 
 
@@ -1575,11 +1459,6 @@ class AscendGlm5NextIndexer(nn.Module):
         rows of ``wk_weights_proj``), so only the Indexer head weights are
         computed here with the remaining ``n_head`` rows (plan §6).
         """
-        print(
-            f"[GLM5-DEBUG] indexer module enter: hidden={tuple(hidden_states.shape)} "
-            f"qr={tuple(qr.shape)} positions={tuple(positions.shape)}",
-            flush=True,
-        )
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
 

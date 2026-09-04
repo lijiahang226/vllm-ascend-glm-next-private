@@ -187,11 +187,6 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         del common_prefix_len, fast_build
         num_reqs = common_attn_metadata.num_reqs
         num_input_tokens = common_attn_metadata.num_input_tokens
-        print(
-            f"[GLM5-DEBUG] indexer builder enter: num_reqs={num_reqs} "
-            f"num_input_tokens={num_input_tokens}",
-            flush=True,
-        )
         positions = common_attn_metadata.positions[:num_input_tokens].long()
         slot_mapping = self._slot_mapping_buffer[:num_input_tokens]
         slot_mapping.copy_(
@@ -401,11 +396,6 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
         del common_prefix_len, fast_build
         num_reqs = common_attn_metadata.num_reqs
         num_input_tokens = common_attn_metadata.num_input_tokens
-        print(
-            f"[GLM5-DEBUG] state builder enter: num_reqs={num_reqs} "
-            f"num_input_tokens={num_input_tokens}",
-            flush=True,
-        )
         if num_reqs > self._start_pos_buffer.shape[0]:
             raise ValueError(
                 "GLM-5 compressor-state metadata exceeds its persistent "
