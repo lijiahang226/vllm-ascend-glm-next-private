@@ -345,7 +345,9 @@ def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
         == 128
     )
     assert metadata.block_size == 96
-    assert metadata.block_table.tolist() == [[7, 2]]
+    # The builder passes the FULL persistent-buffer width (contiguous); only
+    # the valid columns carry the recovered scheduler block ids.
+    assert metadata.block_table[:, :2].tolist() == [[7, 2]]
     assert metadata.slot_mapping.tolist() == [-1, -1, -1, 7 * 96 + 95]
     assert metadata.seq_lens.tolist() == [96]
     assert metadata.seq_lens_cpu.tolist() == [96]
@@ -369,7 +371,7 @@ def test_indexer_kpool_cache_uses_minimal_independent_metadata_builder():
     assert replay_metadata.block_table.data_ptr() == first_block_table_ptr
     assert replay_metadata.slot_mapping.tolist() == [-1, -1, -1, 3 * 96 + 1]
     assert replay_metadata.seq_lens.tolist() == [2]
-    assert replay_metadata.block_table.tolist() == [[3]]
+    assert replay_metadata.block_table[:, :1].tolist() == [[3]]
 
 
 def test_indexer_kpool_state_metadata_builds_cann_key_pool_inputs_in_place():
@@ -409,7 +411,9 @@ def test_indexer_kpool_state_metadata_builds_cann_key_pool_inputs_in_place():
     # cu_seqlens = [0, cumsum(query_lens)] == query_start_loc.
     assert metadata.cu_seqlens.tolist() == [0, 1, 3]
     # KeyPool block table conversion: vLLM id >= 0 -> id + 1, -1 -> 0.
-    assert metadata.block_table.tolist() == [[0, 3, 1], [4, 0, 5]]
+    # The builder passes the FULL persistent-buffer width (contiguous); only
+    # the valid columns carry the converted ids.
+    assert metadata.block_table[:, :3].tolist() == [[0, 3, 1], [4, 0, 5]]
     first_ptrs = (
         metadata.start_pos.data_ptr(),
         metadata.cu_seqlens.data_ptr(),
@@ -429,7 +433,7 @@ def test_indexer_kpool_state_metadata_builds_cann_key_pool_inputs_in_place():
     replay2 = builder.build(0, common_metadata)
     assert replay2.start_pos.tolist() == [5, 7]
     assert replay2.cu_seqlens.tolist() == [0, 2, 4]
-    assert replay2.block_table.tolist() == [[6, 0], [7, 8]]
+    assert replay2.block_table[:, :2].tolist() == [[6, 0], [7, 8]]
     assert (
         replay2.start_pos.data_ptr(),
         replay2.cu_seqlens.data_ptr(),

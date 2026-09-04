@@ -236,9 +236,12 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
                 f"required={logical_width}, capacity="
                 f"{self._block_table_buffer.shape[1]}."
             )
-        block_table = self._block_table_buffer[
-            :num_reqs, :logical_width
-        ]
+        # Pass the FULL persistent-buffer width so the slice stays contiguous
+        # (a narrow [:num_reqs, :logical_width] slice is strided whenever
+        # logical_width < capacity, and the op's tiling reads the storage
+        # shape); only the valid columns are refreshed in place, keeping the
+        # fixed addresses stable for ACLGraph replay.
+        block_table = self._block_table_buffer[:num_reqs, :]
         # The common full-group table is expanded for the C128 SFA kernel:
         # scheduler block N becomes [split*N, ..., split*N+split-1]. The
         # compressed indexer owns one physical page per scheduler block, so it
@@ -247,7 +250,7 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             expanded_block_table[:, ::split],
             split,
             rounding_mode="floor",
-            out=block_table,
+            out=block_table[:, :logical_width],
         )
         # plan §5.2 (vLLM query_start_loc already has the leading 0):
         #   actual_seq_q = cumsum(query_lens) == query_start_loc[1:] (TND
@@ -432,12 +435,18 @@ class AscendIndexerKPoolStateMetadataBuilder(AttentionMetadataBuilder):
                 f"buffer: width={width}, capacity="
                 f"{self._state_block_table_buffer.shape[1]}."
             )
-        block_table = self._state_block_table_buffer[:num_reqs, :width]
+        # Pass the FULL persistent-buffer width so the slice stays contiguous
+        # (a narrow [:num_reqs, :width] slice is strided whenever width <
+        # capacity, and key_pool's tiling reads the storage shape); only the
+        # valid columns are refreshed in place.
+        block_table = self._state_block_table_buffer[:num_reqs, :]
         # In-place refresh of the fixed-address buffer. Computed via a temp
         # (same pattern as `slot_mapping.copy_(format_...)` below) because
         # torch.where's out= variant rejects scalar `other` and promotes the
         # result to int64.
-        block_table.copy_(torch.where(raw_block_table >= 0, raw_block_table + 1, 0))
+        block_table[:, :width].copy_(
+            torch.where(raw_block_table >= 0, raw_block_table + 1, 0)
+        )
         return AscendIndexerKPoolStateMetadata(
             block_table=block_table,
             slot_mapping=common_attn_metadata.slot_mapping[:num_input_tokens],
