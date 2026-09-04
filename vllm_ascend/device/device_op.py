@@ -1783,47 +1783,6 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         topk_indices = sorted_topk
         ori_topk_length = (topk_indices >= 0).sum(dim=-1, keepdim=True).to(torch.int32)
 
-        # ---- TEMPORARY NPU fault-location diagnostics (debug commit only) ----
-        torch.npu.synchronize()
-        num_rows = topk_indices.shape[0]
-        q_ends = attn_metadata.query_start_loc
-        row_ids = torch.bucketize(
-            torch.arange(num_rows, device=topk_indices.device, dtype=q_ends.dtype),
-            q_ends,
-            right=True,
-        )
-        q_starts = torch.cat([q_ends[:1], q_ends[:-1]])
-        q_lens = q_ends[1:] - q_ends[:-1]
-        key_lens = actual_seq_lengths_key
-        offsets = (
-            torch.arange(num_rows, device=topk_indices.device, dtype=q_ends.dtype)
-            - q_starts[row_ids]
-        )
-        causal_limits = key_lens[row_ids] - q_lens[row_ids] + offsets + 1
-        valid_vals = topk_indices[topk_indices >= 0]
-        max_val = topk_indices.max().item() if topk_indices.numel() else -1
-        max_pos = (
-            (topk_indices == max_val).nonzero()[0].tolist() if max_val >= 0 else None
-        )
-        print(
-            "[GLM5-DEBUG] sfa pre: "
-            f"ori_topk_length={ori_topk_length.squeeze(-1).cpu().tolist()} "
-            f"zero_len_rows={(ori_topk_length == 0).sum().item()} "
-            f"valid_minmax={(-1, -1) if valid_vals.numel() == 0 else (valid_vals.min().item(), valid_vals.max().item())} "
-            f"causal_violations={((topk_indices >= 0) & (topk_indices >= causal_limits.unsqueeze(1))).sum().item()} "
-            f"block_table_max={block_table.max().item() if block_table.numel() else -1} "
-            f"kv_blocks={packed_kv_cache.shape[0]} "
-            f"max_idx_row={max_pos}",
-            flush=True,
-        )
-        if max_pos is not None:
-            print(
-                f"[GLM5-DEBUG] sfa pre max row {max_pos[0]}: "
-                f"{topk_indices[max_pos[0]].cpu().tolist()}",
-                flush=True,
-            )
-        # ---- end TEMPORARY diagnostics ----
-
         result = torch.ops._C_ascend.npu_sparse_flash_mla(
             ql_nope,
             ori_kv=packed_kv_cache,
@@ -1854,10 +1813,6 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             topk_value_mode=1,
             return_softmax_lse=False,
         )
-        # ---- TEMPORARY NPU fault-location sync (debug commit only) ----
-        torch.npu.synchronize()
-        print("[GLM5-DEBUG] sfa done", flush=True)
-        # ---- end TEMPORARY diagnostics ----
         return result[0]
 
     @staticmethod

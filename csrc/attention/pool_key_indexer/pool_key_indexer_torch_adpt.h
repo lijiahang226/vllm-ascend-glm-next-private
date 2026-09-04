@@ -58,8 +58,11 @@ std::tuple<at::Tensor, at::Tensor> ConstructPoolKeyIndexerOutputTensor(
     }
 
     at::Tensor sparse_indices_out =
-        // TEMPORARY DEBUG: at::full(-1) instead of at::empty to bisect whether
-        // the op fully writes the output (revert with the debug commit).
+        // KNOWN ISSUE (temporary safety net): the op may leave parts of the
+        // output unwritten in some configs; -1-initialize so unwritten
+        // entries are masked instead of garbage reaching
+        // npu_sparse_flash_mla. Costs one device-side fill per call; revisit
+        // once the op's output coverage is confirmed.
         at::full(indices_shape, -1, query.options().dtype(at::kInt));
     at::Tensor sparse_values_out;
     if (return_value) {
