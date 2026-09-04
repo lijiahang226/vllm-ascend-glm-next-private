@@ -48,7 +48,6 @@ from vllm_ascend.models.glm5_next import (
     AscendGlm5NextIndexer,
     AscendGlm5NextIndexerKPoolCache,
     AscendSparseAttnIndexerKpool,
-    SparseAttnIndexerKpool,
 )
 from vllm_ascend.ops.glm5_next_kpool_compress import glm5_next_kpool_compress_and_write_cache
 from vllm_ascend.ops.glm5_next_lightning_indexer import glm5_next_lightning_indexer
@@ -853,7 +852,7 @@ def test_indexer_kpool_mla_state_block_table_maps_request_tail_pages():
         block_table=torch.tensor([[0, 2], [1, 3]], dtype=torch.int32),
     )
 
-    result = SparseAttnIndexerKpool._gather_compressor_state(
+    result = AscendSparseAttnIndexerKpool._gather_compressor_state(
         op,
         state_cache,
         metadata,
@@ -1792,8 +1791,8 @@ def test_glm5_indexer_class_keeps_upstream_forward_contracts():
         "index_kpool",
         "positions",
     ]
-    assert list(inspect.signature(SparseAttnIndexerKpool.forward_native).parameters) == expected_op_forward
-    assert list(inspect.signature(SparseAttnIndexerKpool.forward_ascend).parameters) == expected_op_forward
+    assert list(inspect.signature(AscendSparseAttnIndexerKpool.forward_native).parameters) == expected_op_forward
+    assert list(inspect.signature(AscendSparseAttnIndexerKpool.forward_ascend).parameters) == expected_op_forward
     assert list(inspect.signature(AscendGlm5NextIndexer.forward).parameters) == [
         "self",
         "hidden_states",
